@@ -1,0 +1,21 @@
+services:
+  won-oss-server:
+    build: .
+    container_name: won-oss-server
+    restart: unless-stopped
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST to your VPS public IPv4}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      GATEWAY_PORT: ${GATEWAY_PORT:-15101}
+      ROUTING_PORT: ${ROUTING_PORT:-15100}
+      ROUTING_MAX_PORT: ${ROUTING_MAX_PORT:-15120}
+      FIREWALL_PORT: ${FIREWALL_PORT:-2021}
+      ADMIN_HOST: ${ADMIN_HOST:-0.0.0.0}
+      ADMIN_PORT: ${ADMIN_PORT:-8080}
+    ports:
+      - "${GATEWAY_PORT:-15101}:${GATEWAY_PORT:-15101}"
+      - "${ROUTING_PORT:-15100}-${ROUTING_MAX_PORT:-15120}:${ROUTING_PORT:-15100}-${ROUTING_MAX_PORT:-15120}"
+      - "${FIREWALL_PORT:-2021}:${FIREWALL_PORT:-2021}"
+      - "127.0.0.1:${ADMIN_PORT:-8080}:${ADMIN_PORT:-8080}"
+    volumes:
+      - ./data:/data

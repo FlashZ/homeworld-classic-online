@@ -1,0 +1,5 @@
+# Runtime dependency for Homeworld Auth1 Blowfish/CBC handling.
+pycryptodome
+
+# Needed when generating a fresh verifier/auth key set on the server.
+cryptography

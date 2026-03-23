@@ -1,0 +1,12 @@
+__pycache__/
+tests/
+captures/
+installer/
+data/
+.env
+*.pyc
+*.pyo
+*.pyd
+wireshark*.txt
+ChatGPT_Learnings.md
+CLAUDE_CODE_TASK.md
