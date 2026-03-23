@@ -65,6 +65,12 @@ flowchart LR
 - **Reconnect-to-match**: Reconnect currently matches on the same player name and IP, so it still needs wider real-world validation in game.
 - **Game process model**: Routing rooms are managed in-gateway rather than spawning external `RoutingServHWGame` binaries.
 
+## Roadmap
+
+- **Decode live gameplay packets**: The server already relays native `SendData` and `SendDataBroadcast` traffic during a match, but the payloads are still treated as opaque bytes. The next step is to classify the recurring packet shapes and map them to concrete in-game actions.
+- **Use decoded match traffic for diagnostics**: Once packet types are understood, the admin dashboard can expose match timelines, desync clues, launch/start/end markers, and better post-match debugging instead of only packet sizes and counts.
+- **Use decoded match traffic for future features**: Decoded traffic would also make it much easier to build match result summaries, lightweight telemetry, and more reliable reconnect or resync experiments without trying to persist every raw frame.
+
 ---
 
 ## Client install
