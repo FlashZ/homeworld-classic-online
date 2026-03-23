@@ -104,6 +104,28 @@ The installer:
 
 No Python is required on client machines. Players just run the installer and then launch Homeworld normally.
 
+### What `NetTweak.script` does
+
+`NetTweak.script` is the client-side file that tells Homeworld which directory and patch server host and port to contact first. The installer writes:
+
+- `DIRSERVER_IPSTRINGS`
+- `DIRSERVER_PORTS`
+- `PATCHSERVER_IPSTRINGS`
+- `PATCHSERVER_PORTS`
+
+In practice, that means:
+
+- `NetTweak.script` tells Homeworld where to connect
+- `kver.kp` tells Homeworld which verifier public key to trust
+
+Both have to match the server you are actually running. If the host points at one network and the verifier blob belongs to another, the game can reach the server but Auth1 validation will fail.
+
+### How I found it
+
+I found `NetTweak.script` by reverse-engineering the old Homeworld bootstrap path and then validating the behavior against the live client. The key clues were that changing the `DIRSERVER_*` and `PATCHSERVER_*` values redirected the stock client without any executable patching, and that once those values matched the replacement server, the client successfully connected, queried the directory, completed Auth1, and entered the lobby.
+
+That is why this project does not rely on `hosts` file hacks: the client already has a built-in configuration hook for its initial server lookup, and `NetTweak.script` is that hook.
+
 ## Server install
 
 ### Python deployment
