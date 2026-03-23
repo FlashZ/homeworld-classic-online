@@ -2,6 +2,8 @@
 
 Open-source replacement for the Sierra WON (World Opponent Network) backend services, targeting Homeworld 1 multiplayer. It implements the real WON/Titan wire protocol, including Auth1 key exchange, NR-MD5 signatures, and ElGamal encryption, so the original Homeworld 1 client can connect without executable patching.
 
+Tested against the original Homeworld 1.05 patch. Homeworld Remastered Classic is not supported, because its multiplayer functionality was removed and it does not behave like the original retail multiplayer client.
+
 ## Architecture
 
 ```mermaid
