@@ -1,17 +1,15 @@
-FROM python:3.12-slim
+FROM python:3.12-alpine3.22
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-WORKDIR /app
+WORKDIR /app/won_oss_server
 
 COPY requirements-server.txt /tmp/requirements-server.txt
 RUN pip install --no-cache-dir -r /tmp/requirements-server.txt
 
 COPY . /app/won_oss_server
 
-RUN chmod +x /app/won_oss_server/docker-entrypoint.sh
+EXPOSE 9100 15101 15100-15120 2021 8080
 
-EXPOSE 15101 15100-15120 2021 8080
-
-CMD ["/app/won_oss_server/docker-entrypoint.sh"]
+CMD ["python", "won_server.py"]

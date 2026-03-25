@@ -27,8 +27,10 @@ import argparse
 import asyncio
 from collections import deque
 import contextlib
+import ipaddress
 import logging
 import os
+import secrets
 import socket as _socket
 import sqlite3
 import struct
@@ -44,6 +46,21 @@ import binascii
 from won_oss_server import won_crypto
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_loopback_host(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    candidate = str(value).strip()
+    if not candidate:
+        return False
+    if candidate.startswith("::ffff:"):
+        candidate = candidate[7:]
+    if candidate.lower() == "localhost":
+        return True
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(candidate).is_loopback
+    return False
 
 
 class DashboardLogHandler(logging.Handler):
@@ -115,6 +132,11 @@ ROUTING_HEARTBEAT_IDLE_SECONDS = 20.0
 ROUTING_MAINTENANCE_INTERVAL_SECONDS = 5.0
 PEER_SESSION_TTL_SECONDS = 300.0
 PEER_SESSION_SWEEP_INTERVAL_SECONDS = 60.0
+BACKEND_RPC_TIMEOUT_SECONDS = 5.0
+IP_ACTIVITY_TTL_SECONDS = 24 * 60 * 60.0
+MAX_IP_ACTIVITY_ROWS = 1024
+MAX_NATIVE_CLIENT_ID = 0xFFFF
+MAX_PEER_SESSION_ID = 0xFFFF
 FIREWALL_PROBE_REPLY = b"\x00" * 16
 
 AUTH1_PEER_SERVICE_TYPE = 203
@@ -1850,9 +1872,13 @@ class SilencerRoutingServer:
         return client
 
     def _alloc_native_client_id(self) -> int:
-        client_id = self._next_native_client_id
-        self._next_native_client_id += 1
-        return client_id
+        reserved_ids = set(self._native_clients) | set(self._pending_reconnects)
+        for _ in range(MAX_NATIVE_CLIENT_ID):
+            client_id = self._next_native_client_id
+            self._next_native_client_id = 1 if client_id >= MAX_NATIVE_CLIENT_ID else client_id + 1
+            if client_id not in reserved_ids:
+                return client_id
+        raise RuntimeError("native_client_id_exhausted")
 
     def _flush_solo_peer_data_logs(self, client_id: Optional[int] = None) -> None:
         keys = [
@@ -3134,90 +3160,6 @@ class SilencerRoutingServer:
             else:
                 await self._handle_silencer_session(reader, writer, payload)
             return
-            while True:
-                # --- Read 2-byte LE length prefix ---
-                hdr = await reader.readexactly(2)
-                total_len, = struct.unpack("<H", hdr)
-                payload_size = total_len - 2
-                if payload_size < 3 or payload_size > 8192:
-                    LOGGER.warning(
-                        "Routing: bad payload size %d from %s:%s", payload_size, *peer
-                    )
-                    break
-
-                payload = await reader.readexactly(payload_size)
-
-                # --- Validate \x03\x02 header ---
-                if payload[:2] != b"\x03\x02":
-                    LOGGER.warning(
-                        "Routing: missing \\x03\\x02 header from %s:%s", *peer
-                    )
-                    break
-
-                msg_type = payload[2]
-                data = payload[3:]
-
-                # --- Dispatch ---
-                if msg_type == self._INIT_ID:
-                    LOGGER.info("Routing: INIT from %s:%s", *peer)
-                    writer.write(_SILENCER_ROUTING_ACK)
-                    await writer.drain()
-                    await asyncio.sleep(0.05)   # brief pause (Silencer does sleep(2))
-                    writer.write(_SILENCER_ROUTING_USAGE)
-                    await writer.drain()
-
-                elif msg_type == self._NEW_CONFLICT_ID:
-                    if len(data) == _SILENCER_CONFLICT_DATA_LEN:
-                        LOGGER.info(
-                            "Routing: NEW_CONFLICT from %s:%s (%d bytes)",
-                            *peer, len(data),
-                        )
-                        tail = bytes(
-                            _SILENCER_CONFLICT_TOTAL
-                            - len(_SILENCER_CONFLICT_HDR)
-                            - _SILENCER_CONFLICT_DATA_LEN
-                        )
-                        self._conflict_data = (
-                            _SILENCER_CONFLICT_HDR + data[:_SILENCER_CONFLICT_DATA_LEN] + tail
-                        )
-                    else:
-                        LOGGER.warning(
-                            "Routing: NEW_CONFLICT bad size %d (want %d) from %s:%s",
-                            len(data), _SILENCER_CONFLICT_DATA_LEN, *peer,
-                        )
-                    # NOTE: fall-through to CONFLICTQUERY — Silencer does "DO NOT BREAK"
-                    writer.write(self._conflict_data)
-                    await writer.drain()
-                    LOGGER.info("Routing: conflict listing sent to %s:%s", *peer)
-
-                elif msg_type == self._CONFLICTQUERY_ID:
-                    LOGGER.info("Routing: CONFLICTQUERY from %s:%s", *peer)
-                    writer.write(self._conflict_data)
-                    await writer.drain()
-
-                elif msg_type == self._CHATMESSAGE_ID:
-                    # Chat treated as conflict query (Silencer workaround)
-                    LOGGER.info(
-                        "Routing: CHATMESSAGE (→ conflict listing) from %s:%s", *peer
-                    )
-                    writer.write(self._conflict_data)
-                    await writer.drain()
-
-                elif msg_type == self._ABORT_CONFLICT:
-                    LOGGER.info("Routing: ABORT_CONFLICT from %s:%s", *peer)
-
-                elif msg_type == self._USER_TERMINATION:
-                    LOGGER.info("Routing: USER_TERMINATION from %s:%s (keeping conn)", *peer)
-                    # Silencer commented-out KillThisConnection here; stay open.
-
-                elif msg_type == self._CLIENTQUERY_ID:
-                    LOGGER.info("Routing: CLIENTQUERY (ignored) from %s:%s", *peer)
-
-                else:
-                    LOGGER.warning(
-                        "Routing: unknown msg_type=0x%02x len=%d from %s:%s",
-                        msg_type, len(data), *peer,
-                    )
 
         except asyncio.IncompleteReadError:
             LOGGER.debug("Routing: EOF from %s:%s", *peer)
@@ -3429,11 +3371,39 @@ class AdminDashboardServer:
         gateway: BinaryGatewayServer,
         db_path: str,
         log_handler: DashboardLogHandler,
+        admin_token: str = "",
     ) -> None:
         self.gateway = gateway
         self.db_path = db_path
         self.log_handler = log_handler
+        self.admin_token = admin_token.strip()
         self.started_at = time.time()
+
+    @staticmethod
+    def _parse_headers(request_text: str) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        for line in request_text.splitlines()[1:]:
+            if not line or ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+        return headers
+
+    def _is_authorized(self, query: Dict[str, list[str]], headers: Dict[str, str]) -> bool:
+        if not self.admin_token:
+            return True
+        query_token = str(query.get("token", [""])[0] or "")
+        if query_token and secrets.compare_digest(query_token, self.admin_token):
+            return True
+        header_token = str(headers.get("x-admin-token", "") or "")
+        if header_token and secrets.compare_digest(header_token, self.admin_token):
+            return True
+        auth_header = str(headers.get("authorization", "") or "")
+        if auth_header.lower().startswith("bearer "):
+            bearer_token = auth_header[7:].strip()
+            if bearer_token and secrets.compare_digest(bearer_token, self.admin_token):
+                return True
+        return False
 
     @staticmethod
     def _coerce_db_value(value: object) -> object:
@@ -3515,6 +3485,7 @@ class AdminDashboardServer:
         body: bytes,
         content_type: str,
         status: str = "200 OK",
+        extra_headers: Optional[list[str]] = None,
     ) -> bytes:
         headers = [
             f"HTTP/1.1 {status}",
@@ -3522,12 +3493,13 @@ class AdminDashboardServer:
             f"Content-Length: {len(body)}",
             "Cache-Control: no-store",
             "Connection: close",
-            "",
-            "",
         ]
+        if extra_headers:
+            headers.extend(extra_headers)
+        headers.extend(["", ""])
         return "\r\n".join(headers).encode("ascii") + body
 
-    def _html(self) -> str:
+    def _html(self, embedded_token: str = "") -> str:
         return """<!doctype html>
 <html lang="en">
 <head>
@@ -3691,13 +3663,14 @@ class AdminDashboardServer:
 <body>
   <header>
     <h1>Homeworld WON OSS Dashboard</h1>
-    <div class="sub">Local-only gateway view. Auto-refreshes every 3 seconds.</div>
+    <div class="sub">Gateway view. Auto-refreshes every 3 seconds.</div>
     <div class="sub" id="status">Loading...</div>
   </header>
   <main id="app"></main>
   <script>
     const app = document.getElementById("app");
     const status = document.getElementById("status");
+    const adminToken = __ADMIN_TOKEN__;
     let activeTab = "dashboard";
 
     function esc(value) {
@@ -4067,7 +4040,8 @@ class AdminDashboardServer:
     }
 
     async function refresh() {
-      const res = await fetch("/api/snapshot?rows=25&logs=200&activity=150", { cache: "no-store" });
+      const tokenQuery = adminToken ? `&token=${encodeURIComponent(adminToken)}` : "";
+      const res = await fetch(`/api/snapshot?rows=25&logs=200&activity=150${tokenQuery}`, { cache: "no-store" });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
@@ -4086,7 +4060,7 @@ class AdminDashboardServer:
     loop();
   </script>
 </body>
-</html>"""
+</html>""".replace("__ADMIN_TOKEN__", json.dumps(embedded_token))
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -4103,6 +4077,7 @@ class AdminDashboardServer:
             return
 
         request_text = raw.decode("iso-8859-1", errors="replace")
+        headers = self._parse_headers(request_text)
         first_line = request_text.splitlines()[0] if request_text.splitlines() else ""
         parts = first_line.split(" ")
         if len(parts) < 2:
@@ -4122,6 +4097,19 @@ class AdminDashboardServer:
 
         parsed = urlsplit(target)
         query = parse_qs(parsed.query)
+        if not self._is_authorized(query, headers):
+            writer.write(
+                self._http_response(
+                    b"dashboard authentication required",
+                    "text/plain; charset=utf-8",
+                    "401 Unauthorized",
+                    extra_headers=["WWW-Authenticate: Bearer"],
+                )
+            )
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
         rows = 25
         log_limit = 200
         activity_limit = 150
@@ -4143,7 +4131,12 @@ class AdminDashboardServer:
             ).encode("utf-8")
             writer.write(self._http_response(body, "application/json; charset=utf-8"))
         elif parsed.path == "/":
-            writer.write(self._http_response(self._html().encode("utf-8"), "text/html; charset=utf-8"))
+            writer.write(
+                self._http_response(
+                    self._html(str(query.get("token", [""])[0] or "")).encode("utf-8"),
+                    "text/html; charset=utf-8",
+                )
+            )
         else:
             writer.write(self._http_response(b"not found", "text/plain; charset=utf-8", "404 Not Found"))
 
@@ -4280,6 +4273,18 @@ def decode_frame(data: bytes) -> Tuple[int, Dict[str, object]]:
     return opcode, _from_wire_map(raw)
 
 
+def _invalid_action(error: str) -> Dict[str, object]:
+    return {"action": "INVALID", "error": error}
+
+
+def _required_payload_text(payload: Dict[str, object], key: str) -> Optional[str]:
+    value = payload.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def opcode_to_action(opcode: int, payload: Dict[str, object], ctx: ConnectionContext) -> Dict[str, object]:
     if opcode == OP_PING:
         return {"action": "PING"}
@@ -4289,11 +4294,14 @@ def opcode_to_action(opcode: int, payload: Dict[str, object], ctx: ConnectionCon
         return {"action": "AUTH_LOGIN", "username": str(payload.get("username", "guest")), "password": str(payload.get("password", ""))}
     if opcode == OP_REGISTER_PLAYER:
         if ctx.state == ConnState.CONNECTED:
-            return {"action": "INVALID", "error": "auth_required"}
-        return {"action": "REGISTER_PLAYER", "player_id": str(payload["player_id"]), "nickname": str(payload.get("nickname", payload["player_id"]))}
+            return _invalid_action("auth_required")
+        player_id = _required_payload_text(payload, "player_id")
+        if player_id is None:
+            return _invalid_action("missing_player_id")
+        return {"action": "REGISTER_PLAYER", "player_id": player_id, "nickname": str(payload.get("nickname", player_id))}
     if opcode == OP_CREATE_LOBBY:
         if ctx.state != ConnState.PLAYER_READY or not ctx.token:
-            return {"action": "INVALID", "error": "player_not_ready"}
+            return _invalid_action("player_not_ready")
         return {
             "action": "CREATE_LOBBY",
             "token": ctx.token,
@@ -4305,24 +4313,38 @@ def opcode_to_action(opcode: int, payload: Dict[str, object], ctx: ConnectionCon
         }
     if opcode == OP_JOIN_LOBBY:
         if ctx.state != ConnState.PLAYER_READY:
-            return {"action": "INVALID", "error": "player_not_ready"}
-        return {"action": "JOIN_LOBBY", "lobby_id": str(payload["lobby_id"]), "player_id": str(payload.get("player_id", ctx.player_id or "")), "password": str(payload.get("password", ""))}
+            return _invalid_action("player_not_ready")
+        lobby_id = _required_payload_text(payload, "lobby_id")
+        if lobby_id is None:
+            return _invalid_action("missing_lobby_id")
+        return {"action": "JOIN_LOBBY", "lobby_id": lobby_id, "player_id": str(payload.get("player_id", ctx.player_id or "")), "password": str(payload.get("password", ""))}
     if opcode == OP_ROUTE_REGISTER:
         if ctx.state != ConnState.PLAYER_READY:
-            return {"action": "INVALID", "error": "player_not_ready"}
-        return {"action": "TITAN_ROUTE_REGISTER", "lobby_id": str(payload["lobby_id"]), "player_id": str(payload.get("player_id", ctx.player_id or ""))}
+            return _invalid_action("player_not_ready")
+        lobby_id = _required_payload_text(payload, "lobby_id")
+        if lobby_id is None:
+            return _invalid_action("missing_lobby_id")
+        return {"action": "TITAN_ROUTE_REGISTER", "lobby_id": lobby_id, "player_id": str(payload.get("player_id", ctx.player_id or ""))}
     if opcode == OP_ROUTE_CHAT:
-        lid = str(payload["lobby_id"])
+        lid = _required_payload_text(payload, "lobby_id")
+        if lid is None:
+            return _invalid_action("missing_lobby_id")
         if lid not in ctx.registered_lobbies:
-            return {"action": "INVALID", "error": "route_not_registered"}
-        return {"action": "TITAN_ROUTE_CHAT", "lobby_id": lid, "from_player": str(payload.get("from_player", ctx.player_id or "unknown")), "message": str(payload["message"])}
+            return _invalid_action("route_not_registered")
+        message = payload.get("message")
+        if message is None:
+            return _invalid_action("missing_message")
+        return {"action": "TITAN_ROUTE_CHAT", "lobby_id": lid, "from_player": str(payload.get("from_player", ctx.player_id or "unknown")), "message": str(message)}
     if opcode == OP_START_GAME:
         if ctx.state != ConnState.PLAYER_READY:
-            return {"action": "INVALID", "error": "player_not_ready"}
-        return {"action": "TITAN_START_GAME", "lobby_id": str(payload["lobby_id"]), "requester_id": str(payload.get("requester_id", ctx.player_id or "")), "port": payload.get("port")}
+            return _invalid_action("player_not_ready")
+        lobby_id = _required_payload_text(payload, "lobby_id")
+        if lobby_id is None:
+            return _invalid_action("missing_lobby_id")
+        return {"action": "TITAN_START_GAME", "lobby_id": lobby_id, "requester_id": str(payload.get("requester_id", ctx.player_id or "")), "port": payload.get("port")}
     if opcode == OP_POLL_EVENTS:
         if ctx.state == ConnState.CONNECTED:
-            return {"action": "INVALID", "error": "auth_required"}
+            return _invalid_action("auth_required")
         return {"action": "ROUTE_POLL", "player_id": str(payload.get("player_id", ctx.player_id or "")), "after_seq": int(payload.get("after_seq", 0))}
     if opcode == OP_TITAN_MESSAGE:
         return {"action": "TITAN_MESSAGE", "packet_hex": str(payload.get("packet_hex", ""))}
@@ -4333,14 +4355,35 @@ def action_to_response_opcode(opcode: int) -> int:
     return opcode
 
 
-async def call_backend(host: str, port: int, payload: Dict[str, object]) -> Dict[str, object]:
-    r, w = await asyncio.open_connection(host, port)
-    w.write((json.dumps(payload) + "\n").encode("utf-8"))
-    await w.drain()
-    line = await r.readline()
-    w.close()
-    await w.wait_closed()
-    return json.loads(line.decode("utf-8")) if line else {"ok": False, "error": "backend_no_response"}
+async def call_backend(
+    host: str,
+    port: int,
+    payload: Dict[str, object],
+    *,
+    shared_secret: str = "",
+    timeout_s: float = BACKEND_RPC_TIMEOUT_SECONDS,
+) -> Dict[str, object]:
+    request_payload = dict(payload)
+    if shared_secret:
+        request_payload["_backend_secret"] = shared_secret
+
+    reader: Optional[asyncio.StreamReader] = None
+    writer: Optional[asyncio.StreamWriter] = None
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout_s)
+        writer.write((json.dumps(request_payload) + "\n").encode("utf-8"))
+        await asyncio.wait_for(writer.drain(), timeout=timeout_s)
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout_s)
+        return json.loads(line.decode("utf-8")) if line else {"ok": False, "error": "backend_no_response"}
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "backend_timeout"}
+    except OSError as exc:
+        return {"ok": False, "error": f"backend_connect_failed:{exc}"}
+    finally:
+        if writer is not None:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), timeout=max(1.0, timeout_s))
 
 
 class BinaryGatewayServer:
@@ -4351,9 +4394,13 @@ class BinaryGatewayServer:
                  routing_port: int = 15100,
                  version_str: str = "0110",
                  valid_versions: Optional[list[str]] = None,
-                 keys_dir: Optional[str] = None):
+                 keys_dir: Optional[str] = None,
+                 backend_shared_secret: str = "",
+                 backend_timeout_s: float = BACKEND_RPC_TIMEOUT_SECONDS):
         self.backend_host = backend_host
         self.backend_port = backend_port
+        self.backend_shared_secret = backend_shared_secret.strip()
+        self.backend_timeout_s = max(1.0, float(backend_timeout_s))
         self.event_bus = event_bus or GatewayEventBus()
         self.public_host = public_host
         self.public_port = public_port
@@ -4375,6 +4422,15 @@ class BinaryGatewayServer:
         self._maintenance_task: Optional[asyncio.Task] = None
         if keys_dir:
             self._load_keys(keys_dir)
+
+    async def _call_backend(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await call_backend(
+            self.backend_host,
+            self.backend_port,
+            payload,
+            shared_secret=self.backend_shared_secret,
+            timeout_s=self.backend_timeout_s,
+        )
 
     def start_background_tasks(self) -> None:
         if self._maintenance_task is None:
@@ -4416,8 +4472,33 @@ class BinaryGatewayServer:
             while True:
                 await asyncio.sleep(PEER_SESSION_SWEEP_INTERVAL_SECONDS)
                 self._expire_peer_sessions()
+                self._prune_ip_activity()
         except asyncio.CancelledError:
             raise
+
+    def _prune_ip_activity(self) -> int:
+        now = time.time()
+        removed = 0
+        stale_ips = [
+            ip
+            for ip, raw in list(self._ip_activity.items())
+            if now - float(raw.get("last_seen", 0.0)) >= IP_ACTIVITY_TTL_SECONDS
+        ]
+        for ip in stale_ips:
+            self._ip_activity.pop(ip, None)
+            removed += 1
+
+        overflow = len(self._ip_activity) - MAX_IP_ACTIVITY_ROWS
+        if overflow > 0:
+            oldest = sorted(
+                self._ip_activity.items(),
+                key=lambda item: (float(item[1].get("last_seen", 0.0)), item[0]),
+            )[:overflow]
+            for ip, _raw in oldest:
+                if ip in self._ip_activity:
+                    self._ip_activity.pop(ip, None)
+                    removed += 1
+        return removed
 
     def record_activity(
         self,
@@ -4504,6 +4585,7 @@ class BinaryGatewayServer:
         return rows[:max(1, limit)]
 
     def dashboard_snapshot(self, activity_limit: int = 150) -> Dict[str, object]:
+        self._prune_ip_activity()
         routing_snapshot = (
             self.routing_manager.dashboard_snapshot()
             if self.routing_manager is not None
@@ -4729,11 +4811,12 @@ class BinaryGatewayServer:
         )
 
     def _alloc_peer_session_id(self) -> int:
-        session_id = self._next_peer_session_id
-        self._next_peer_session_id += 1
-        if self._next_peer_session_id > 0xFFFF:
-            self._next_peer_session_id = 1
-        return session_id
+        for _ in range(MAX_PEER_SESSION_ID):
+            session_id = self._next_peer_session_id
+            self._next_peer_session_id = 1 if session_id >= MAX_PEER_SESSION_ID else session_id + 1
+            if session_id not in self._peer_sessions:
+                return session_id
+        raise RuntimeError("peer_session_id_exhausted")
 
     async def _handle_auth1_peer_connection(self, reader: asyncio.StreamReader,
                                              writer: asyncio.StreamWriter,
@@ -4814,8 +4897,8 @@ class BinaryGatewayServer:
             LOGGER.warning("Auth1Peer: empty SecretA from %s:%s", *peer)
             return
 
-        session_id = self._alloc_peer_session_id() if req["auth_mode"] == 2 else 0
         self._expire_peer_sessions()
+        session_id = self._alloc_peer_session_id() if req["auth_mode"] == 2 else 0
         secret_a_cipher = won_crypto.eg_encrypt(
             struct.pack("<H", len(secret_a)) + secret_a,
             int(client_cert["p"]),
@@ -4964,27 +5047,23 @@ class BinaryGatewayServer:
             )
 
         try:
-            await call_backend(
-                self.backend_host,
-                self.backend_port,
+            await self._call_backend(
                 {
                     "action": "REGISTER_FACTORY",
                     "factory_id": factory_id,
                     "host": self.public_host,
                     "region": "global",
                     "max_processes": 4,
-                },
+                }
             )
-            backend = await call_backend(
-                self.backend_host,
-                self.backend_port,
+            backend = await self._call_backend(
                 {
                     "action": "FACTORY_START_PROCESS",
                     "factory_id": factory_id,
                     "process_name": process_name,
                     "game_name": game_name,
                     "port": selected_port,
-                },
+                }
             )
             if backend.get("ok"):
                 server = backend.get("server", {})
@@ -5025,15 +5104,13 @@ class BinaryGatewayServer:
         req = decode_request(packet)
         kind = req.get("kind")
         if kind == "auth_login":
-            backend = await call_backend(
-                self.backend_host,
-                self.backend_port,
+            backend = await self._call_backend(
                 {
                     "action": "AUTH_LOGIN",
                     "username": req["username"],
                     "password": req["password"],
                     "client_ip": client_ip,
-                },
+                }
             )
             if backend.get("ok"):
                 reply = AuthLoginReply(STATUS_OK, str(backend.get("token", ""))).encode()
@@ -5042,7 +5119,7 @@ class BinaryGatewayServer:
             return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
 
         if kind == "dir_get":
-            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_DIR_GET", "path": req["path"]})
+            backend = await self._call_backend({"action": "TITAN_DIR_GET", "path": req["path"]})
             if backend.get("ok"):
                 reply = DirGetReply(STATUS_OK, json.dumps(backend.get("entities", {}))).encode()
             else:
@@ -5050,7 +5127,7 @@ class BinaryGatewayServer:
             return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
 
         if kind == "route_register":
-            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_REGISTER", "lobby_id": req["lobby_id"], "player_id": req["player_id"]})
+            backend = await self._call_backend({"action": "TITAN_ROUTE_REGISTER", "lobby_id": req["lobby_id"], "player_id": req["player_id"]})
             if backend.get("ok"):
                 reply = RoutingStatusReply(STATUS_OK, "registered").encode()
             else:
@@ -5058,7 +5135,7 @@ class BinaryGatewayServer:
             return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
 
         if kind == "route_join":
-            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_JOIN", "lobby_id": req["lobby_id"], "player_id": req["player_id"]})
+            backend = await self._call_backend({"action": "TITAN_ROUTE_JOIN", "lobby_id": req["lobby_id"], "player_id": req["player_id"]})
             if backend.get("ok"):
                 reply = RoutingStatusReply(STATUS_OK, "joined").encode()
             else:
@@ -5066,7 +5143,7 @@ class BinaryGatewayServer:
             return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
 
         if kind == "route_chat":
-            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_CHAT", "lobby_id": req["lobby_id"], "from_player": req["player_id"], "message": req["message"]})
+            backend = await self._call_backend({"action": "TITAN_ROUTE_CHAT", "lobby_id": req["lobby_id"], "from_player": req["player_id"], "message": req["message"]})
             if backend.get("ok"):
                 reply = RoutingChatEvent(STATUS_OK, req["lobby_id"], req["player_id"], req["message"]).encode()
             else:
@@ -5074,9 +5151,9 @@ class BinaryGatewayServer:
             return {"ok": True, "packet_hex": binascii.hexlify(reply).decode("ascii")}
 
         if kind == "route_data_set":
-            backend = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_SET_DATA_OBJECT", "lobby_id": req["lobby_id"], "key": req["key"], "value": req["value"]})
+            backend = await self._call_backend({"action": "TITAN_ROUTE_SET_DATA_OBJECT", "lobby_id": req["lobby_id"], "key": req["key"], "value": req["value"]})
             if backend.get("ok"):
-                backend2 = await call_backend(self.backend_host, self.backend_port, {"action": "TITAN_ROUTE_GET_DATA_OBJECT", "lobby_id": req["lobby_id"], "key": req["key"]})
+                backend2 = await self._call_backend({"action": "TITAN_ROUTE_GET_DATA_OBJECT", "lobby_id": req["lobby_id"], "key": req["key"]})
                 if backend2.get("ok"):
                     reply = RoutingDataObjectReply(STATUS_OK, req["key"], str(backend2.get("value", ""))).encode()
                 else:
@@ -5142,10 +5219,7 @@ class BinaryGatewayServer:
 
         # Fetch lobby members from backend to know who to push to
         try:
-            backend_resp = await call_backend(
-                self.backend_host, self.backend_port,
-                {"action": "TITAN_DIR_GET", "path": "/Homeworld"},
-            )
+            backend_resp = await self._call_backend({"action": "TITAN_DIR_GET", "path": "/Homeworld"})
             entities = backend_resp.get("entities", {})
             lobby_ent = entities.get(lobby_id)
             if isinstance(lobby_ent, dict):
@@ -5156,10 +5230,7 @@ class BinaryGatewayServer:
 
         # Simpler: query lobby player list directly
         try:
-            lobby_resp = await call_backend(
-                self.backend_host, self.backend_port,
-                {"action": "LIST_LOBBIES"},
-            )
+            lobby_resp = await self._call_backend({"action": "LIST_LOBBIES"})
             lobbies = lobby_resp.get("lobbies", [])
             for lob in lobbies:
                 if isinstance(lob, dict) and lob.get("lobby_id") == lobby_id:
@@ -5327,10 +5398,7 @@ class BinaryGatewayServer:
             if self.routing_manager is not None:
                 entries.extend(self.routing_manager.directory_entries())
             if not entries:
-                backend = await call_backend(
-                    self.backend_host, self.backend_port,
-                    {"action": "TITAN_DIR_GET", "path": "/Homeworld"},
-                )
+                backend = await self._call_backend({"action": "TITAN_DIR_GET", "path": "/Homeworld"})
                 if backend.get("ok"):
                     for entity_name, ent in dict(backend.get("entities", {})).items():
                         if not isinstance(ent, dict):
@@ -5352,10 +5420,7 @@ class BinaryGatewayServer:
                                 "data_objects": data_objects,
                             })
 
-            titan_backend = await call_backend(
-                self.backend_host, self.backend_port,
-                {"action": "TITAN_DIR_GET", "path": "/TitanServers"},
-            )
+            titan_backend = await self._call_backend({"action": "TITAN_DIR_GET", "path": "/TitanServers"})
             if titan_backend.get("ok"):
                 for entity_name, ent in dict(titan_backend.get("entities", {})).items():
                     if not isinstance(ent, dict):
@@ -5558,7 +5623,7 @@ class BinaryGatewayServer:
                                 client_ip=str(peer[0]),
                             )
                         else:
-                            response = await call_backend(self.backend_host, self.backend_port, action)
+                            response = await self._call_backend(action)
                     except Exception as exc:
                         response = {"ok": False, "error": str(exc)}
 
@@ -5630,6 +5695,8 @@ class BinaryGatewayServer:
 
 async def main_async(args: argparse.Namespace) -> None:
     event_bus = GatewayEventBus()
+    if args.admin_port > 0 and not _is_loopback_host(args.admin_host) and not str(args.admin_token or "").strip():
+        raise ValueError("Refusing to expose the admin dashboard on a non-loopback host without --admin-token.")
     valid_versions: list[str] = []
     if getattr(args, "valid_versions_file", None):
         raw = Path(args.valid_versions_file).read_text(encoding="utf-8")
@@ -5647,6 +5714,8 @@ async def main_async(args: argparse.Namespace) -> None:
         version_str=args.version_str,
         valid_versions=valid_versions,
         keys_dir=args.keys_dir,
+        backend_shared_secret=args.backend_shared_secret,
+        backend_timeout_s=args.backend_timeout,
     )
     LOGGER.info("ValidVersions configured: %r", list(srv.valid_versions))
     routing_manager = RoutingServerManager(
@@ -5671,6 +5740,7 @@ async def main_async(args: argparse.Namespace) -> None:
         srv,
         args.db_path,
         DASHBOARD_LOG_HANDLER,
+        admin_token=args.admin_token,
     )
     admin_server = None
     if args.admin_port > 0:
@@ -5722,6 +5792,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend-host", default="127.0.0.1")
     p.add_argument("--backend-port", type=int, default=9100,
                    help="Port of the internal WON backend (won_server.py)")
+    p.add_argument(
+        "--backend-shared-secret",
+        default=os.environ.get("BACKEND_SHARED_SECRET", ""),
+        help="Optional shared secret sent to the internal backend JSON-RPC service.",
+    )
+    p.add_argument(
+        "--backend-timeout",
+        type=float,
+        default=float(os.environ.get("BACKEND_RPC_TIMEOUT", BACKEND_RPC_TIMEOUT_SECONDS)),
+        help="Timeout in seconds for backend JSON-RPC calls.",
+    )
     p.add_argument("--public-host", default="127.0.0.1",
                    help="Public IP reported to Homeworld clients in directory replies")
     p.add_argument("--routing-port", type=int, default=15100,
@@ -5734,6 +5815,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Bind host for the local admin dashboard (127.0.0.1 keeps it local-only)")
     p.add_argument("--admin-port", type=int, default=8080,
                    help="Port for the local admin dashboard (set to 0 to disable)")
+    p.add_argument(
+        "--admin-token",
+        default=os.environ.get("ADMIN_TOKEN", ""),
+        help="Optional token for the admin dashboard. Required if --admin-host is not loopback.",
+    )
     p.add_argument("--db-path", default=str(Path(__file__).with_name("won_server.db")),
                    help="Path to the SQLite backend DB shown in the admin dashboard")
     p.add_argument("--version-str", default="0110",

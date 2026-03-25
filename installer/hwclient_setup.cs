@@ -222,6 +222,8 @@ internal static class HWClientSetup
             throw new OperationCanceledException();
         }
 
+        installChoices.ServerHost = NormalizeServerHost(installChoices.ServerHost);
+
         InstallResult result = Install(gameDirectory, installChoices.ServerHost, installChoices.WriteRegistryKeys, installChoices.RegistryCdKey);
         MessageBox.Show(
             BuildInstallSuccessMessage(result),
@@ -240,7 +242,7 @@ internal static class HWClientSetup
         }
         BackupNetTweak(gameDirectory);
         WriteNetTweak(gameDirectory, serverHost);
-        File.WriteAllBytes(Path.Combine(gameDirectory, "kver.kp"), EmbeddedKver);
+        WriteFileBytes(Path.Combine(gameDirectory, "kver.kp"), EmbeddedKver, "kver.kp");
 
         return new InstallResult
         {
@@ -350,14 +352,14 @@ internal static class HWClientSetup
             return;
         }
 
-        File.Copy(netTweakPath, backupPath, false);
+        CopyFile(netTweakPath, backupPath, "NetTweak.script backup");
     }
 
     private static void WriteNetTweak(string gameDirectory, string serverHost)
     {
         string netTweakPath = Path.Combine(gameDirectory, "NetTweak.script");
         string contents = ApplyNetTweakOverrides(ReadNetTweakBaseline(gameDirectory), serverHost);
-        File.WriteAllText(netTweakPath, contents, Encoding.ASCII);
+        WriteFileText(netTweakPath, contents, Encoding.ASCII, "NetTweak.script");
     }
 
     private static string ReadNetTweakBaseline(string gameDirectory)
@@ -422,6 +424,41 @@ internal static class HWClientSetup
         return string.Join("\r\n", mergedLines) + "\r\n";
     }
 
+    private static string NormalizeServerHost(string serverHost)
+    {
+        string normalized = (serverHost ?? string.Empty).Trim();
+        if (normalized.Length == 0)
+        {
+            throw new InvalidOperationException("Enter a server host or IPv4 address.");
+        }
+
+        if (normalized.IndexOfAny(new[] { '\r', '\n', '\t', ' ', ',', ';', '"', '\'' }) >= 0)
+        {
+            throw new InvalidOperationException("Server host must be a single hostname or IPv4 address without spaces or control characters.");
+        }
+
+        foreach (char ch in normalized)
+        {
+            bool allowed = (ch >= 'a' && ch <= 'z')
+                || (ch >= 'A' && ch <= 'Z')
+                || (ch >= '0' && ch <= '9')
+                || ch == '.'
+                || ch == '-';
+            if (!allowed)
+            {
+                throw new InvalidOperationException("Server host contains unsupported characters. Use a hostname like hw1.example.com or an IPv4 address.");
+            }
+        }
+
+        UriHostNameType hostType = Uri.CheckHostName(normalized);
+        if (hostType != UriHostNameType.Dns && hostType != UriHostNameType.IPv4)
+        {
+            throw new InvalidOperationException("Server host must be a valid hostname or IPv4 address.");
+        }
+
+        return normalized;
+    }
+
     private static bool TryGetNetTweakKey(string line, out string key)
     {
         key = null;
@@ -455,7 +492,66 @@ internal static class HWClientSetup
     {
         if (File.Exists(path))
         {
-            File.Delete(path);
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                if (!(ex is IOException) && !(ex is UnauthorizedAccessException))
+                {
+                    throw;
+                }
+                throw new InvalidOperationException("Could not remove " + Path.GetFileName(path) + " at " + path + ". Close any programs using the file and try again.", ex);
+            }
+        }
+    }
+
+    private static void CopyFile(string sourcePath, string destinationPath, string displayName)
+    {
+        try
+        {
+            File.Copy(sourcePath, destinationPath, false);
+        }
+        catch (Exception ex)
+        {
+            if (!(ex is IOException) && !(ex is UnauthorizedAccessException))
+            {
+                throw;
+            }
+            throw new InvalidOperationException("Could not create " + displayName + " at " + destinationPath + ".", ex);
+        }
+    }
+
+    private static void WriteFileText(string path, string contents, Encoding encoding, string displayName)
+    {
+        try
+        {
+            File.WriteAllText(path, contents, encoding);
+        }
+        catch (Exception ex)
+        {
+            if (!(ex is IOException) && !(ex is UnauthorizedAccessException))
+            {
+                throw;
+            }
+            throw new InvalidOperationException("Could not write " + displayName + " at " + path + ".", ex);
+        }
+    }
+
+    private static void WriteFileBytes(string path, byte[] contents, string displayName)
+    {
+        try
+        {
+            File.WriteAllBytes(path, contents);
+        }
+        catch (Exception ex)
+        {
+            if (!(ex is IOException) && !(ex is UnauthorizedAccessException))
+            {
+                throw;
+            }
+            throw new InvalidOperationException("Could not write " + displayName + " at " + path + ".", ex);
         }
     }
 
@@ -908,6 +1004,29 @@ internal static class HWClientSetup
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);
                     customTextBox.Focus();
+                    form.DialogResult = DialogResult.None;
+                    return;
+                }
+
+                try
+                {
+                    string candidateServerHost = useCustom
+                        ? customTextBox.Text
+                        : (presetCombo.SelectedItem as string ?? DefaultServerHost);
+                    NormalizeServerHost(candidateServerHost);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    MessageBox.Show(
+                        form,
+                        ex.Message,
+                        "Homeworld Online Setup",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                    if (useCustom)
+                    {
+                        customTextBox.Focus();
+                    }
                     form.DialogResult = DialogResult.None;
                     return;
                 }

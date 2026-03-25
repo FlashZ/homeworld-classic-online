@@ -129,31 +129,6 @@ def encode_private_key(p: int, q: int, g: int, y: int, x: int) -> bytes:
 
 
 def decode_public_key(der: bytes) -> Tuple[int, int, int, int]:
-    """Decode DER SEQUENCE { p, q, g, y } → (p, q, g, y)."""
-    if der[0] != 0x30:
-        raise ValueError("Expected DER SEQUENCE tag 0x30")
-    _, offset = _der_parse_length(der, 1)
-    p, offset = _der_parse_integer(der, offset)
-    q, offset = _der_parse_integer(der, offset)
-    g, offset = _der_parse_integer(der, offset)
-    y, offset = _der_parse_integer(der, offset)
-    return p, q, g, y
-
-
-def decode_private_key(der: bytes) -> Tuple[int, int, int, int, int]:
-    """Decode DER SEQUENCE { p, q, g, y, x } → (p, q, g, y, x)."""
-    if der[0] != 0x30:
-        raise ValueError("Expected DER SEQUENCE tag 0x30")
-    _, offset = _der_parse_length(der, 1)
-    p, offset = _der_parse_integer(der, offset)
-    q, offset = _der_parse_integer(der, offset)
-    g, offset = _der_parse_integer(der, offset)
-    y, offset = _der_parse_integer(der, offset)
-    x, offset = _der_parse_integer(der, offset)
-    return p, q, g, y, x
-
-
-def decode_public_key(der: bytes) -> Tuple[int, int, int, int]:
     """Decode DER SEQUENCE { p, q, g, y } into (p, q, g, y)."""
     offset, end = _der_parse_sequence(der, 0)
     p, offset = _der_parse_integer(der, offset)

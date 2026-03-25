@@ -1,17 +1,72 @@
 services:
-  won-oss-server:
+  backend:
     build: .
-    container_name: won-oss-server
+    container_name: won-backend
     restart: unless-stopped
-    environment:
-      PUBLIC_HOST: ${PUBLIC_HOST:?set PUBLIC_HOST to your VPS public IPv4}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      GATEWAY_PORT: ${GATEWAY_PORT:-15101}
-      ROUTING_PORT: ${ROUTING_PORT:-15100}
-      ROUTING_MAX_PORT: ${ROUTING_MAX_PORT:-15120}
-      FIREWALL_PORT: ${FIREWALL_PORT:-2021}
-      ADMIN_HOST: ${ADMIN_HOST:-0.0.0.0}
-      ADMIN_PORT: ${ADMIN_PORT:-8080}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        mkdir -p /data /data/keys
+        if [ ! -f /data/won_server.db ]; then
+          cp /app/won_oss_server/won_server.db /data/won_server.db
+        fi
+        for key_file in authserver_private.der authserver_public.der verifier_private.der verifier_public.der kver.kp; do
+          if [ ! -f "/data/keys/$$key_file" ]; then
+            cp "/app/won_oss_server/keys/$$key_file" "/data/keys/$$key_file"
+          fi
+        done
+        exec python /app/won_oss_server/won_server.py \
+          --host 0.0.0.0 \
+          --port "${BACKEND_PORT:-9100}" \
+          --db-path /data/won_server.db \
+          --shared-secret "${BACKEND_SHARED_SECRET:?set BACKEND_SHARED_SECRET in .env}"
+    volumes:
+      - ./data:/data
+    networks:
+      - won-network
+
+  gateway:
+    build: .
+    container_name: won-gateway
+    restart: unless-stopped
+    command:
+      - python
+      - /app/won_oss_server/titan_binary_gateway.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${GATEWAY_PORT:-15101}"
+      - --backend-host
+      - backend
+      - --backend-port
+      - "${BACKEND_PORT:-9100}"
+      - --backend-shared-secret
+      - "${BACKEND_SHARED_SECRET:?set BACKEND_SHARED_SECRET in .env}"
+      - --backend-timeout
+      - "${BACKEND_RPC_TIMEOUT:-5}"
+      - --public-host
+      - "${PUBLIC_HOST:?set PUBLIC_HOST to your VPS public IPv4 or DNS name}"
+      - --routing-port
+      - "${ROUTING_PORT:-15100}"
+      - --routing-max-port
+      - "${ROUTING_MAX_PORT:-15120}"
+      - --firewall-port
+      - "${FIREWALL_PORT:-2021}"
+      - --admin-host
+      - 0.0.0.0
+      - --admin-port
+      - "${ADMIN_PORT:-8080}"
+      - --admin-token
+      - "${ADMIN_TOKEN:?set ADMIN_TOKEN in .env for the Docker-published dashboard}"
+      - --db-path
+      - /data/won_server.db
+      - --keys-dir
+      - /data/keys
+      - --log
+      - "${LOG_LEVEL:-INFO}"
+    depends_on:
+      - backend
     ports:
       - "${GATEWAY_PORT:-15101}:${GATEWAY_PORT:-15101}"
       - "${ROUTING_PORT:-15100}-${ROUTING_MAX_PORT:-15120}:${ROUTING_PORT:-15100}-${ROUTING_MAX_PORT:-15120}"
@@ -19,3 +74,9 @@ services:
       - "127.0.0.1:${ADMIN_PORT:-8080}:${ADMIN_PORT:-8080}"
     volumes:
       - ./data:/data
+    networks:
+      - won-network
+
+networks:
+  won-network:
+    driver: bridge

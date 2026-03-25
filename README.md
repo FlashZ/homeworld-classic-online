@@ -13,11 +13,11 @@ Tested against Homeworld 1.05. Homeworld Remastered Classic is not supported (it
 ## Quick start (Docker)
 
 ```bash
-cp .env.example .env        # then edit PUBLIC_HOST to your server's address
+cp .env.example .env        # then edit PUBLIC_HOST, BACKEND_SHARED_SECRET, and ADMIN_TOKEN
 docker compose up -d --build
 ```
 
-This starts both the backend and gateway, seeds default keys and database on first launch, and stores persistent data under `./data`.
+This builds one Docker image, then runs two containers from it: `backend` and `gateway`. On first launch the backend seeds default keys/database into `./data`, and both containers reuse that persistent state on later restarts.
 
 Ports to expose:
 
@@ -27,7 +27,7 @@ Ports to expose:
 | `15100-15120/tcp` | Routing, chat, and game rooms |
 | `2021/tcp` | Firewall/NAT probe |
 
-The admin dashboard is available at `http://127.0.0.1:8080/` on the host machine.
+The admin dashboard is available at `http://127.0.0.1:8080/?token=...` on the host machine. In Docker, the dashboard is published through the gateway container, so `ADMIN_TOKEN` is required.
 
 ## Testing
 
@@ -94,17 +94,35 @@ python titan_binary_gateway.py `
 
 Set `--public-host` to the address clients will use to reach the server.
 
+Security defaults:
+
+- The backend now defaults to `127.0.0.1` and only accepts non-loopback clients if you explicitly configure a matching shared secret with `won_server.py --shared-secret ...` and `titan_binary_gateway.py --backend-shared-secret ...`.
+- The dashboard defaults to `127.0.0.1`. If you bind `--admin-host` to anything non-loopback, you must also set `--admin-token` and include it as `?token=...` in the dashboard URL.
+
 ### Docker details
 
-Copy `.env.example` to `.env` and set `PUBLIC_HOST`. To reuse existing data, place key files in `data/keys/` and/or the database at `data/won_server.db` before first start.
+Copy `.env.example` to `.env` and set at least `PUBLIC_HOST`, `BACKEND_SHARED_SECRET`, and `ADMIN_TOKEN`. To reuse existing data, place key files in `data/keys/` and/or the database at `data/won_server.db` before first start.
 
 ```bash
 docker compose up -d --build   # start
-docker compose logs -f         # watch logs
+docker compose logs -f backend gateway   # watch logs
 docker compose down            # stop
 ```
 
-The container runs both processes and seeds `./data` with defaults on first launch.
+Compose now starts two services from the same image:
+
+- `backend` runs `won_server.py` on the internal Docker network only.
+- `gateway` runs `titan_binary_gateway.py` and publishes the Homeworld-facing ports plus a localhost-only admin dashboard.
+
+The shared `./data` bind mount holds the SQLite database and Auth1 key material for both containers.
+
+There is no custom Docker entrypoint or sidecar supervisor in this setup. Compose launches the Python commands directly, and the only bootstrap logic left is a small first-run seed step in the backend service command so `./data` starts with the bundled database and keys.
+
+Useful environment knobs:
+
+- `BACKEND_SHARED_SECRET` is required in Docker because the gateway talks to the backend over the Compose bridge network instead of container-local loopback.
+- `ADMIN_TOKEN` is required in Docker because the gateway must bind the dashboard on `0.0.0.0` inside the container before Docker can publish it back to `127.0.0.1` on the host.
+- `BACKEND_PORT`, `GATEWAY_PORT`, `ROUTING_PORT`, `ROUTING_MAX_PORT`, `FIREWALL_PORT`, and `ADMIN_PORT` let you remap the container listeners if needed.
 
 ## Architecture
 

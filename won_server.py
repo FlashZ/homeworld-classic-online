@@ -7,8 +7,10 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
+import ipaddress
 import json
 import logging
+import os
 import secrets
 import signal
 import sqlite3
@@ -22,6 +24,7 @@ LOGGER = logging.getLogger("won_oss_server")
 SESSION_TTL_SECONDS = 24 * 60 * 60
 RATE_WINDOW_SECONDS = 5 * 60
 MAX_LOGIN_ATTEMPTS = 20
+MAX_EVENTS_PER_PLAYER = 256
 PROTECTED_PATHS: Set[str] = {"/Homeworld", "/TitanServers"}
 _login_attempts: Dict[str, List[float]] = {}
 
@@ -34,6 +37,21 @@ OBJ_FACT_CUR_SERVER_COUNT = "__FactCur_RoutingServHWGame"
 OBJ_FACT_TOTAL_SERVER_COUNT = "__FactTotal_RoutingServHWGame"
 OBJ_SERVER_UPTIME = "__ServerUptime"
 DEFAULT_FACTORY_DISPLAY_NAME = "Melbourne"
+
+
+def _is_loopback_ip(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    candidate = str(value).strip()
+    if not candidate:
+        return False
+    if candidate.startswith("::ffff:"):
+        candidate = candidate[7:]
+    if candidate.lower() == "localhost":
+        return True
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(candidate).is_loopback
+    return False
 
 
 @dataclass
@@ -243,6 +261,9 @@ class WONLikeState:
             evt = json.loads(r["event_json"])
             self.events_by_player.setdefault(r["player_id"], []).append(evt)
             self.event_seq = max(self.event_seq, int(r["seq"]))
+        for player_id, events in list(self.events_by_player.items()):
+            if len(events) > MAX_EVENTS_PER_PLAYER:
+                self.events_by_player[player_id] = events[-MAX_EVENTS_PER_PLAYER:]
 
     @staticmethod
     def _directory_entity_path(path: str, entity_name: str) -> str:
@@ -345,7 +366,10 @@ class WONLikeState:
         self.event_seq += 1
         event = {"seq": self.event_seq, "type": evt_type, "payload": payload, "ts": time.time()}
         for pid in player_ids:
-            self.events_by_player.setdefault(pid, []).append(event)
+            events = self.events_by_player.setdefault(pid, [])
+            events.append(event)
+            if len(events) > MAX_EVENTS_PER_PLAYER:
+                del events[:-MAX_EVENTS_PER_PLAYER]
         self._persist_events()
 
     def create_user(self, username: str, password: str) -> None:
@@ -391,6 +415,19 @@ class WONLikeState:
         if expired_tokens:
             self._persist_sessions()
         return len(expired_tokens)
+
+    def cleanup_login_attempts(self) -> int:
+        now = time.time()
+        removed_entries = 0
+        for key in list(_login_attempts):
+            current = _login_attempts.get(key, [])
+            pruned = [ts for ts in current if now - ts <= RATE_WINDOW_SECONDS]
+            removed_entries += max(0, len(current) - len(pruned))
+            if pruned:
+                _login_attempts[key] = pruned
+            else:
+                _login_attempts.pop(key, None)
+        return removed_entries
 
     def is_session_valid(self, token: str) -> bool:
         session = self.sessions.get(token)
@@ -644,9 +681,23 @@ def serialize_server(gs: GameServer) -> Dict[str, Any]:
 
 
 class WONLikeProtocolServer:
-    def __init__(self, state: WONLikeState):
+    def __init__(self, state: WONLikeState, shared_secret: str = ""):
         self.state = state
+        self.shared_secret = shared_secret.strip()
         self.managed_procs: Dict[str, asyncio.subprocess.Process] = {}
+
+    @staticmethod
+    def _client_ip(writer: asyncio.StreamWriter) -> Optional[str]:
+        peer = writer.get_extra_info("peername")
+        if isinstance(peer, tuple) and peer:
+            return str(peer[0])
+        return None
+
+    def _request_is_authorized(self, req: Dict[str, Any], client_ip: Optional[str]) -> bool:
+        if self.shared_secret:
+            supplied = req.get("_backend_secret")
+            return isinstance(supplied, str) and secrets.compare_digest(supplied, self.shared_secret)
+        return _is_loopback_ip(client_ip)
 
     async def _spawn_managed_process(self, key: str) -> None:
         # Legacy-friendly placeholder process supervisor; replace cmd with real dedicated binary as needed.
@@ -663,6 +714,7 @@ class WONLikeProtocolServer:
         asyncio.create_task(_waiter())
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        client_ip = self._client_ip(writer)
         try:
             while True:
                 raw = await reader.readline()
@@ -670,8 +722,16 @@ class WONLikeProtocolServer:
                     break
                 self.state.metrics["requests"] += 1
                 try:
-                    req = json.loads(raw.decode("utf-8"))
-                    resp = await self.handle_request(req)
+                    decoded = json.loads(raw.decode("utf-8"))
+                    if not isinstance(decoded, dict):
+                        raise ValueError("invalid_request")
+                    req = dict(decoded)
+                    if not self._request_is_authorized(req, client_ip):
+                        self.state.metrics["errors"] += 1
+                        resp = {"ok": False, "error": "unauthorized_backend_request"}
+                    else:
+                        req.pop("_backend_secret", None)
+                        resp = await self.handle_request(req)
                 except Exception as exc:
                     self.state.metrics["errors"] += 1
                     resp = {"ok": False, "error": str(exc)}
@@ -780,20 +840,35 @@ async def prune_loop(state: WONLikeState, every_s: int = 10) -> None:
         expired_sessions = state.cleanup_expired_sessions()
         if expired_sessions:
             LOGGER.info("expired_sessions_removed=%d", expired_sessions)
+        expired_login_attempts = state.cleanup_login_attempts()
+        if expired_login_attempts:
+            LOGGER.info("expired_login_attempts_removed=%d", expired_login_attempts)
         await asyncio.sleep(every_s)
 
 
-async def run_server(host: str, port: int, timeout_s: int, db_path: str) -> Tuple[asyncio.AbstractServer, WONLikeState, StateStore]:
+async def run_server(
+    host: str,
+    port: int,
+    timeout_s: int,
+    db_path: str,
+    shared_secret: str = "",
+) -> Tuple[asyncio.AbstractServer, WONLikeState, StateStore]:
     store = StateStore(db_path)
     state = WONLikeState(store=store, heartbeat_timeout_s=timeout_s)
-    proto = WONLikeProtocolServer(state)
+    proto = WONLikeProtocolServer(state, shared_secret=shared_secret)
     srv = await asyncio.start_server(proto.handle_client, host=host, port=port)
     return srv, state, store
 
 
 async def main_async(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    server, state, store = await run_server(args.host, args.port, args.heartbeat_timeout, args.db_path)
+    server, state, store = await run_server(
+        args.host,
+        args.port,
+        args.heartbeat_timeout,
+        args.db_path,
+        shared_secret=args.shared_secret,
+    )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     try:
@@ -816,11 +891,16 @@ async def main_async(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="WON-inspired open source lobby/matchmaking server")
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9100,
                    help="Internal backend port (gateway connects here; NOT the Homeworld-facing port)")
     p.add_argument("--heartbeat-timeout", type=int, default=45)
     p.add_argument("--db-path", default=str(Path(__file__).resolve().parent / "won_server.db"))
+    p.add_argument(
+        "--shared-secret",
+        default=os.environ.get("BACKEND_SHARED_SECRET", ""),
+        help="Optional shared secret required by backend JSON-RPC clients. Without this, only loopback clients are accepted.",
+    )
     return p
 
 
