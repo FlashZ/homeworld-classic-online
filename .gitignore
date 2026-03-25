@@ -1,6 +1,7 @@
 
 __pycache__/
 *.pyc
+.pytest_cache/
 won_server.db
 won_server.db-wal
 won_server.db-shm
