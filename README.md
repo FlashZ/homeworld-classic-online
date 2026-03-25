@@ -6,7 +6,7 @@
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![Homeworld 1.05](https://img.shields.io/badge/Homeworld-1.05-orange)](https://en.wikipedia.org/wiki/Homeworld)
 
-Open-source replacement for the Sierra WON (World Opponent Network) backend services, targeting **Homeworld 1 multiplayer**. It implements the real WON/Titan wire protocol — Auth1 key exchange, NR-MD5 signatures, and ElGamal encryption — so the original unpatched Homeworld 1 client can connect directly.
+Open-source replacement for the Sierra WON (World Opponent Network) backend services, targeting **Homeworld 1 multiplayer**. It implements the real WON/Titan wire protocol - Auth1 key exchange, NR-MD5 signatures, and ElGamal encryption - so the original unpatched Homeworld 1 client can connect directly.
 
 Tested against Homeworld 1.05. Homeworld Remastered Classic is not supported (its multiplayer was removed and it does not behave like the original retail client).
 
@@ -57,8 +57,8 @@ installer\build_installer.bat
 
 Two files control which server the game contacts:
 
-- **`NetTweak.script`** — tells Homeworld which directory/patch server to connect to (`DIRSERVER_IPSTRINGS`, `DIRSERVER_PORTS`, `PATCHSERVER_IPSTRINGS`, `PATCHSERVER_PORTS`). The installer updates these values while preserving the rest of the retail script (LAN settings, port tuning).
-- **`kver.kp`** — the verifier public key the client uses to validate the server's Auth1 handshake.
+- **`NetTweak.script`** - tells Homeworld which directory/patch server to connect to (`DIRSERVER_IPSTRINGS`, `DIRSERVER_PORTS`, `PATCHSERVER_IPSTRINGS`, `PATCHSERVER_PORTS`). The installer updates these values while preserving the rest of the retail script (LAN settings, port tuning).
+- **`kver.kp`** - the verifier public key the client uses to validate the server's Auth1 handshake.
 
 Both must match the server you are running. If the host points at one server but the verifier key belongs to another, the client will connect but Auth1 will fail.
 
@@ -79,10 +79,10 @@ python generate_keys.py --keys-dir keys
 Start the backend and gateway in separate terminals:
 
 ```powershell
-# Terminal 1 — backend
+# Terminal 1 - backend
 python won_server.py --host 127.0.0.1 --port 9100 --db-path won_server.db
 
-# Terminal 2 — gateway
+# Terminal 2 - gateway
 python titan_binary_gateway.py `
   --host 0.0.0.0 --port 15101 `
   --backend-host 127.0.0.1 --backend-port 9100 `
@@ -160,13 +160,13 @@ flowchart LR
 
 The server has two processes:
 
-- **`won_server.py`** — JSON-RPC backend handling auth, lobbies, matchmaking, and game-launch lifecycle. Persists state to SQLite (WAL mode).
-- **`titan_binary_gateway.py`** — Binary protocol gateway that speaks the native Titan wire format. Handles Auth1 handshakes, directory queries, routing, the factory service, firewall probes, and the admin dashboard. Communicates with the backend over internal JSON-RPC.
+- **`won_server.py`** - JSON-RPC backend handling auth, lobbies, matchmaking, and game-launch lifecycle. Persists state to SQLite (WAL mode).
+- **`titan_binary_gateway.py`** - Binary protocol gateway that speaks the native Titan wire format. Handles Auth1 handshakes, directory queries, routing, the factory service, firewall probes, and the admin dashboard. Communicates with the backend over internal JSON-RPC.
 
 Supporting modules:
 
-- **`won_crypto.py`** — NR-MD5 signatures, ElGamal encryption, DER key encoding, Auth1 key block and certificate builders.
-- **`titan_messages.py`** — Titan message schemas and codecs.
+- **`won_crypto.py`** - NR-MD5 signatures, ElGamal encryption, DER key encoding, Auth1 key block and certificate builders.
+- **`titan_messages.py`** - Titan message schemas and codecs.
 
 ### What's implemented
 
@@ -183,20 +183,20 @@ Supporting modules:
 
 ### Known limitations
 
-- **No credential validation** — the server issues a certificate to any connecting client without checking credentials. Accounts are auto-created on first login.
-- **NAT detection** — the firewall probe reply is implemented but strict-NAT behavior needs broader field testing.
-- **Reconnect-to-match** — matches on player name and IP; needs wider real-world validation.
-- **In-process routing** — routing rooms are managed in-gateway rather than spawning external `RoutingServHWGame` binaries.
+- **No credential validation** - the server issues a certificate to any connecting client without checking credentials. Accounts are auto-created on first login.
+- **NAT detection** - the firewall probe reply is implemented but strict-NAT behavior needs broader field testing.
+- **Reconnect-to-match** - matches on player name and IP; needs wider real-world validation.
+- **In-process routing** - routing rooms are managed in-gateway rather than spawning external `RoutingServHWGame` binaries.
 
 ## Roadmap
 
-- **Decode gameplay packets** — the server relays `SendData`/`SendDataBroadcast` traffic as opaque bytes. Next step is classifying packet shapes and mapping them to in-game actions.
-- **Match diagnostics** — once packets are decoded, surface match timelines, desync clues, and launch/end markers in the admin dashboard.
-- **Match telemetry** — use decoded traffic for result summaries, lightweight stats, and more reliable reconnect/resync.
+- **Decode gameplay packets** - the server relays `SendData`/`SendDataBroadcast` traffic as opaque bytes. Next step is classifying packet shapes and mapping them to in-game actions.
+- **Match diagnostics** - once packets are decoded, surface match timelines, desync clues, and launch/end markers in the admin dashboard.
+- **Match telemetry** - use decoded traffic for result summaries, lightweight stats, and more reliable reconnect/resync.
 
 ## Self-hosting with your own keys
 
-The source code is public, but network identity is defined by the key material in `keys/`. The two private `.der` files are the sensitive part — do not publish them if you want to remain the sole operator of your network.
+The source code is public, but network identity is defined by the key material in `keys/`. The two private `.der` files are the sensitive part - do not publish them if you want to remain the sole operator of your network.
 
 To run an independent network:
 
