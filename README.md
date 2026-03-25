@@ -1,4 +1,4 @@
-# WON OSS Server (Homeworld-oriented)
+# Homeworld 1 - WON OSS Server
 
 [![Tests](https://github.com/FlashZ/won_oss_server/actions/workflows/tests.yml/badge.svg)](https://github.com/FlashZ/won_oss_server/actions/workflows/tests.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
