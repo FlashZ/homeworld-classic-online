@@ -169,14 +169,18 @@ Its job is to make an unmodified Homeworld install trust and find your server.
 It does three things:
 
 1. Installs a valid WON Homeworld CD key
-   - writes the WON registry key directly
+   - optionally writes the WON registry key directly
    - also mirrors the plain Sierra key if needed
+   - can generate a fresh bundled key from the installer UI before writing it
+   - detects existing registry values first and defaults to preserving them
+   - reports the generated/display CD key back to the user after install
 
 2. Writes `NetTweak.script`
    - sets `DIRSERVER_IPSTRINGS`
    - sets `DIRSERVER_PORTS`
    - sets `PATCHSERVER_IPSTRINGS`
    - sets `PATCHSERVER_PORTS`
+   - preserves the stock LAN and other retail tweak values from the existing script
 
 3. Installs `kver.kp`
    - either from a sibling `keys\\kver.kp`
@@ -1044,6 +1048,7 @@ The script is designed so a friend can:
 - drop it beside `Homeworld.exe`
 - run as Administrator
 - pass your server host
+- understand from the dialog what is being changed
 
 and be done.
 

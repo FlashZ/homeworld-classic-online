@@ -83,7 +83,7 @@ Build the Windows installer once on a Windows machine:
 installer\build_installer.bat
 ```
 
-By default, the installer now targets `homeworld.kerrbell.dev` and offers a custom host/IP option in its server picker UI.
+By default, the installer now targets `homeworld.kerrbell.dev`, offers a custom host/IP option in its server picker UI, explains the bootstrap steps in the dialog itself, and lets the user choose whether to write the Homeworld CD key into the registry.
 
 You can still distribute `HWOnlineSetup.exe` to each player and run it as Administrator with an explicit server host or IP:
 
@@ -97,23 +97,34 @@ If you have DNS set up, you can pass a hostname instead:
 HWOnlineSetup.exe hw1.example.com
 ```
 
+If you want to skip the registry CD key step and only update `NetTweak.script` and `kver.kp`, use:
+
+```powershell
+HWOnlineSetup.exe --skip-registry hw1.example.com
+```
+
 The installer:
 
 - auto-detects the Homeworld install directory (registry plus common paths)
-- installs a valid WON Homeworld CD key in the registry
-- writes `NetTweak.script` so `hosts` file edits are not needed
+- optionally installs a valid WON Homeworld CD key in the registry
+- can generate a fresh bundled Homeworld CD key from the install dialog before writing it
+- detects existing Homeworld registry key values first and preserves them by default unless the user explicitly opts into overwrite
+- updates `NetTweak.script` so `hosts` file edits are not needed while preserving the stock LAN tuning
 - installs `kver.kp` into the game folder
+- shows the exact Homeworld CD key and registry paths after a successful registry write
 
 No Python is required on client machines. Players just run the installer and then launch Homeworld normally.
 
 ### What `NetTweak.script` does
 
-`NetTweak.script` is the client-side file that tells Homeworld which directory and patch server host and port to contact first. The installer writes:
+`NetTweak.script` is the client-side file that tells Homeworld which directory and patch server host and port to contact first. The installer updates:
 
 - `DIRSERVER_IPSTRINGS`
 - `DIRSERVER_PORTS`
 - `PATCHSERVER_IPSTRINGS`
 - `PATCHSERVER_PORTS`
+
+It preserves the rest of the retail script, including the stock LAN/game port settings, instead of replacing the file with an internet-only stub.
 
 In practice, that means:
 
