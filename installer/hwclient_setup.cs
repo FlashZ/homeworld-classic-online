@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -11,8 +12,14 @@ internal static class HWClientSetup
     private const string DefaultServerHost = "homeworld.kerrbell.dev";
     private const string CustomHostOptionLabel = "Custom host or IP";
     private const int DefaultGatewayPort = 15101;
+    private const string NetTweakBackupSuffix = ".homeworld_oss.bak";
     private const string DefaultDisplayCdKey = "NYX7-ZEC9-FYZ6-GUX8-4253";
     private const string DefaultPlainCdKey = "NYX7ZEC9FYZ6GUX84253";
+    private const string WonCdKeysRegistryPath = @"SOFTWARE\WON\CDKeys";
+    private const string SierraHomeworldRegistryPath = @"SOFTWARE\Sierra On-Line\Homeworld";
+    private const string WonHomeworldValueName = "Homeworld";
+    private const string SierraCdKeyValueName = "CDKey";
+    private const string InstallerRegistryMarkerValueName = "HomeworldOnlineSetupWroteCdKey";
 
     // This installer intentionally ships the same known-good retail-compatible key
     // as the legacy batch bootstrap, so it stays dependency-free on stock Windows.
@@ -20,6 +27,34 @@ internal static class HWClientSetup
     {
         0xFB, 0x0F, 0x77, 0xC4, 0x80, 0x3F, 0x65, 0xDB,
         0xBB, 0xA6, 0x6A, 0x4D, 0x4E, 0x2C, 0xB6, 0x17,
+    };
+
+    private static readonly RegistryCdKeyOption[] RegistryCdKeyPool = new[]
+    {
+        new RegistryCdKeyOption(DefaultDisplayCdKey, DefaultEncryptedCdKey),
+        new RegistryCdKeyOption("PYL8-GUD4-BET3-MEX9-6624", new byte[] { 0x75, 0xA6, 0x4E, 0xD5, 0x40, 0x1B, 0xE8, 0xD6, 0x1B, 0x7A, 0x7A, 0x90, 0x22, 0xD7, 0x1E, 0x06 }),
+        new RegistryCdKeyOption("XYR4-DYM7-FAG8-NEL4-5963", new byte[] { 0x89, 0x6F, 0xD2, 0xA5, 0x8A, 0xA1, 0xDB, 0x89, 0xFC, 0x46, 0x30, 0xC6, 0x38, 0x20, 0x34, 0x19 }),
+        new RegistryCdKeyOption("SUT5-DUF8-XUB4-DAZ2-3552", new byte[] { 0xF3, 0x6D, 0x1A, 0xE6, 0x93, 0x81, 0x1A, 0x3F, 0xDC, 0x54, 0x0C, 0x4B, 0xCA, 0x4F, 0x61, 0x46 }),
+        new RegistryCdKeyOption("WEW2-RYF2-TAJ4-XUP2-2996", new byte[] { 0xF1, 0x06, 0x56, 0x2A, 0xA2, 0xB9, 0x90, 0xC9, 0x62, 0xD3, 0x67, 0x4C, 0x68, 0x05, 0x97, 0x01 }),
+        new RegistryCdKeyOption("MEB4-RUG3-REL7-DUG9-3375", new byte[] { 0x02, 0x25, 0x13, 0xAA, 0x08, 0x6B, 0xAE, 0xDF, 0xF9, 0x50, 0xEE, 0xBC, 0xB1, 0xCA, 0x87, 0x97 }),
+        new RegistryCdKeyOption("GYJ6-ZYS4-MUD2-GUT4-8772", new byte[] { 0x25, 0x0F, 0x51, 0x40, 0x07, 0x42, 0x4E, 0x7E, 0x97, 0x0A, 0x8D, 0xF0, 0xFB, 0xD1, 0xB7, 0xAF }),
+        new RegistryCdKeyOption("CUX8-NUM6-DYT5-CUB6-3882", new byte[] { 0x48, 0xE4, 0x20, 0x75, 0x48, 0x0F, 0x76, 0x61, 0x65, 0x14, 0xE4, 0xA7, 0x02, 0x1F, 0x51, 0x7A }),
+        new RegistryCdKeyOption("CUC2-DUR7-PAN5-CAR9-2879", new byte[] { 0x5E, 0x26, 0x95, 0xFD, 0x97, 0x11, 0x52, 0x0A, 0x53, 0xFF, 0x5C, 0xEF, 0xCB, 0xFE, 0xEF, 0x8B }),
+        new RegistryCdKeyOption("NAJ4-FUN6-CYT4-BAG8-9675", new byte[] { 0x7E, 0x8F, 0x0B, 0xFD, 0x0E, 0x42, 0xF7, 0xE4, 0x94, 0x81, 0x18, 0x6E, 0x90, 0xA4, 0x69, 0xCE }),
+        new RegistryCdKeyOption("BUX7-PAC3-GYN4-TAJ7-4552", new byte[] { 0x1A, 0x3E, 0xB3, 0xE9, 0xE9, 0xCF, 0x09, 0xB2, 0x88, 0xA4, 0x9E, 0xD6, 0x9E, 0x88, 0xDC, 0xC3 }),
+        new RegistryCdKeyOption("DUT5-GUC7-LUG9-BUJ2-5558", new byte[] { 0x7F, 0xFF, 0x6A, 0x22, 0xBE, 0xC6, 0x88, 0x73, 0x28, 0xFF, 0x4B, 0x17, 0x1B, 0x8F, 0xAD, 0xB7 }),
+        new RegistryCdKeyOption("SEP5-NEN8-WYZ4-BYF6-3245", new byte[] { 0xC6, 0xA9, 0x66, 0x41, 0x5C, 0x74, 0xAF, 0xDF, 0x11, 0x44, 0xAA, 0x34, 0x01, 0x61, 0x58, 0x60 }),
+        new RegistryCdKeyOption("BUB8-ZAW2-GAW4-DUJ8-3823", new byte[] { 0xE5, 0x4F, 0x02, 0x40, 0xFF, 0xC6, 0x0F, 0x72, 0x91, 0x75, 0x76, 0xDD, 0x69, 0xEB, 0x39, 0xA3 }),
+        new RegistryCdKeyOption("FYX9-LUZ3-DAX8-SEF2-8737", new byte[] { 0xC8, 0x79, 0x83, 0xCF, 0x6B, 0x52, 0xC6, 0x5C, 0x78, 0x55, 0x2B, 0xC8, 0xED, 0xA6, 0x50, 0xAB }),
+        new RegistryCdKeyOption("FUN5-BAF2-PAJ7-GUP2-9638", new byte[] { 0x79, 0x55, 0x86, 0x0A, 0xCE, 0xFD, 0x6C, 0x99, 0xC0, 0xFF, 0x46, 0x8C, 0x6A, 0x99, 0xF7, 0xE4 }),
+        new RegistryCdKeyOption("CED8-FES8-RUT4-XUX9-5732", new byte[] { 0x57, 0xAA, 0x9E, 0xB7, 0x1E, 0xEF, 0x6B, 0x8D, 0x28, 0xC0, 0x77, 0x54, 0x70, 0x31, 0x96, 0x5E }),
+        new RegistryCdKeyOption("JUN2-LYL7-GUX9-CYJ3-2879", new byte[] { 0xF0, 0xE0, 0x74, 0x49, 0x70, 0x65, 0x17, 0xBA, 0x2E, 0xE1, 0xC9, 0xD9, 0x02, 0xF9, 0x21, 0xE9 }),
+        new RegistryCdKeyOption("SEC2-LAR3-NAC7-LAF7-5799", new byte[] { 0xD7, 0xDE, 0x4A, 0x7F, 0xE3, 0xE2, 0x47, 0x2A, 0x59, 0x0D, 0xCF, 0xAD, 0xC6, 0x1F, 0x65, 0x0D }),
+        new RegistryCdKeyOption("TAB7-CAS9-ZYX2-TUS8-9554", new byte[] { 0x1F, 0x01, 0x8B, 0x8E, 0xBF, 0x50, 0x8C, 0x16, 0x1B, 0x94, 0x54, 0x96, 0x97, 0x98, 0x94, 0xFD }),
+        new RegistryCdKeyOption("NUN2-RUM2-DEZ2-RUZ5-7729", new byte[] { 0xB1, 0x8A, 0xCB, 0xE3, 0x6C, 0xEA, 0xC6, 0x35, 0x6C, 0x7F, 0x6A, 0x2E, 0x2B, 0x12, 0xA2, 0x05 }),
+        new RegistryCdKeyOption("WYS6-LEF2-BUS3-JAX3-6647", new byte[] { 0x9F, 0xC2, 0x94, 0x9D, 0xE8, 0x74, 0xC0, 0x36, 0xD4, 0xFE, 0xF8, 0xDF, 0xCD, 0x4B, 0x5B, 0xC2 }),
+        new RegistryCdKeyOption("NUR2-TYJ6-NAN8-DAW5-6586", new byte[] { 0x87, 0xEC, 0x78, 0x9A, 0x88, 0xD9, 0x3E, 0x7A, 0x26, 0xDB, 0xC6, 0x33, 0x9D, 0x67, 0x69, 0x08 }),
+        new RegistryCdKeyOption("ZYJ9-CAS9-NAR6-BAT5-6443", new byte[] { 0xEE, 0xC4, 0xAB, 0xB9, 0x63, 0x1F, 0x10, 0xE3, 0x3F, 0xE4, 0xA0, 0xA3, 0x88, 0xFF, 0x95, 0x6C }),
     };
 
     private static readonly byte[] EmbeddedKver = new byte[]
@@ -51,6 +86,78 @@ internal static class HWClientSetup
             0x68, 0xB1, 0x5F, 0xEA, 0x69, 0xE6, 0x0F, 0x60, 0x2E, 0xBE, 0x55, 0x93, 0xA9, 0x17, 0x4E, 0x2C,
             0x87, 0x70, 0xA1, 0x20, 0x1E, 0x1E, 0x7F, 0x4E, 0x31, 0x38, 0xAD, 0x81, 0x75, 0x65, 0x25, 0x63,
             0x82, 0x19, 0xF3, 0xB8, 0x68, 0x65,
+    };
+
+    private static readonly KeyValuePair<string, string>[] NetTweakServerOverrides = new KeyValuePair<string, string>[]
+    {
+        new KeyValuePair<string, string>("DIRSERVER_NUM", "1"),
+        new KeyValuePair<string, string>("DIRSERVER_PORTS", DefaultGatewayPort.ToString()),
+        new KeyValuePair<string, string>("PATCHSERVER_NUM", "1"),
+        new KeyValuePair<string, string>("PATCHSERVER_PORTS", DefaultGatewayPort.ToString()),
+    };
+
+    private static readonly string[] RetailNetTweakTemplate = new[]
+    {
+        "[NetTweak]",
+        "TITAN_PICKER_REFRESH_TIME       4.0",
+        "TITAN_GAME_EXPIRE_TIME          3600",
+        "",
+        "GAME_PORT                       6037",
+        "",
+        "AD_PORT                         6038",
+        "",
+        "; Main servers",
+        "DIRSERVER_NUM                   3",
+        "",
+        "DIRSERVER_PORTS                 15101,15101,15101",
+        "DIRSERVER_IPSTRINGS             homeworld-demo.east.won.net,homeworld-demo.west.won.net,homeworld.central.won.net",
+        "",
+        "PATCHSERVER_NUM                 1",
+        "",
+        "PATCHSERVER_PORTS               80",
+        "PATCHSERVER_IPSTRINGS           homeworld.update.won.net",
+        "",
+        "PATCHNAME                       HomeworldPatch.exe",
+        "",
+        "PATCHBARCOLOR                   255,0,0",
+        "PATCHBAROUTLINECOLOR            255,255,0",
+        "",
+        "ROUTING_SERVER_NAME              routingserv",
+        "",
+        "CONNECT_TIMEOUT                  8000    ; timeout for connects in ms",
+        "",
+        "; Passing captaincy tweakables:",
+        "",
+        "T1_Timeout                       30.0       ; timeout for not receiving any packets from captain",
+        "T2_Timeout                       14.0        ; timeout for proposing a new captain",
+        "TWAITFORPAUSEACKS_Timeout        14.0        ; timeout for waiting for pause ack's from remaining players",
+        "",
+        "TimedOutWaitingForPauseAcksGiveUpAfterNumTimes   2       ; after this many time outs while waiting for pause acks, give up waiting",
+        "",
+        "HorseRacePlayerDropoutTime       40.0",
+        "HorseRaceDroppedOutColor         75,75,75",
+        "",
+        "; Lan tweakables",
+        "",
+        "LAN_ADVERTISE_USER_TIME          0.5",
+        "LAN_ADVERTISE_USER_TIMEOUT       3.0",
+        "",
+        "LAN_ADVERTISE_GAME_TIME          0.5",
+        "LAN_ADVERTISE_GAME_TIMEOUT       3.0",
+        "",
+        "; Keep alive tweakables (know if player is still actively in game)",
+        "",
+        "KEEPALIVE_SEND_IAMALIVE_TIME    10.0",
+        "KEEPALIVE_IAMALIVE_TIMEOUT      30.0",
+        "KEEPALIVE_SEND_ALIVESTATUS_TIME 30.0",
+        "",
+        "PRINTLAG_IFGREATERTHAN          10          ; make really big to turn off",
+        "PRINTLAG_MINFRAMES              20",
+        "",
+        "ROOM_MIN_THRESHOLD              1",
+        "ROOM_MAX_THRESHOLD              30",
+        "",
+        "WAIT_SHUTDOWN_MS                1000        ; if you have created a game and quit won, wait this long before quitting so the messages to dissolve, etc, get sent.",
     };
 
     [STAThread]
@@ -98,31 +205,48 @@ internal static class HWClientSetup
             throw new InvalidOperationException("Could not locate Homeworld.exe.");
         }
 
-        string serverHost = string.IsNullOrWhiteSpace(options.ServerHost)
-            ? PromptForServerHost(DefaultServerHost)
-            : options.ServerHost.Trim();
-        if (string.IsNullOrWhiteSpace(serverHost))
+        ExistingInstallState existingState = DetectExistingInstallState(gameDirectory);
+        bool defaultWriteRegistryKeys = options.WriteRegistryKeys ?? !existingState.HasAnyRegistryCdKey;
+
+        InstallChoices installChoices = string.IsNullOrWhiteSpace(options.ServerHost)
+            ? PromptForInstallChoices(DefaultServerHost, defaultWriteRegistryKeys, GetDefaultRegistryCdKey(), existingState)
+            : new InstallChoices
+            {
+                ServerHost = options.ServerHost.Trim(),
+                WriteRegistryKeys = defaultWriteRegistryKeys,
+                RegistryCdKey = GetDefaultRegistryCdKey(),
+            };
+
+        if (string.IsNullOrWhiteSpace(installChoices.ServerHost))
         {
             throw new OperationCanceledException();
         }
 
-        Install(gameDirectory, serverHost);
+        InstallResult result = Install(gameDirectory, installChoices.ServerHost, installChoices.WriteRegistryKeys, installChoices.RegistryCdKey);
         MessageBox.Show(
-            string.Format(
-                "Homeworld configured for server {0}. Launch the game normally.",
-                serverHost),
+            BuildInstallSuccessMessage(result),
             "Homeworld Online Setup",
             MessageBoxButtons.OK,
             MessageBoxIcon.Information);
     }
 
-    private static void Install(string gameDirectory, string serverHost)
+    private static InstallResult Install(string gameDirectory, string serverHost, bool writeRegistryKeys, RegistryCdKeyOption registryCdKey)
     {
         EnsureHomeworldDirectory(gameDirectory);
-        WriteRegistryKeys();
+        RegistryWriteResult registryWriteResult = null;
+        if (writeRegistryKeys)
+        {
+            registryWriteResult = WriteRegistryKeys(registryCdKey ?? GetDefaultRegistryCdKey());
+        }
         BackupNetTweak(gameDirectory);
         WriteNetTweak(gameDirectory, serverHost);
         File.WriteAllBytes(Path.Combine(gameDirectory, "kver.kp"), EmbeddedKver);
+
+        return new InstallResult
+        {
+            ServerHost = serverHost,
+            RegistryWrite = registryWriteResult,
+        };
     }
 
     private static void Uninstall(string gameDirectory)
@@ -135,56 +259,92 @@ internal static class HWClientSetup
         }
     }
 
-    private static void WriteRegistryKeys()
+    private static RegistryWriteResult WriteRegistryKeys(RegistryCdKeyOption registryCdKey)
     {
         using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32))
         {
-            using (RegistryKey wonKeys = baseKey.CreateSubKey(@"SOFTWARE\WON\CDKeys"))
+            using (RegistryKey wonKeys = baseKey.CreateSubKey(WonCdKeysRegistryPath))
             {
                 if (wonKeys == null)
                 {
-                    throw new InvalidOperationException("Failed to open HKLM\\SOFTWARE\\WON\\CDKeys.");
+                    throw new InvalidOperationException("Failed to open HKLM\\" + WonCdKeysRegistryPath + ".");
                 }
-                wonKeys.SetValue("Homeworld", DefaultEncryptedCdKey, RegistryValueKind.Binary);
+                wonKeys.SetValue(WonHomeworldValueName, registryCdKey.EncryptedCdKey, RegistryValueKind.Binary);
             }
 
-            using (RegistryKey sierraKey = baseKey.CreateSubKey(@"SOFTWARE\Sierra On-Line\Homeworld"))
+            using (RegistryKey sierraKey = baseKey.CreateSubKey(SierraHomeworldRegistryPath))
             {
                 if (sierraKey == null)
                 {
-                    throw new InvalidOperationException("Failed to open HKLM\\SOFTWARE\\Sierra On-Line\\Homeworld.");
+                    throw new InvalidOperationException("Failed to open HKLM\\" + SierraHomeworldRegistryPath + ".");
                 }
-                sierraKey.SetValue("CDKey", DefaultPlainCdKey, RegistryValueKind.String);
+                sierraKey.SetValue(SierraCdKeyValueName, registryCdKey.PlainCdKey, RegistryValueKind.String);
+                sierraKey.SetValue(InstallerRegistryMarkerValueName, 1, RegistryValueKind.DWord);
             }
         }
+
+        return new RegistryWriteResult
+        {
+            DisplayCdKey = registryCdKey.DisplayCdKey,
+            SierraRegistryValuePath = @"HKLM\" + SierraHomeworldRegistryPath + "\\" + SierraCdKeyValueName,
+            WonRegistryValuePath = @"HKLM\" + WonCdKeysRegistryPath + "\\" + WonHomeworldValueName,
+        };
     }
 
     private static void RemoveRegistryKeys()
     {
         using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32))
         {
-            using (RegistryKey wonKeys = baseKey.OpenSubKey(@"SOFTWARE\WON\CDKeys", true))
+            using (RegistryKey sierraKey = baseKey.OpenSubKey(SierraHomeworldRegistryPath, true))
+            {
+                if (!InstallerOwnsRegistryKeys(sierraKey))
+                {
+                    return;
+                }
+
+                sierraKey.DeleteValue(SierraCdKeyValueName, false);
+                sierraKey.DeleteValue(InstallerRegistryMarkerValueName, false);
+            }
+
+            using (RegistryKey wonKeys = baseKey.OpenSubKey(WonCdKeysRegistryPath, true))
             {
                 if (wonKeys != null)
                 {
-                    wonKeys.DeleteValue("Homeworld", false);
-                }
-            }
-
-            using (RegistryKey sierraKey = baseKey.OpenSubKey(@"SOFTWARE\Sierra On-Line\Homeworld", true))
-            {
-                if (sierraKey != null)
-                {
-                    sierraKey.DeleteValue("CDKey", false);
+                    wonKeys.DeleteValue(WonHomeworldValueName, false);
                 }
             }
         }
     }
 
+    private static bool InstallerOwnsRegistryKeys(RegistryKey sierraKey)
+    {
+        if (sierraKey == null)
+        {
+            return false;
+        }
+
+        object markerValue = sierraKey.GetValue(InstallerRegistryMarkerValueName);
+        if (markerValue is int)
+        {
+            return (int)markerValue == 1;
+        }
+
+        if (markerValue is string)
+        {
+            int parsed;
+            if (int.TryParse((string)markerValue, out parsed))
+            {
+                return parsed == 1;
+            }
+        }
+
+        return false;
+    }
+
     private static void BackupNetTweak(string gameDirectory)
     {
         string netTweakPath = Path.Combine(gameDirectory, "NetTweak.script");
-        string backupPath = netTweakPath + ".homeworld_oss.bak";
+        string backupPath = netTweakPath + NetTweakBackupSuffix;
         if (!File.Exists(netTweakPath) || File.Exists(backupPath))
         {
             return;
@@ -196,19 +356,99 @@ internal static class HWClientSetup
     private static void WriteNetTweak(string gameDirectory, string serverHost)
     {
         string netTweakPath = Path.Combine(gameDirectory, "NetTweak.script");
-        string contents = string.Join(
-            "\r\n",
-            new[]
-            {
-                "DIRSERVER_NUM 1",
-                string.Format("DIRSERVER_PORTS {0}", DefaultGatewayPort),
-                string.Format("DIRSERVER_IPSTRINGS {0}", serverHost),
-                "PATCHSERVER_NUM 1",
-                string.Format("PATCHSERVER_PORTS {0}", DefaultGatewayPort),
-                string.Format("PATCHSERVER_IPSTRINGS {0}", serverHost),
-                string.Empty,
-            });
+        string contents = ApplyNetTweakOverrides(ReadNetTweakBaseline(gameDirectory), serverHost);
         File.WriteAllText(netTweakPath, contents, Encoding.ASCII);
+    }
+
+    private static string ReadNetTweakBaseline(string gameDirectory)
+    {
+        string netTweakPath = Path.Combine(gameDirectory, "NetTweak.script");
+        string backupPath = netTweakPath + NetTweakBackupSuffix;
+
+        if (File.Exists(backupPath))
+        {
+            return File.ReadAllText(backupPath, Encoding.ASCII);
+        }
+
+        if (File.Exists(netTweakPath))
+        {
+            return File.ReadAllText(netTweakPath, Encoding.ASCII);
+        }
+
+        return string.Join("\r\n", RetailNetTweakTemplate) + "\r\n";
+    }
+
+    private static string ApplyNetTweakOverrides(string baseline, string serverHost)
+    {
+        Dictionary<string, string> overrides = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (KeyValuePair<string, string> entry in NetTweakServerOverrides)
+        {
+            overrides[entry.Key] = entry.Value;
+        }
+
+        overrides["DIRSERVER_IPSTRINGS"] = serverHost;
+        overrides["PATCHSERVER_IPSTRINGS"] = serverHost;
+
+        List<string> mergedLines = new List<string>();
+        HashSet<string> seenKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        string[] baselineLines = baseline
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Split(new[] { '\n' }, StringSplitOptions.None);
+
+        foreach (string line in baselineLines)
+        {
+            string key;
+            if (TryGetNetTweakKey(line, out key) && overrides.ContainsKey(key))
+            {
+                mergedLines.Add(string.Format("{0} {1}", key, overrides[key]));
+                seenKeys.Add(key);
+            }
+            else
+            {
+                mergedLines.Add(line);
+            }
+        }
+
+        foreach (KeyValuePair<string, string> entry in overrides)
+        {
+            if (!seenKeys.Contains(entry.Key))
+            {
+                mergedLines.Add(string.Format("{0} {1}", entry.Key, entry.Value));
+            }
+        }
+
+        return string.Join("\r\n", mergedLines) + "\r\n";
+    }
+
+    private static bool TryGetNetTweakKey(string line, out string key)
+    {
+        key = null;
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            return false;
+        }
+
+        string trimmed = line.TrimStart();
+        if (trimmed.Length == 0 || trimmed[0] == ';' || trimmed[0] == '[')
+        {
+            return false;
+        }
+
+        int end = 0;
+        while (end < trimmed.Length && !char.IsWhiteSpace(trimmed[end]))
+        {
+            end++;
+        }
+
+        if (end == 0)
+        {
+            return false;
+        }
+
+        key = trimmed.Substring(0, end);
+        return true;
     }
 
     private static void DeleteIfExists(string path)
@@ -336,51 +576,284 @@ internal static class HWClientSetup
         }
     }
 
-    private static string PromptForServerHost(string defaultValue)
+    private static ExistingInstallState DetectExistingInstallState(string gameDirectory)
+    {
+        ExistingInstallState state = new ExistingInstallState();
+
+        if (!string.IsNullOrEmpty(gameDirectory))
+        {
+            state.HasNetTweakScript = File.Exists(Path.Combine(gameDirectory, "NetTweak.script"));
+            state.HasNetTweakBackup = File.Exists(Path.Combine(gameDirectory, "NetTweak.script" + NetTweakBackupSuffix));
+            state.HasKverFile = File.Exists(Path.Combine(gameDirectory, "kver.kp"));
+        }
+
+        using (RegistryKey baseKey = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry32))
+        {
+            using (RegistryKey sierraKey = baseKey.OpenSubKey(SierraHomeworldRegistryPath, false))
+            {
+                if (sierraKey != null)
+                {
+                    object sierraCdKey = sierraKey.GetValue(SierraCdKeyValueName);
+                    string sierraCdKeyString = sierraCdKey as string;
+                    if (!string.IsNullOrWhiteSpace(sierraCdKeyString))
+                    {
+                        state.HasSierraCdKey = true;
+                        state.SierraCdKeyDisplay = FormatDisplayCdKey(sierraCdKeyString.Trim());
+                    }
+
+                    state.RegistryOwnedByInstaller = InstallerOwnsRegistryKeys(sierraKey);
+                }
+            }
+
+            using (RegistryKey wonKeys = baseKey.OpenSubKey(WonCdKeysRegistryPath, false))
+            {
+                if (wonKeys != null)
+                {
+                    byte[] wonCdKey = wonKeys.GetValue(WonHomeworldValueName) as byte[];
+                    state.HasWonCdKey = wonCdKey != null && wonCdKey.Length > 0;
+                }
+            }
+        }
+
+        return state;
+    }
+
+    private static string FormatDisplayCdKey(string plainOrDisplayCdKey)
+    {
+        if (string.IsNullOrWhiteSpace(plainOrDisplayCdKey))
+        {
+            return string.Empty;
+        }
+
+        string compact = plainOrDisplayCdKey
+            .Trim()
+            .Replace("-", string.Empty)
+            .Replace(" ", string.Empty)
+            .ToUpperInvariant();
+
+        if (compact.Length != 20)
+        {
+            return plainOrDisplayCdKey.Trim();
+        }
+
+        return string.Format(
+            "{0}-{1}-{2}-{3}-{4}",
+            compact.Substring(0, 4),
+            compact.Substring(4, 4),
+            compact.Substring(8, 4),
+            compact.Substring(12, 4),
+            compact.Substring(16, 4));
+    }
+
+    private static string BuildInstallSummaryText(ExistingInstallState existingState)
+    {
+        StringBuilder summary = new StringBuilder();
+        summary.Append("This installer points Homeworld at the selected server, writes NetTweak.script, installs kver.kp, and can optionally write a matching Homeworld CD key to the registry.");
+
+        if (existingState.HasAnyRegistryCdKey)
+        {
+            summary.AppendLine();
+            summary.AppendLine();
+            summary.Append("Existing Homeworld registry CD key values were detected, so the registry step starts turned off to preserve them.");
+        }
+
+        if (existingState.HasBootstrapFiles)
+        {
+            summary.AppendLine();
+            summary.AppendLine();
+            summary.Append("Existing bootstrap files were detected in the game folder and will be updated:");
+            if (existingState.HasNetTweakScript)
+            {
+                summary.Append(" NetTweak.script");
+            }
+            if (existingState.HasKverFile)
+            {
+                summary.Append(existingState.HasNetTweakScript ? ", kver.kp" : " kver.kp");
+            }
+            summary.Append(".");
+        }
+
+        return summary.ToString();
+    }
+
+    private static string BuildRegistryHelpText(bool installRegistryKey, RegistryCdKeyOption selectedCdKey, ExistingInstallState existingState)
+    {
+        if (!installRegistryKey)
+        {
+            if (existingState.HasAnyRegistryCdKey)
+            {
+                return "Existing Homeworld registry key values were detected. Leave this off to preserve them.";
+            }
+
+            return "Registry CD key install is turned off.";
+        }
+
+        if (existingState.HasAnyRegistryCdKey)
+        {
+            return "Existing Homeworld registry key values were detected. Keeping this enabled will overwrite them with " + selectedCdKey.DisplayCdKey + ".";
+        }
+
+        return "Writes " + selectedCdKey.DisplayCdKey + " to the Sierra and WON registry entries for stock Homeworld login.";
+    }
+
+    private static string BuildExistingRegistryPrompt(ExistingInstallState existingState, RegistryCdKeyOption selectedCdKey)
+    {
+        StringBuilder prompt = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(existingState.SierraCdKeyDisplay))
+        {
+            prompt.Append("Existing Homeworld registry CD key detected: ");
+            prompt.Append(existingState.SierraCdKeyDisplay);
+            prompt.AppendLine();
+            prompt.AppendLine();
+        }
+        else
+        {
+            prompt.Append("Existing Homeworld registry CD key values were detected on this machine.");
+            prompt.AppendLine();
+            prompt.AppendLine();
+        }
+
+        prompt.Append("Overwrite them with ");
+        prompt.Append(selectedCdKey.DisplayCdKey);
+        prompt.Append("? Choose No to preserve the current registry values and continue without changing them.");
+        return prompt.ToString();
+    }
+
+    private static RegistryCdKeyOption GetDefaultRegistryCdKey()
+    {
+        return RegistryCdKeyPool[0];
+    }
+
+    private static RegistryCdKeyOption PickRandomRegistryCdKey(string excludeDisplayCdKey)
+    {
+        if (RegistryCdKeyPool.Length == 0)
+        {
+            throw new InvalidOperationException("No bundled Homeworld CD keys are available.");
+        }
+
+        if (RegistryCdKeyPool.Length == 1)
+        {
+            return RegistryCdKeyPool[0];
+        }
+
+        byte[] randomBytes = new byte[4];
+        using (RandomNumberGenerator random = RandomNumberGenerator.Create())
+        {
+            for (;;)
+            {
+                random.GetBytes(randomBytes);
+                uint randomValue = BitConverter.ToUInt32(randomBytes, 0);
+                int index = (int)(randomValue % (uint)RegistryCdKeyPool.Length);
+                RegistryCdKeyOption candidate = RegistryCdKeyPool[index];
+                if (!string.Equals(candidate.DisplayCdKey, excludeDisplayCdKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    private static string BuildInstallSuccessMessage(InstallResult result)
+    {
+        StringBuilder builder = new StringBuilder();
+        builder.AppendFormat("Homeworld configured for server {0}.", result.ServerHost);
+        builder.AppendLine();
+        builder.AppendLine();
+
+        if (result.RegistryWrite != null)
+        {
+            builder.AppendFormat("Registry CD key written: {0}", result.RegistryWrite.DisplayCdKey);
+            builder.AppendLine();
+            builder.AppendLine(result.RegistryWrite.SierraRegistryValuePath);
+            builder.AppendLine(result.RegistryWrite.WonRegistryValuePath + " (encrypted WON form)");
+        }
+        else
+        {
+            builder.Append("Registry CD key step was skipped.");
+        }
+
+        builder.AppendLine();
+        builder.AppendLine();
+        builder.Append("Launch the game normally.");
+        return builder.ToString();
+    }
+
+    private static InstallChoices PromptForInstallChoices(string defaultValue, bool defaultWriteRegistryKeys, RegistryCdKeyOption defaultCdKey, ExistingInstallState existingState)
     {
         using (Form form = new Form())
+        using (Label summaryLabel = new Label())
         using (Label presetLabel = new Label())
         using (ComboBox presetCombo = new ComboBox())
         using (Label customLabel = new Label())
         using (TextBox customTextBox = new TextBox())
+        using (CheckBox registryCheckBox = new CheckBox())
+        using (Label selectedKeyLabel = new Label())
+        using (TextBox cdKeyTextBox = new TextBox())
+        using (Button generateKeyButton = new Button())
+        using (Label registryHelpLabel = new Label())
         using (Button okButton = new Button())
         using (Button cancelButton = new Button())
         {
             string initialValue = string.IsNullOrWhiteSpace(defaultValue)
                 ? DefaultServerHost
                 : defaultValue.Trim();
+            RegistryCdKeyOption selectedCdKey = defaultCdKey ?? GetDefaultRegistryCdKey();
 
             form.Text = "Homeworld Online Setup";
             form.FormBorderStyle = FormBorderStyle.FixedDialog;
             form.StartPosition = FormStartPosition.CenterScreen;
-            form.ClientSize = new Size(420, 170);
+            form.ClientSize = new Size(520, 400);
             form.MinimizeBox = false;
             form.MaximizeBox = false;
             form.AcceptButton = okButton;
             form.CancelButton = cancelButton;
 
+            summaryLabel.Location = new Point(15, 12);
+            summaryLabel.Size = new Size(490, 108);
+            summaryLabel.Text = BuildInstallSummaryText(existingState);
+
             presetLabel.AutoSize = true;
-            presetLabel.Location = new Point(12, 15);
+            presetLabel.Location = new Point(12, 132);
             presetLabel.Text = "Server preset:";
 
             presetCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-            presetCombo.Location = new Point(15, 40);
-            presetCombo.Size = new Size(390, 23);
+            presetCombo.Location = new Point(15, 157);
+            presetCombo.Size = new Size(490, 23);
             presetCombo.Items.Add(DefaultServerHost);
             presetCombo.Items.Add(CustomHostOptionLabel);
 
             customLabel.AutoSize = true;
-            customLabel.Location = new Point(12, 75);
+            customLabel.Location = new Point(12, 192);
             customLabel.Text = "Custom host or IP:";
 
-            customTextBox.Location = new Point(15, 100);
-            customTextBox.Size = new Size(390, 23);
+            customTextBox.Location = new Point(15, 217);
+            customTextBox.Size = new Size(490, 23);
+
+            registryCheckBox.AutoSize = true;
+            registryCheckBox.Location = new Point(15, 252);
+            registryCheckBox.Text = "Write Homeworld CD key to the registry";
+            registryCheckBox.Checked = defaultWriteRegistryKeys;
+
+            selectedKeyLabel.AutoSize = true;
+            selectedKeyLabel.Location = new Point(32, 280);
+            selectedKeyLabel.Text = "Selected CD key:";
+
+            cdKeyTextBox.Location = new Point(35, 303);
+            cdKeyTextBox.ReadOnly = true;
+            cdKeyTextBox.Size = new Size(360, 23);
+
+            generateKeyButton.Location = new Point(410, 302);
+            generateKeyButton.Size = new Size(95, 25);
+            generateKeyButton.Text = "Generate";
+
+            registryHelpLabel.Location = new Point(32, 331);
+            registryHelpLabel.Size = new Size(473, 40);
 
             okButton.Text = "OK";
-            okButton.Location = new Point(249, 135);
+            okButton.Location = new Point(334, 366);
 
             cancelButton.Text = "Cancel";
-            cancelButton.Location = new Point(330, 135);
+            cancelButton.Location = new Point(415, 366);
             cancelButton.DialogResult = DialogResult.Cancel;
 
             EventHandler syncSelection = delegate
@@ -389,8 +862,15 @@ internal static class HWClientSetup
                     presetCombo.SelectedItem as string,
                     CustomHostOptionLabel,
                     StringComparison.OrdinalIgnoreCase);
+                bool installRegistryKey = registryCheckBox.Checked;
                 customTextBox.Enabled = useCustom;
                 customLabel.Enabled = useCustom;
+                selectedKeyLabel.Enabled = installRegistryKey;
+                cdKeyTextBox.Enabled = installRegistryKey;
+                generateKeyButton.Enabled = installRegistryKey;
+                registryHelpLabel.Enabled = installRegistryKey;
+                cdKeyTextBox.Text = selectedCdKey.DisplayCdKey;
+                registryHelpLabel.Text = BuildRegistryHelpText(installRegistryKey, selectedCdKey, existingState);
             };
 
             if (string.Equals(initialValue, DefaultServerHost, StringComparison.OrdinalIgnoreCase))
@@ -406,6 +886,12 @@ internal static class HWClientSetup
             syncSelection(null, EventArgs.Empty);
 
             presetCombo.SelectedIndexChanged += syncSelection;
+            registryCheckBox.CheckedChanged += syncSelection;
+            generateKeyButton.Click += delegate
+            {
+                selectedCdKey = PickRandomRegistryCdKey(selectedCdKey.DisplayCdKey);
+                syncSelection(null, EventArgs.Empty);
+            };
 
             okButton.Click += delegate
             {
@@ -426,14 +912,35 @@ internal static class HWClientSetup
                     return;
                 }
 
+                if (registryCheckBox.Checked && existingState.HasAnyRegistryCdKey)
+                {
+                    DialogResult overwriteResult = MessageBox.Show(
+                        form,
+                        BuildExistingRegistryPrompt(existingState, selectedCdKey),
+                        "Homeworld Online Setup",
+                        MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Warning);
+
+                    if (overwriteResult == DialogResult.No)
+                    {
+                        registryCheckBox.Checked = false;
+                    }
+                }
+
                 form.DialogResult = DialogResult.OK;
                 form.Close();
             };
 
+            form.Controls.Add(summaryLabel);
             form.Controls.Add(presetLabel);
             form.Controls.Add(presetCombo);
             form.Controls.Add(customLabel);
             form.Controls.Add(customTextBox);
+            form.Controls.Add(registryCheckBox);
+            form.Controls.Add(selectedKeyLabel);
+            form.Controls.Add(cdKeyTextBox);
+            form.Controls.Add(generateKeyButton);
+            form.Controls.Add(registryHelpLabel);
             form.Controls.Add(okButton);
             form.Controls.Add(cancelButton);
 
@@ -444,13 +951,18 @@ internal static class HWClientSetup
             }
 
             string selectedValue = presetCombo.SelectedItem as string;
-            if (string.Equals(selectedValue, CustomHostOptionLabel, StringComparison.OrdinalIgnoreCase))
+            string serverHost = string.Equals(selectedValue, CustomHostOptionLabel, StringComparison.OrdinalIgnoreCase)
+                ? customTextBox.Text.Trim()
+                : (string.IsNullOrWhiteSpace(selectedValue)
+                    ? DefaultServerHost
+                    : selectedValue.Trim());
+
+            return new InstallChoices
             {
-                return customTextBox.Text.Trim();
-            }
-            return string.IsNullOrWhiteSpace(selectedValue)
-                ? DefaultServerHost
-                : selectedValue.Trim();
+                ServerHost = serverHost,
+                WriteRegistryKeys = registryCheckBox.Checked,
+                RegistryCdKey = selectedCdKey,
+            };
         }
     }
 
@@ -459,6 +971,7 @@ internal static class HWClientSetup
         public string ServerHost { get; private set; }
         public string GameDirectory { get; private set; }
         public bool Uninstall { get; private set; }
+        public bool? WriteRegistryKeys { get; private set; }
 
         public static InstallerOptions Parse(string[] args)
         {
@@ -479,6 +992,16 @@ internal static class HWClientSetup
                 if (Matches(arg, "--game-dir", "/game-dir"))
                 {
                     options.GameDirectory = ReadValue(args, ref i, arg);
+                    continue;
+                }
+                if (Matches(arg, "--skip-registry", "/skip-registry"))
+                {
+                    options.WriteRegistryKeys = false;
+                    continue;
+                }
+                if (Matches(arg, "--write-registry", "/write-registry"))
+                {
+                    options.WriteRegistryKeys = true;
                     continue;
                 }
 
@@ -518,5 +1041,60 @@ internal static class HWClientSetup
         {
             return arg.IndexOf('\\') >= 0 || arg.IndexOf('/') >= 0 || arg.IndexOf(':') >= 0;
         }
+    }
+
+    private sealed class InstallChoices
+    {
+        public string ServerHost { get; set; }
+        public bool WriteRegistryKeys { get; set; }
+        public RegistryCdKeyOption RegistryCdKey { get; set; }
+    }
+
+    private sealed class RegistryCdKeyOption
+    {
+        public RegistryCdKeyOption(string displayCdKey, byte[] encryptedCdKey)
+        {
+            DisplayCdKey = displayCdKey;
+            PlainCdKey = displayCdKey.Replace("-", string.Empty);
+            EncryptedCdKey = encryptedCdKey;
+        }
+
+        public string DisplayCdKey { get; private set; }
+        public string PlainCdKey { get; private set; }
+        public byte[] EncryptedCdKey { get; private set; }
+    }
+
+    private sealed class ExistingInstallState
+    {
+        public bool HasSierraCdKey { get; set; }
+        public bool HasWonCdKey { get; set; }
+        public bool RegistryOwnedByInstaller { get; set; }
+        public string SierraCdKeyDisplay { get; set; }
+        public bool HasNetTweakScript { get; set; }
+        public bool HasNetTweakBackup { get; set; }
+        public bool HasKverFile { get; set; }
+
+        public bool HasAnyRegistryCdKey
+        {
+            get { return HasSierraCdKey || HasWonCdKey; }
+        }
+
+        public bool HasBootstrapFiles
+        {
+            get { return HasNetTweakScript || HasKverFile; }
+        }
+    }
+
+    private sealed class RegistryWriteResult
+    {
+        public string DisplayCdKey { get; set; }
+        public string SierraRegistryValuePath { get; set; }
+        public string WonRegistryValuePath { get; set; }
+    }
+
+    private sealed class InstallResult
+    {
+        public string ServerHost { get; set; }
+        public RegistryWriteResult RegistryWrite { get; set; }
     }
 }
