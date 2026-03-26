@@ -2,58 +2,43 @@ name: HWOnlineInstaller Release
 
 on:
   push:
-    tags:
-      - "v*"
-      - "*.*.*"
-  release:
-    types:
-      - published
+    branches:
+      - main
+    paths:
+      - "installer/hwclient_setup.cs"
+      - "installer/hwclient_setup.manifest"
+      - "installer/build_installer.bat"
+      - "installer/write_assembly_info.ps1"
+      - "keys/kver.kp"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-and-upload-installer:
+  build-and-release-installer:
     runs-on: windows-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Resolve installer version
+      - name: Generate version from date and short SHA
         id: version
         shell: pwsh
-        env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } elseif ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { "manual-$env:GITHUB_RUN_NUMBER-$($env:GITHUB_SHA.Substring(0, 7))" }
-          $version = $version.Trim()
-          if ([string]::IsNullOrWhiteSpace($version)) {
-            $version = "manual-$env:GITHUB_RUN_NUMBER"
-          }
+          $date = Get-Date -Format "yyyy.M.d"
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          $tag = "installer-v$date"
+          $version = "$date.0"
+          $outputName = "HWOnlineSetup-$tag.exe"
 
-          $semverSource = $version -replace '^[vV]', ''
-          $match = [regex]::Match($semverSource, '^(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)(?:\.(?<build>\d+))?(?:[-+].*)?$')
-
-          if ($match.Success) {
-            $build = if ($match.Groups['build'].Success) { [int]$match.Groups['build'].Value } else { 0 }
-            $numericVersion = "{0}.{1}.{2}.{3}" -f $match.Groups['major'].Value, $match.Groups['minor'].Value, $match.Groups['patch'].Value, $build
-          } else {
-            $fallbackBuild = [Math]::Min([int]$env:GITHUB_RUN_NUMBER, 65534)
-            $numericVersion = "0.0.0.$fallbackBuild"
-          }
-
-          $safeVersion = ($version -replace '[<>:"/\\|?*]', '-').Trim('. ')
-          if ([string]::IsNullOrWhiteSpace($safeVersion)) {
-            $safeVersion = "build-$env:GITHUB_RUN_NUMBER"
-          }
-
-          $outputName = "HWOnlineSetup-$safeVersion.exe"
-
-          "informational_version=$version" >> $env:GITHUB_OUTPUT
-          "file_version=$numericVersion" >> $env:GITHUB_OUTPUT
-          "assembly_version=$numericVersion" >> $env:GITHUB_OUTPUT
+          "tag=$tag"               >> $env:GITHUB_OUTPUT
+          "informational_version=$tag+$sha" >> $env:GITHUB_OUTPUT
+          "file_version=$version"  >> $env:GITHUB_OUTPUT
+          "assembly_version=$version" >> $env:GITHUB_OUTPUT
           "output_name=$outputName" >> $env:GITHUB_OUTPUT
 
       - name: Build HWOnline installer
@@ -72,11 +57,34 @@ jobs:
           path: installer/${{ steps.version.outputs.output_name }}
           if-no-files-found: error
 
-      - name: Create or update GitHub release
-        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
+      - name: Generate release notes from installer commits
+        id: notes
+        shell: pwsh
+        run: |
+          $lastRelease = git tag --list "installer-v*" --sort=-creatordate | Select-Object -First 1
+          if ($lastRelease) {
+            $log = git log --pretty=format:"- %s (%h)" "$lastRelease..HEAD" -- installer/ keys/kver.kp
+          } else {
+            $log = git log --pretty=format:"- %s (%h)" -10 -- installer/ keys/kver.kp
+          }
+          if (-not $log) { $log = "- Installer update" }
+          $log = $log -join "`n"
+          # Write multiline output
+          "notes<<ENDOFNOTES" >> $env:GITHUB_OUTPUT
+          $log >> $env:GITHUB_OUTPUT
+          "ENDOFNOTES" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "HWOnlineSetup ${{ steps.version.outputs.tag }}"
+          body: |
+            ## Installer update
+
+            ${{ steps.notes.outputs.notes }}
+
+            Download `${{ steps.version.outputs.output_name }}` below, run as Administrator, and follow the prompts.
           files: installer/${{ steps.version.outputs.output_name }}
           fail_on_unmatched_files: true
-          overwrite_files: true
+          make_latest: true
