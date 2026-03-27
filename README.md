@@ -45,7 +45,9 @@ GitHub Actions runs the same suite on every push and pull request across Python 
 
 Distribute `HWOnlineSetup.exe` to players. Run as Administrator
 
-The installer auto-detects the Homeworld install directory, optionally writes a CD key to the registry, updates `NetTweak.script` to point at your server, and installs the `kver.kp` verifier key. No Python required on client machines.
+The installer auto-detects the Homeworld install directory, optionally writes a randomized bundled CD key to the registry, updates `NetTweak.script` to point at your server, and installs the `kver.kp` verifier key. No Python required on client machines.
+
+The bundled installer pool is still static at runtime, but you can now regenerate a much larger pool from the real retail algorithm with `generate_cdkeys.py` instead of hand-curating captured keys.
 
 To rebuild the installer from source:
 
@@ -75,6 +77,15 @@ Optionally generate fresh keys (skip this to use the bundled key set):
 ```powershell
 python generate_keys.py --keys-dir keys
 ```
+
+Generate true retail-compatible Homeworld or Cataclysm CD keys:
+
+```powershell
+python generate_cdkeys.py --product Homeworld --count 10
+python generate_cdkeys.py --product Cataclysm --count 25 --format csharp
+```
+
+`--format csharp` emits `RegistryCdKeyOption(...)` lines you can paste into an installer pool.
 
 Start the backend and gateway in separate terminals:
 
@@ -183,7 +194,7 @@ Supporting modules:
 
 ### Known limitations
 
-- **No credential validation** - the server issues a certificate to any connecting client without checking credentials. Accounts are auto-created on first login.
+- **Native auth is still lightweight** - Homeworld/Cataclysm Auth1 now decrypts the native login blob, requires explicit account creation on first use, rejects missing or invalid retail-format CD keys, and binds each username to its first successful CD key. The legacy JSON auth endpoint still auto-creates users and there is no global CD-key uniqueness enforcement yet.
 - **NAT detection** - the firewall probe reply is implemented but strict-NAT behavior needs broader field testing.
 - **Reconnect-to-match** - matches on player name and IP; needs wider real-world validation.
 - **In-process routing** - routing rooms are managed in-gateway rather than spawning external `RoutingServHWGame` binaries.

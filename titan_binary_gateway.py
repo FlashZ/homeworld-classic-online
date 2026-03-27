@@ -750,6 +750,31 @@ def _sanitize_routing_chat_text(text: str) -> str:
     return "".join(cleaned).strip()[:ROUTING_MAX_CHAT_CHARS]
 
 
+def _mask_account_key(value: str) -> str:
+    """Return a short, non-sensitive representation of a CD/login key."""
+    normalized = "".join(ch for ch in value if ch.isalnum())
+    if not normalized:
+        return "<empty>"
+    if len(normalized) <= 8:
+        return normalized[0] + ("*" * max(0, len(normalized) - 2)) + normalized[-1]
+    return f"{normalized[:4]}...{normalized[-4:]}"
+
+
+def _native_auth_error_to_status(error: str) -> int:
+    """Map backend native-auth failures to retail Auth1 status codes."""
+    mapping = {
+        "missing_username": won_crypto.STATUS_AUTH_INVALID_USER_NAME,
+        "create_account_required": won_crypto.STATUS_AUTH_USER_NOT_FOUND,
+        "username_taken": won_crypto.STATUS_AUTH_USER_EXISTS,
+        "invalid_credentials": won_crypto.STATUS_AUTH_BAD_PASSWORD,
+        "missing_cd_key": won_crypto.STATUS_AUTH_INVALID_CD_KEY,
+        "invalid_cd_key": won_crypto.STATUS_AUTH_INVALID_CD_KEY,
+        "cd_key_mismatch": won_crypto.STATUS_AUTH_INVALID_CD_KEY,
+        "rate_limited": won_crypto.STATUS_AUTH_BAD_PASSWORD,
+    }
+    return mapping.get(str(error), won_crypto.STATUS_COMMON_INVALID_PARAMETERS)
+
+
 def _encode_routing_chat_text(chat_type: int, text: str, fallback: bytes) -> bytes:
     """Encode sanitized chat back into the original wire format."""
     if chat_type in {3, 4}:
@@ -4736,6 +4761,65 @@ class BinaryGatewayServer:
         except Exception as exc:
             LOGGER.error("Auth1: ElGamal decrypt failed: %s", exc)
             return
+
+        client_ip = None
+        if isinstance(peer, (tuple, list)) and peer:
+            client_ip = str(peer[0])
+
+        native_login = None
+        try:
+            native_login = won_crypto.parse_auth1_login_payload(login_req["bf_data"], session_key)
+            LOGGER.info(
+                "Auth1: native login user=%r community=%r create=%s need_key=%s cd_key=%s login_key=%s variant=%s",
+                native_login["username"],
+                native_login["community_name"],
+                native_login["create_account"],
+                native_login["need_key"],
+                _mask_account_key(str(native_login["cd_key"])),
+                _mask_account_key(str(native_login["login_key"])),
+                native_login.get("ciphertext_variant", "direct"),
+            )
+        except Exception as exc:
+            LOGGER.warning("Auth1: failed to parse native login payload from %s:%s: %s", *peer, exc)
+            return
+
+        backend = await self._call_backend(
+            {
+                "action": "AUTH_LOGIN_NATIVE",
+                "username": str(native_login["username"]),
+                "password": str(native_login["password"]),
+                "new_password": str(native_login["new_password"]),
+                "cd_key": str(native_login["cd_key"]),
+                "login_key": str(native_login["login_key"]),
+                "create_account": bool(native_login["create_account"]),
+                "client_ip": client_ip,
+            }
+        )
+        if not backend.get("ok"):
+            error_code = str(backend.get("error", "native_auth_failed"))
+            status = _native_auth_error_to_status(error_code)
+            LOGGER.warning(
+                "Auth1: native login rejected for user=%r from %s:%s error=%s status=%d",
+                native_login["username"],
+                *peer,
+                error_code,
+                status,
+            )
+            try:
+                writer.write(won_crypto.build_auth1_login_failure_reply(status))
+                await writer.drain()
+            except Exception as exc:
+                LOGGER.debug("Auth1: failed to send login failure reply to %s:%s: %s", *peer, exc)
+            return
+        native_result = backend.get("result", {})
+        if isinstance(native_result, dict):
+            LOGGER.info(
+                "Auth1: native account accepted user=%r created=%s cd_key_bound=%s binding_changed=%s",
+                native_result.get("username", native_login["username"]),
+                bool(native_result.get("created", False)),
+                bool(native_result.get("cd_key_bound", False)),
+                bool(native_result.get("binding_changed", False)),
+            )
 
         # --- Send LoginChallengeHW ---
         challenge_seed = os.urandom(16)

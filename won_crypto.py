@@ -350,6 +350,19 @@ AUTH1_LOGIN_REQUEST_HW    = 30
 AUTH1_LOGIN_CHALLENGE_HW  = 32
 AUTH1_LOGIN_CONFIRM_HW    = 33
 
+STATUS_COMMON_SUCCESS = 0
+STATUS_COMMON_INVALID_PARAMETERS = -4
+STATUS_AUTH_BAD_PUB_KEY_BLOCK = -1500
+STATUS_AUTH_BAD_CD_KEY = -1501
+STATUS_AUTH_CD_KEY_IN_USE = -1503
+STATUS_AUTH_CRC_FAILED = -1504
+STATUS_AUTH_USER_EXISTS = -1505
+STATUS_AUTH_USER_NOT_FOUND = -1506
+STATUS_AUTH_BAD_PASSWORD = -1507
+STATUS_AUTH_INVALID_USER_NAME = -1508
+STATUS_AUTH_BAD_COMMUNITY = -1509
+STATUS_AUTH_INVALID_CD_KEY = -1510
+
 
 def build_tmessage(service_type: int, msg_type: int, body: bytes) -> bytes:
     """Build a complete TMessage frame.
@@ -518,6 +531,213 @@ def bf_decrypt(ciphertext: bytes, key: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Retail client CD-key encode/decode helpers
+#
+# Ported from Homeworld's ClientCDKey.cpp and CRC16.cpp. This is the actual
+# retail key format used for both the human-readable 20-character key and the
+# 16-byte WON registry value.
+# ---------------------------------------------------------------------------
+
+CDKEY_PRODUCT_HOMEWORLD = "Homeworld"
+CDKEY_PRODUCT_CATACLYSM = "Cataclysm"
+
+_CDKEY_STRING_MAP = "CVCNCVCNCVCNCVCNNNNN"
+_CDKEY_C_CHARS = "BCDFGJLMNPRSTWXZ"
+_CDKEY_V_CHARS = "AEUY"
+_CDKEY_SKIP_CHARS = {"-", " ", "\t", "\r", "\n", "\0"}
+_CDKEY_BINARY_LEN = 16
+
+_CRC16_TABLE = (
+    0x0000, 0x8005, 0x800F, 0x000A, 0x801B, 0x001E, 0x0014, 0x8011,
+    0x8033, 0x0036, 0x003C, 0x8039, 0x0028, 0x802D, 0x8027, 0x0022,
+    0x8063, 0x0066, 0x006C, 0x8069, 0x0078, 0x807D, 0x8077, 0x0072,
+    0x0050, 0x8055, 0x805F, 0x005A, 0x804B, 0x004E, 0x0044, 0x8041,
+    0x80C3, 0x00C6, 0x00CC, 0x80C9, 0x00D8, 0x80DD, 0x80D7, 0x00D2,
+    0x00F0, 0x80F5, 0x80FF, 0x00FA, 0x80EB, 0x00EE, 0x00E4, 0x80E1,
+    0x00A0, 0x80A5, 0x80AF, 0x00AA, 0x80BB, 0x00BE, 0x00B4, 0x80B1,
+    0x8093, 0x0096, 0x009C, 0x8099, 0x0088, 0x808D, 0x8087, 0x0082,
+    0x8183, 0x0186, 0x018C, 0x8189, 0x0198, 0x819D, 0x8197, 0x0192,
+    0x01B0, 0x81B5, 0x81BF, 0x01BA, 0x81AB, 0x01AE, 0x01A4, 0x81A1,
+    0x01E0, 0x81E5, 0x81EF, 0x01EA, 0x81FB, 0x01FE, 0x01F4, 0x81F1,
+    0x81D3, 0x01D6, 0x01DC, 0x81D9, 0x01C8, 0x81CD, 0x81C7, 0x01C2,
+    0x0140, 0x8145, 0x814F, 0x014A, 0x815B, 0x015E, 0x0154, 0x8151,
+    0x8173, 0x0176, 0x017C, 0x8179, 0x0168, 0x816D, 0x8167, 0x0162,
+    0x8123, 0x0126, 0x012C, 0x8129, 0x0138, 0x813D, 0x8137, 0x0132,
+    0x0110, 0x8115, 0x811F, 0x011A, 0x810B, 0x010E, 0x0104, 0x8101,
+    0x8303, 0x0306, 0x030C, 0x8309, 0x0318, 0x831D, 0x8317, 0x0312,
+    0x0330, 0x8335, 0x833F, 0x033A, 0x832B, 0x032E, 0x0324, 0x8321,
+    0x0360, 0x8365, 0x836F, 0x036A, 0x837B, 0x037E, 0x0374, 0x8371,
+    0x8353, 0x0356, 0x035C, 0x8359, 0x0348, 0x834D, 0x8347, 0x0342,
+    0x03C0, 0x83C5, 0x83CF, 0x03CA, 0x83DB, 0x03DE, 0x03D4, 0x83D1,
+    0x83F3, 0x03F6, 0x03FC, 0x83F9, 0x03E8, 0x83ED, 0x83E7, 0x03E2,
+    0x83A3, 0x03A6, 0x03AC, 0x83A9, 0x03B8, 0x83BD, 0x83B7, 0x03B2,
+    0x0390, 0x8395, 0x839F, 0x039A, 0x838B, 0x038E, 0x0384, 0x8381,
+    0x0280, 0x8285, 0x828F, 0x028A, 0x829B, 0x029E, 0x0294, 0x8291,
+    0x82B3, 0x02B6, 0x02BC, 0x82B9, 0x02A8, 0x82AD, 0x82A7, 0x02A2,
+    0x82E3, 0x02E6, 0x02EC, 0x82E9, 0x02F8, 0x82FD, 0x82F7, 0x02F2,
+    0x02D0, 0x82D5, 0x82DF, 0x02DA, 0x82CB, 0x02CE, 0x02C4, 0x82C1,
+    0x8243, 0x0246, 0x024C, 0x8249, 0x0258, 0x825D, 0x8257, 0x0252,
+    0x0270, 0x8275, 0x827F, 0x027A, 0x826B, 0x026E, 0x0264, 0x8261,
+    0x0220, 0x8225, 0x822F, 0x022A, 0x823B, 0x023E, 0x0234, 0x8231,
+    0x8213, 0x0216, 0x021C, 0x8219, 0x0208, 0x820D, 0x8207, 0x0202,
+)
+
+
+def crc16_won(data: bytes, init_value: int = 0, xor_out_value: int = 0) -> int:
+    """Compute the WON CRC16 used by retail CD-key code."""
+    register = init_value & 0xFFFF
+    for byte in data:
+        register = _CRC16_TABLE[((register >> 8) ^ byte) & 0xFF] ^ ((register << 8) & 0xFFFF)
+    return (register ^ xor_out_value) & 0xFFFF
+
+
+def _normalize_cd_key_text(value: str) -> str:
+    return "".join(ch for ch in value.upper() if ch not in _CDKEY_SKIP_CHARS)
+
+
+def _derive_cd_key_symmetric_key(product: str) -> bytes:
+    """Match ClientCDKey::CreateSymmetricKey."""
+    product_bytes = product.encode("ascii")
+    rolling = product_bytes
+    checksums = [crc16_won(rolling)]
+    for byte in product_bytes[:3]:
+        rolling += bytes([byte])
+        checksums.append(crc16_won(rolling))
+    return b"".join(struct.pack("<H", checksum) for checksum in checksums)
+
+
+def _light_validity_check(product: str, key_bytes: bytes) -> int:
+    checksum = crc16_won(product.encode("ascii") + key_bytes)
+    return (checksum & 0x0FFF) >> 4
+
+
+def _pack_cd_key_raw(key_bytes: bytes, light_check: int) -> bytes:
+    if len(key_bytes) != 7:
+        raise ValueError("cd_key_key_bytes_len")
+    return key_bytes[:3] + bytes([light_check & 0xFF]) + key_bytes[3:]
+
+
+def _unpack_cd_key_raw(raw: bytes) -> Tuple[bytes, int]:
+    if len(raw) != 8:
+        raise ValueError("cd_key_raw_len")
+    return raw[:3] + raw[4:], raw[3]
+
+
+def cd_key_to_display(raw: bytes) -> str:
+    """Convert an 8-byte raw retail CD-key buffer to display form."""
+    if len(raw) != 8:
+        raise ValueError("cd_key_raw_len")
+    buf = int.from_bytes(raw, "little")
+    offset = 0
+    chars = []
+
+    for token in _CDKEY_STRING_MAP:
+        if token == "C":
+            chars.append(_CDKEY_C_CHARS[(buf >> offset) & 0x0F])
+            offset += 4
+        elif token == "V":
+            chars.append(_CDKEY_V_CHARS[(buf >> offset) & 0x03])
+            offset += 2
+        elif token == "N":
+            chars.append(chr(((buf >> offset) & 0x07) + ord("2")))
+            offset += 3
+        else:
+            raise ValueError("cd_key_unknown_map_token")
+
+    return "-".join("".join(chars[i:i + 4]) for i in range(0, len(chars), 4))
+
+
+def cd_key_from_display(display_key: str) -> bytes:
+    """Parse a retail display/plain CD-key into the raw 8-byte buffer."""
+    normalized = _normalize_cd_key_text(display_key)
+    if len(normalized) != len(_CDKEY_STRING_MAP):
+        raise ValueError("cd_key_length")
+
+    buf = 0
+    offset = 0
+    for token, char in zip(_CDKEY_STRING_MAP, normalized):
+        if token == "C":
+            value = _CDKEY_C_CHARS.find(char)
+            if value < 0:
+                raise ValueError("cd_key_invalid_c")
+            buf |= value << offset
+            offset += 4
+        elif token == "V":
+            value = _CDKEY_V_CHARS.find(char)
+            if value < 0:
+                raise ValueError("cd_key_invalid_v")
+            buf |= value << offset
+            offset += 2
+        elif token == "N":
+            if char < "2" or char > "9":
+                raise ValueError("cd_key_invalid_n")
+            buf |= (ord(char) - ord("2")) << offset
+            offset += 3
+        else:
+            raise ValueError("cd_key_unknown_map_token")
+
+    return buf.to_bytes(8, "little")
+
+
+def validate_cd_key(product: str, display_key: str) -> bool:
+    """Check whether a retail Homeworld-family CD key passes the client checksum."""
+    try:
+        raw = cd_key_from_display(display_key)
+    except ValueError:
+        return False
+    key_bytes, light_check = _unpack_cd_key_raw(raw)
+    return _light_validity_check(product, key_bytes) == light_check
+
+
+def encrypt_cd_key_for_registry(product: str, display_key: str) -> bytes:
+    """Convert a retail display/plain CD key to the 16-byte WON registry blob."""
+    raw = cd_key_from_display(display_key)
+    key_bytes, light_check = _unpack_cd_key_raw(raw)
+    if _light_validity_check(product, key_bytes) != light_check:
+        raise ValueError("invalid_cd_key")
+    return bf_encrypt(raw, _derive_cd_key_symmetric_key(product))
+
+
+def decrypt_cd_key_from_registry(product: str, encrypted_key: bytes) -> dict:
+    """Decode a WON registry CD-key value back to display/plain form."""
+    if len(encrypted_key) != _CDKEY_BINARY_LEN:
+        raise ValueError("cd_key_encrypted_len")
+    raw = bf_decrypt(encrypted_key, _derive_cd_key_symmetric_key(product))
+    if len(raw) != 8:
+        raise ValueError("cd_key_decrypted_raw_len")
+    key_bytes, light_check = _unpack_cd_key_raw(raw)
+    display_key = cd_key_to_display(raw)
+    return {
+        "display_key": display_key,
+        "plain_key": _normalize_cd_key_text(display_key),
+        "raw_key": raw,
+        "key_bytes": key_bytes,
+        "light_check": light_check,
+        "valid": _light_validity_check(product, key_bytes) == light_check,
+    }
+
+
+def generate_cd_key(product: str, *, beta: bool = False) -> dict:
+    """Generate a new retail-compatible Homeworld-family CD key."""
+    key_bytes = bytearray(os.urandom(7))
+    if beta:
+        key_bytes[0] |= 0x01
+    else:
+        key_bytes[0] &= 0xFE
+
+    light_check = _light_validity_check(product, bytes(key_bytes))
+    raw = _pack_cd_key_raw(bytes(key_bytes), light_check)
+    display_key = cd_key_to_display(raw)
+    return {
+        "display_key": display_key,
+        "plain_key": _normalize_cd_key_text(display_key),
+        "encrypted_key": bf_encrypt(raw, _derive_cd_key_symmetric_key(product)),
+        "raw_key": raw,
+        "beta": bool(key_bytes[0] & 0x01),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Auth1 TMessage builders (complete framed packets ready to send)
 # ---------------------------------------------------------------------------
 
@@ -564,6 +784,19 @@ def build_auth1_login_reply(cert: bytes) -> bytes:
     return build_tmessage(AUTH1_SERVICE_TYPE, AUTH1_LOGIN_REPLY, body)
 
 
+def build_auth1_login_failure_reply(status: int) -> bytes:
+    """Build an Auth1LoginReply failure packet.
+
+    The retail WON format sends:
+      [u16 status][u8 error_count][u8 clear_entry_count]
+    followed by any optional error strings or clear blocks. For the Homeworld
+    client, the status code alone is sufficient for the UI to classify the
+    login failure, so we send no extra strings or blocks.
+    """
+    body = struct.pack("<hBB", status, 0, 0)
+    return build_tmessage(AUTH1_SERVICE_TYPE, AUTH1_LOGIN_REPLY, body)
+
+
 # ---------------------------------------------------------------------------
 # Auth1 LoginRequestHW parser
 # ---------------------------------------------------------------------------
@@ -595,15 +828,216 @@ def parse_auth1_login_request(body: bytes) -> dict:
     eg_ciphertext = body[offset:offset + eg_len]
     offset += eg_len
 
-    # PackRawBuf: [u16 LE len][data] for Blowfish-encrypted login data
-    bf_data = b''
-    if offset + 2 <= len(body):
-        bf_len, = struct.unpack('<H', body[offset:offset + 2])
-        offset += 2
-        bf_data = body[offset:offset + bf_len]
+    # TMsgAuth1LoginBase2 appends the encrypted login data as the remainder of
+    # the message body; it is not wrapped in a second PackRawBuf length prefix.
+    bf_data = body[offset:] if offset <= len(body) else b''
 
     return {
         'block_id': block_id,
         'eg_ciphertext': eg_ciphertext,
         'bf_data': bf_data,
     }
+
+
+def _read_pw_string_le(data: bytes, offset: int) -> Tuple[str, int]:
+    """Read a WON PW_STRING ([u16 LE chars][utf-16-le bytes])."""
+    if offset + 2 > len(data):
+        raise ValueError("auth1_login_pw_string_truncated_len")
+    nchar, = struct.unpack('<H', data[offset:offset + 2])
+    offset += 2
+    byte_len = nchar * 2
+    if offset + byte_len > len(data):
+        raise ValueError("auth1_login_pw_string_truncated_data")
+    value = data[offset:offset + byte_len].decode("utf-16-le", errors="replace") if nchar else ""
+    return value, offset + byte_len
+
+
+def _read_raw_buf_le(data: bytes, offset: int) -> Tuple[bytes, int]:
+    """Read a WON PackRawBuf ([u16 LE len][raw bytes])."""
+    if offset + 2 > len(data):
+        raise ValueError("auth1_login_raw_buf_truncated_len")
+    raw_len, = struct.unpack('<H', data[offset:offset + 2])
+    offset += 2
+    if offset + raw_len > len(data):
+        raise ValueError("auth1_login_raw_buf_truncated_data")
+    return data[offset:offset + raw_len], offset + raw_len
+
+
+def _decode_login_raw_text(raw: bytes) -> str:
+    """Best-effort decode for CD/login key buffers."""
+    if not raw:
+        return ""
+    try:
+        return raw.decode("ascii").rstrip("\x00")
+    except UnicodeDecodeError:
+        pass
+    if len(raw) % 2 == 0:
+        try:
+            return raw.decode("utf-16-le").rstrip("\x00")
+        except UnicodeDecodeError:
+            pass
+    return raw.hex()
+
+
+def _decode_login_cd_key(raw: bytes) -> str:
+    """Decode the Homeworld-family login CD-key buffer.
+
+    Retail Homeworld sends the CD key as an 8-byte raw key value, not as the
+    human-readable 20-character display string. Convert that raw form back to
+    display form so the backend can validate it normally.
+    """
+    if not raw:
+        return ""
+    if len(raw) == 8:
+        try:
+            return cd_key_to_display(raw)
+        except Exception:
+            pass
+    return _decode_login_raw_text(raw)
+
+
+def _decode_login_key(raw: bytes) -> str:
+    """Decode the Homeworld-family login key buffer.
+
+    Retail Homeworld stores the login key as an opaque 8-byte token. Some test
+    and tooling paths use printable ASCII strings instead, so preserve those,
+    but otherwise keep binary data as hex rather than attempting UTF-16.
+    """
+    if not raw:
+        return ""
+    if all(32 <= byte <= 126 for byte in raw):
+        try:
+            return raw.decode("ascii").rstrip("\x00")
+        except UnicodeDecodeError:
+            pass
+    return raw.hex()
+
+
+def _parse_auth1_login_cleartext(clear: bytes) -> dict:
+    """Parse the decrypted Auth1LoginRequestHW cleartext payload."""
+    offset = 0
+    if len(clear) < 4:
+        raise ValueError("auth1_login_payload_too_short")
+
+    block_id, = struct.unpack('<H', clear[offset:offset + 2])
+    offset += 2
+    need_key = clear[offset] != 0
+    offset += 1
+    create_account = clear[offset] != 0
+    offset += 1
+
+    username, offset = _read_pw_string_le(clear, offset)
+    community_name, offset = _read_pw_string_le(clear, offset)
+    nickname_key, offset = _read_pw_string_le(clear, offset)
+    password, offset = _read_pw_string_le(clear, offset)
+    new_password, offset = _read_pw_string_le(clear, offset)
+    raw_cd_key, offset = _read_raw_buf_le(clear, offset)
+    raw_login_key, offset = _read_raw_buf_le(clear, offset)
+
+    if offset != len(clear):
+        raise ValueError("auth1_login_payload_trailing_data")
+
+    return {
+        "block_id": block_id,
+        "need_key": need_key,
+        "create_account": create_account,
+        "username": username,
+        "community_name": community_name,
+        "nickname_key": nickname_key,
+        "password": password,
+        "new_password": new_password,
+        "cd_key": _decode_login_cd_key(raw_cd_key),
+        "login_key": _decode_login_key(raw_login_key),
+        "raw_cd_key": raw_cd_key,
+        "raw_login_key": raw_login_key,
+    }
+
+
+def _iter_auth1_bf_ciphertexts(bf_data: bytes) -> Tuple[Tuple[bytes, str], ...]:
+    """Yield plausible Blowfish ciphertext slices from a LoginRequestHW blob.
+
+    Some retail Homeworld builds appear to wrap the encrypted login payload with
+    short framing bytes, which means the raw buffer length is not always an
+    exact multiple of the Blowfish block size.  We prefer the exact blob first,
+    then progressively try explicitly length-prefixed and lightly wrapped forms.
+    """
+    candidates = []
+    seen: set[bytes] = set()
+    total_len = len(bf_data)
+
+    def _add(candidate: bytes, label: str) -> None:
+        if not candidate or len(candidate) % 8 != 0:
+            return
+        if candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append((candidate, label))
+
+    _add(bf_data, "direct")
+
+    for prefix_len in (2, 4):
+        if total_len <= prefix_len:
+            continue
+        format_variants = [("<H", "le"), (">H", "be")] if prefix_len == 2 else [("<I", "le"), (">I", "be")]
+        for fmt, endian_label in format_variants:
+            encoded_len, = struct.unpack(fmt, bf_data[:prefix_len])
+            if encoded_len <= 0 or prefix_len + encoded_len > total_len:
+                continue
+            candidate = bf_data[prefix_len:prefix_len + encoded_len]
+            suffix = bf_data[prefix_len + encoded_len:]
+            label = f"len{prefix_len}{endian_label}_suffix{len(suffix)}"
+            if endian_label == "le":
+                label = f"len{prefix_len}_suffix{len(suffix)}"
+            _add(candidate, label)
+
+    max_trim = min(8, total_len)
+    for trimmed in range(1, max_trim + max_trim + 1):
+        for prefix_trim in range(0, min(max_trim, trimmed) + 1):
+            suffix_trim = trimmed - prefix_trim
+            if suffix_trim > max_trim:
+                continue
+            start = prefix_trim
+            end = total_len - suffix_trim
+            if start >= end:
+                continue
+            _add(bf_data[start:end], f"trim{prefix_trim}_{suffix_trim}")
+
+    return tuple(candidates)
+
+
+def parse_auth1_login_payload(bf_data: bytes, session_key: bytes) -> dict:
+    """Decrypt and parse the Auth1LoginRequestHW login payload.
+
+    Returned fields mirror the native WON/Homeworld login blob:
+      block_id, need_key, create_account, username, community_name,
+      nickname_key, password, new_password, cd_key, login_key.
+    """
+    if not bf_data:
+        return {
+            "block_id": 0,
+            "need_key": False,
+            "create_account": False,
+            "username": "",
+            "community_name": "",
+            "nickname_key": "",
+            "password": "",
+            "new_password": "",
+            "cd_key": "",
+            "login_key": "",
+            "raw_cd_key": b"",
+            "raw_login_key": b"",
+        }
+
+    errors = []
+    for candidate, variant in _iter_auth1_bf_ciphertexts(bf_data):
+        try:
+            parsed = _parse_auth1_login_cleartext(bf_decrypt(candidate, session_key))
+            parsed["ciphertext_variant"] = variant
+            return parsed
+        except Exception as exc:
+            errors.append(f"{variant}:{exc}")
+
+    raise ValueError(
+        "auth1_login_payload_unparseable: "
+        + "; ".join(errors[:6] or ["no_candidate_ciphertexts"])
+    )
