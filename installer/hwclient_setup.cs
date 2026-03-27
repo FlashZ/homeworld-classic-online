@@ -13,48 +13,19 @@ internal static class HWClientSetup
     private const string CustomHostOptionLabel = "Custom host or IP";
     private const int DefaultGatewayPort = 15101;
     private const string NetTweakBackupSuffix = ".homeworld_oss.bak";
+    private const string RetailProductName = "Homeworld";
     private const string DefaultDisplayCdKey = "NYX7-ZEC9-FYZ6-GUX8-4253";
-    private const string DefaultPlainCdKey = "NYX7ZEC9FYZ6GUX84253";
     private const string WonCdKeysRegistryPath = @"SOFTWARE\WON\CDKeys";
     private const string SierraHomeworldRegistryPath = @"SOFTWARE\Sierra On-Line\Homeworld";
     private const string WonHomeworldValueName = "Homeworld";
     private const string SierraCdKeyValueName = "CDKey";
     private const string InstallerRegistryMarkerValueName = "HomeworldOnlineSetupWroteCdKey";
 
-    // This installer intentionally ships the same known-good retail-compatible key
-    // as the legacy batch bootstrap, so it stays dependency-free on stock Windows.
+    // Keep a known-good pair as a runtime sanity check for the embedded retail keygen.
     private static readonly byte[] DefaultEncryptedCdKey = new byte[]
     {
         0xFB, 0x0F, 0x77, 0xC4, 0x80, 0x3F, 0x65, 0xDB,
         0xBB, 0xA6, 0x6A, 0x4D, 0x4E, 0x2C, 0xB6, 0x17,
-    };
-
-    private static readonly RegistryCdKeyOption[] RegistryCdKeyPool = new[]
-    {
-        new RegistryCdKeyOption(DefaultDisplayCdKey, DefaultEncryptedCdKey),
-        new RegistryCdKeyOption("PYL8-GUD4-BET3-MEX9-6624", new byte[] { 0x75, 0xA6, 0x4E, 0xD5, 0x40, 0x1B, 0xE8, 0xD6, 0x1B, 0x7A, 0x7A, 0x90, 0x22, 0xD7, 0x1E, 0x06 }),
-        new RegistryCdKeyOption("XYR4-DYM7-FAG8-NEL4-5963", new byte[] { 0x89, 0x6F, 0xD2, 0xA5, 0x8A, 0xA1, 0xDB, 0x89, 0xFC, 0x46, 0x30, 0xC6, 0x38, 0x20, 0x34, 0x19 }),
-        new RegistryCdKeyOption("SUT5-DUF8-XUB4-DAZ2-3552", new byte[] { 0xF3, 0x6D, 0x1A, 0xE6, 0x93, 0x81, 0x1A, 0x3F, 0xDC, 0x54, 0x0C, 0x4B, 0xCA, 0x4F, 0x61, 0x46 }),
-        new RegistryCdKeyOption("WEW2-RYF2-TAJ4-XUP2-2996", new byte[] { 0xF1, 0x06, 0x56, 0x2A, 0xA2, 0xB9, 0x90, 0xC9, 0x62, 0xD3, 0x67, 0x4C, 0x68, 0x05, 0x97, 0x01 }),
-        new RegistryCdKeyOption("MEB4-RUG3-REL7-DUG9-3375", new byte[] { 0x02, 0x25, 0x13, 0xAA, 0x08, 0x6B, 0xAE, 0xDF, 0xF9, 0x50, 0xEE, 0xBC, 0xB1, 0xCA, 0x87, 0x97 }),
-        new RegistryCdKeyOption("GYJ6-ZYS4-MUD2-GUT4-8772", new byte[] { 0x25, 0x0F, 0x51, 0x40, 0x07, 0x42, 0x4E, 0x7E, 0x97, 0x0A, 0x8D, 0xF0, 0xFB, 0xD1, 0xB7, 0xAF }),
-        new RegistryCdKeyOption("CUX8-NUM6-DYT5-CUB6-3882", new byte[] { 0x48, 0xE4, 0x20, 0x75, 0x48, 0x0F, 0x76, 0x61, 0x65, 0x14, 0xE4, 0xA7, 0x02, 0x1F, 0x51, 0x7A }),
-        new RegistryCdKeyOption("CUC2-DUR7-PAN5-CAR9-2879", new byte[] { 0x5E, 0x26, 0x95, 0xFD, 0x97, 0x11, 0x52, 0x0A, 0x53, 0xFF, 0x5C, 0xEF, 0xCB, 0xFE, 0xEF, 0x8B }),
-        new RegistryCdKeyOption("NAJ4-FUN6-CYT4-BAG8-9675", new byte[] { 0x7E, 0x8F, 0x0B, 0xFD, 0x0E, 0x42, 0xF7, 0xE4, 0x94, 0x81, 0x18, 0x6E, 0x90, 0xA4, 0x69, 0xCE }),
-        new RegistryCdKeyOption("BUX7-PAC3-GYN4-TAJ7-4552", new byte[] { 0x1A, 0x3E, 0xB3, 0xE9, 0xE9, 0xCF, 0x09, 0xB2, 0x88, 0xA4, 0x9E, 0xD6, 0x9E, 0x88, 0xDC, 0xC3 }),
-        new RegistryCdKeyOption("DUT5-GUC7-LUG9-BUJ2-5558", new byte[] { 0x7F, 0xFF, 0x6A, 0x22, 0xBE, 0xC6, 0x88, 0x73, 0x28, 0xFF, 0x4B, 0x17, 0x1B, 0x8F, 0xAD, 0xB7 }),
-        new RegistryCdKeyOption("SEP5-NEN8-WYZ4-BYF6-3245", new byte[] { 0xC6, 0xA9, 0x66, 0x41, 0x5C, 0x74, 0xAF, 0xDF, 0x11, 0x44, 0xAA, 0x34, 0x01, 0x61, 0x58, 0x60 }),
-        new RegistryCdKeyOption("BUB8-ZAW2-GAW4-DUJ8-3823", new byte[] { 0xE5, 0x4F, 0x02, 0x40, 0xFF, 0xC6, 0x0F, 0x72, 0x91, 0x75, 0x76, 0xDD, 0x69, 0xEB, 0x39, 0xA3 }),
-        new RegistryCdKeyOption("FYX9-LUZ3-DAX8-SEF2-8737", new byte[] { 0xC8, 0x79, 0x83, 0xCF, 0x6B, 0x52, 0xC6, 0x5C, 0x78, 0x55, 0x2B, 0xC8, 0xED, 0xA6, 0x50, 0xAB }),
-        new RegistryCdKeyOption("FUN5-BAF2-PAJ7-GUP2-9638", new byte[] { 0x79, 0x55, 0x86, 0x0A, 0xCE, 0xFD, 0x6C, 0x99, 0xC0, 0xFF, 0x46, 0x8C, 0x6A, 0x99, 0xF7, 0xE4 }),
-        new RegistryCdKeyOption("CED8-FES8-RUT4-XUX9-5732", new byte[] { 0x57, 0xAA, 0x9E, 0xB7, 0x1E, 0xEF, 0x6B, 0x8D, 0x28, 0xC0, 0x77, 0x54, 0x70, 0x31, 0x96, 0x5E }),
-        new RegistryCdKeyOption("JUN2-LYL7-GUX9-CYJ3-2879", new byte[] { 0xF0, 0xE0, 0x74, 0x49, 0x70, 0x65, 0x17, 0xBA, 0x2E, 0xE1, 0xC9, 0xD9, 0x02, 0xF9, 0x21, 0xE9 }),
-        new RegistryCdKeyOption("SEC2-LAR3-NAC7-LAF7-5799", new byte[] { 0xD7, 0xDE, 0x4A, 0x7F, 0xE3, 0xE2, 0x47, 0x2A, 0x59, 0x0D, 0xCF, 0xAD, 0xC6, 0x1F, 0x65, 0x0D }),
-        new RegistryCdKeyOption("TAB7-CAS9-ZYX2-TUS8-9554", new byte[] { 0x1F, 0x01, 0x8B, 0x8E, 0xBF, 0x50, 0x8C, 0x16, 0x1B, 0x94, 0x54, 0x96, 0x97, 0x98, 0x94, 0xFD }),
-        new RegistryCdKeyOption("NUN2-RUM2-DEZ2-RUZ5-7729", new byte[] { 0xB1, 0x8A, 0xCB, 0xE3, 0x6C, 0xEA, 0xC6, 0x35, 0x6C, 0x7F, 0x6A, 0x2E, 0x2B, 0x12, 0xA2, 0x05 }),
-        new RegistryCdKeyOption("WYS6-LEF2-BUS3-JAX3-6647", new byte[] { 0x9F, 0xC2, 0x94, 0x9D, 0xE8, 0x74, 0xC0, 0x36, 0xD4, 0xFE, 0xF8, 0xDF, 0xCD, 0x4B, 0x5B, 0xC2 }),
-        new RegistryCdKeyOption("NUR2-TYJ6-NAN8-DAW5-6586", new byte[] { 0x87, 0xEC, 0x78, 0x9A, 0x88, 0xD9, 0x3E, 0x7A, 0x26, 0xDB, 0xC6, 0x33, 0x9D, 0x67, 0x69, 0x08 }),
-        new RegistryCdKeyOption("ZYJ9-CAS9-NAR6-BAT5-6443", new byte[] { 0xEE, 0xC4, 0xAB, 0xB9, 0x63, 0x1F, 0x10, 0xE3, 0x3F, 0xE4, 0xA0, 0xA3, 0x88, 0xFF, 0x95, 0x6C }),
     };
 
     private static readonly byte[] EmbeddedKver = new byte[]
@@ -817,36 +788,40 @@ internal static class HWClientSetup
 
     private static RegistryCdKeyOption GetDefaultRegistryCdKey()
     {
-        return RegistryCdKeyPool[0];
+        GeneratedCdKey generated = RetailCdKeyGenerator.FromDisplay(RetailProductName, DefaultDisplayCdKey);
+        RegistryCdKeyOption option = new RegistryCdKeyOption(generated);
+        if (!ByteArraysEqual(option.EncryptedCdKey, DefaultEncryptedCdKey))
+        {
+            throw new InvalidOperationException("Embedded retail Homeworld CD-key generator failed its known-good self-check.");
+        }
+        return option;
     }
 
     private static RegistryCdKeyOption PickRandomRegistryCdKey(string excludeDisplayCdKey)
     {
-        if (RegistryCdKeyPool.Length == 0)
+        return new RegistryCdKeyOption(
+            RetailCdKeyGenerator.GenerateRandom(RetailProductName, excludeDisplayCdKey));
+    }
+
+    private static bool ByteArraysEqual(byte[] left, byte[] right)
+    {
+        if (ReferenceEquals(left, right))
         {
-            throw new InvalidOperationException("No bundled Homeworld CD keys are available.");
+            return true;
+        }
+        if (left == null || right == null || left.Length != right.Length)
+        {
+            return false;
         }
 
-        if (RegistryCdKeyPool.Length == 1)
+        for (int i = 0; i < left.Length; i += 1)
         {
-            return RegistryCdKeyPool[0];
-        }
-
-        byte[] randomBytes = new byte[4];
-        using (RandomNumberGenerator random = RandomNumberGenerator.Create())
-        {
-            for (;;)
+            if (left[i] != right[i])
             {
-                random.GetBytes(randomBytes);
-                uint randomValue = BitConverter.ToUInt32(randomBytes, 0);
-                int index = (int)(randomValue % (uint)RegistryCdKeyPool.Length);
-                RegistryCdKeyOption candidate = RegistryCdKeyPool[index];
-                if (!string.Equals(candidate.DisplayCdKey, excludeDisplayCdKey, StringComparison.OrdinalIgnoreCase))
-                {
-                    return candidate;
-                }
+                return false;
             }
         }
+        return true;
     }
 
     private static string BuildInstallSuccessMessage(InstallResult result)
@@ -1171,10 +1146,20 @@ internal static class HWClientSetup
 
     private sealed class RegistryCdKeyOption
     {
+        public RegistryCdKeyOption(GeneratedCdKey generatedCdKey)
+            : this(generatedCdKey.DisplayCdKey, generatedCdKey.PlainCdKey, generatedCdKey.EncryptedCdKey)
+        {
+        }
+
         public RegistryCdKeyOption(string displayCdKey, byte[] encryptedCdKey)
+            : this(displayCdKey, displayCdKey.Replace("-", string.Empty), encryptedCdKey)
+        {
+        }
+
+        private RegistryCdKeyOption(string displayCdKey, string plainCdKey, byte[] encryptedCdKey)
         {
             DisplayCdKey = displayCdKey;
-            PlainCdKey = displayCdKey.Replace("-", string.Empty);
+            PlainCdKey = plainCdKey;
             EncryptedCdKey = encryptedCdKey;
         }
 

@@ -30,10 +30,12 @@ if errorlevel 1 exit /b %errorlevel%
   /nologo ^
   /target:winexe ^
   /out:"%SCRIPT_DIR%%INSTALLER_OUTPUT_NAME%" ^
+  /win32icon:"%SCRIPT_DIR%HW.ico" ^
   /win32manifest:"%SCRIPT_DIR%hwclient_setup.manifest" ^
   /reference:System.Windows.Forms.dll ^
   /reference:System.Drawing.dll ^
   "%ASSEMBLY_INFO%" ^
+  "%SCRIPT_DIR%retail_cdkey.cs" ^
   "%SCRIPT_DIR%hwclient_setup.cs"
 
 set "BUILD_EXIT=%ERRORLEVEL%"

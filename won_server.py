@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import won_crypto
+
 LOGGER = logging.getLogger("won_oss_server")
 
 SESSION_TTL_SECONDS = 24 * 60 * 60
@@ -122,7 +124,9 @@ class StateStore:
             CREATE TABLE IF NOT EXISTS users (
               username TEXT PRIMARY KEY,
               password_hash TEXT NOT NULL,
-              created_at REAL NOT NULL
+              created_at REAL NOT NULL,
+              native_cd_key TEXT,
+              native_login_key TEXT
             );
             CREATE TABLE IF NOT EXISTS players (
               player_id TEXT PRIMARY KEY,
@@ -191,6 +195,14 @@ class StateStore:
             str(row["name"])
             for row in cur.execute("PRAGMA table_info(sessions)")
         }
+        user_columns = {
+            str(row["name"])
+            for row in cur.execute("PRAGMA table_info(users)")
+        }
+        if "native_cd_key" not in user_columns:
+            cur.execute("ALTER TABLE users ADD COLUMN native_cd_key TEXT")
+        if "native_login_key" not in user_columns:
+            cur.execute("ALTER TABLE users ADD COLUMN native_login_key TEXT")
         if "created_at" not in session_columns:
             cur.execute("ALTER TABLE sessions ADD COLUMN created_at REAL")
         cur.execute(
@@ -372,10 +384,36 @@ class WONLikeState:
                 del events[:-MAX_EVENTS_PER_PLAYER]
         self._persist_events()
 
-    def create_user(self, username: str, password: str) -> None:
-        h = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    @staticmethod
+    def _hash_password(password: str) -> str:
+        return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _normalize_native_key(value: str) -> str:
+        return "".join(ch for ch in value.upper() if ch.isalnum())
+
+    def create_user(
+        self,
+        username: str,
+        password: str,
+        native_cd_key: str = "",
+        native_login_key: str = "",
+    ) -> None:
+        h = self._hash_password(password)
         cur = self.store.conn.cursor()
-        cur.execute("INSERT OR REPLACE INTO users(username,password_hash,created_at) VALUES(?,?,?)", (username, h, time.time()))
+        cur.execute(
+            """
+            INSERT INTO users(username,password_hash,created_at,native_cd_key,native_login_key)
+            VALUES(?,?,?,?,?)
+            """,
+            (
+                username,
+                h,
+                time.time(),
+                self._normalize_native_key(native_cd_key),
+                native_login_key.strip(),
+            ),
+        )
         self.store.conn.commit()
 
     @staticmethod
@@ -448,12 +486,107 @@ class WONLikeState:
         if row is None:
             self.create_user(username, password)
             row = cur.execute("SELECT password_hash FROM users WHERE username=?", (username,)).fetchone()
-        if hashlib.sha256(password.encode("utf-8")).hexdigest() != row["password_hash"]:
+        if self._hash_password(password) != row["password_hash"]:
             raise ValueError("invalid_credentials")
         token = f"tok_{secrets.token_hex(16)}"
         self.sessions[token] = SessionRecord(username=username, created_at=time.time())
         self._persist_sessions()
         return token
+
+    def login_native(
+        self,
+        username: str,
+        password: str,
+        *,
+        cd_key: str = "",
+        login_key: str = "",
+        client_ip: Optional[str] = None,
+        create_account: bool = False,
+        new_password: str = "",
+    ) -> Dict[str, Any]:
+        self.cleanup_expired_sessions()
+        username = username.strip()
+        if not username:
+            raise ValueError("missing_username")
+        if not self._allow_login_attempt(username, client_ip):
+            raise ValueError("rate_limited")
+
+        normalized_cd_key = self._normalize_native_key(cd_key)
+        normalized_login_key = login_key.strip()
+        requested_password = new_password if (create_account and new_password) else password
+        if not normalized_cd_key:
+            raise ValueError("missing_cd_key")
+        if not won_crypto.validate_cd_key(won_crypto.CDKEY_PRODUCT_HOMEWORLD, normalized_cd_key):
+            raise ValueError("invalid_cd_key")
+
+        cur = self.store.conn.cursor()
+        row = cur.execute(
+            """
+            SELECT password_hash, COALESCE(native_cd_key, '') AS native_cd_key,
+                   COALESCE(native_login_key, '') AS native_login_key
+            FROM users
+            WHERE username=?
+            """,
+            (username,),
+        ).fetchone()
+
+        if row is None:
+            if not create_account:
+                raise ValueError("create_account_required")
+            self.create_user(
+                username,
+                requested_password,
+                native_cd_key=normalized_cd_key,
+                native_login_key=normalized_login_key,
+            )
+            return {
+                "username": username,
+                "created": True,
+                "cd_key_bound": bool(normalized_cd_key),
+            }
+
+        if create_account:
+            raise ValueError("username_taken")
+
+        if self._hash_password(password) != row["password_hash"]:
+            raise ValueError("invalid_credentials")
+
+        existing_cd_key = self._normalize_native_key(str(row["native_cd_key"]))
+        binding_changed = False
+
+        if existing_cd_key:
+            if normalized_cd_key and normalized_cd_key != existing_cd_key:
+                raise ValueError("cd_key_mismatch")
+        elif normalized_cd_key:
+            cur.execute(
+                "UPDATE users SET native_cd_key=? WHERE username=?",
+                (normalized_cd_key, username),
+            )
+            binding_changed = True
+
+        if normalized_login_key and normalized_login_key != str(row["native_login_key"]):
+            cur.execute(
+                "UPDATE users SET native_login_key=? WHERE username=?",
+                (normalized_login_key, username),
+            )
+            binding_changed = True
+
+        if new_password and new_password != password:
+            cur.execute(
+                "UPDATE users SET password_hash=? WHERE username=?",
+                (self._hash_password(new_password), username),
+            )
+            binding_changed = True
+
+        if binding_changed:
+            self.store.conn.commit()
+
+        return {
+            "username": username,
+            "created": False,
+            "cd_key_bound": bool(existing_cd_key or normalized_cd_key),
+            "binding_changed": binding_changed,
+        }
 
     def require_token(self, token: str) -> str:
         if not self.is_session_valid(token):
@@ -759,6 +892,19 @@ class WONLikeProtocolServer:
                     req["username"],
                     req.get("password", ""),
                     req.get("client_ip"),
+                ),
+            }
+        if action == "AUTH_LOGIN_NATIVE":
+            return {
+                "ok": True,
+                "result": self.state.login_native(
+                    req["username"],
+                    req.get("password", ""),
+                    cd_key=req.get("cd_key", ""),
+                    login_key=req.get("login_key", ""),
+                    client_ip=req.get("client_ip"),
+                    create_account=bool(req.get("create_account", False)),
+                    new_password=req.get("new_password", ""),
                 ),
             }
         if action == "AUTH_VALIDATE":
