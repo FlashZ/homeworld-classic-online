@@ -5,19 +5,44 @@ on:
     branches:
       - main
     paths:
-      - "installer/hwclient_setup.cs"
-      - "installer/hwclient_setup.manifest"
-      - "installer/build_installer.bat"
-      - "installer/write_assembly_info.ps1"
+      - "installer/**"
       - "keys/kver.kp"
+      - ".github/workflows/hwonlineinstaller-release.yml"
+      - ".github/scripts/**"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-server.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-server.txt pytest
+
+      - name: Run pytest
+        run: python -m pytest -q
+
   build-and-release-installer:
+    needs: test
     runs-on: windows-latest
+    env:
+      HAS_CODESIGN_CERT: ${{ secrets.WINDOWS_CODESIGN_CERT_PFX_BASE64 != '' }}
+      HAS_VT_KEY: ${{ secrets.VIRUSTOTAL_API_KEY != '' }}
 
     steps:
       - name: Check out repository
@@ -31,8 +56,9 @@ jobs:
         run: |
           $date = Get-Date -Format "yyyy.M.d"
           $sha = $env:GITHUB_SHA.Substring(0, 7)
-          $tag = "installer-v$date"
-          $version = "$date.0"
+          $run = $env:GITHUB_RUN_NUMBER
+          $tag = "installer-v$date.$run"
+          $version = "$date.$run"
           $outputName = "HWOnlineSetup-$tag.exe"
 
           "tag=$tag"               >> $env:GITHUB_OUTPUT
@@ -50,15 +76,115 @@ jobs:
         shell: cmd
         run: installer\build_installer.bat
 
+      - name: Optionally sign installer
+        id: sign
+        if: env.HAS_CODESIGN_CERT == 'true'
+        env:
+          WINDOWS_CODESIGN_CERT_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERT_PFX_BASE64 }}
+          WINDOWS_CODESIGN_CERT_PFX_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERT_PFX_PASSWORD }}
+          WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ secrets.WINDOWS_CODESIGN_TIMESTAMP_URL }}
+          INSTALLER_PATH: installer\${{ steps.version.outputs.output_name }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP "hwonline-codesign.pfx"
+          [System.IO.File]::WriteAllBytes(
+            $pfxPath,
+            [System.Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERT_PFX_BASE64)
+          )
+
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match "\\x64\\" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $signtool) {
+            throw "signtool.exe was not found on the runner."
+          }
+
+          $timestampUrl = if ($env:WINDOWS_CODESIGN_TIMESTAMP_URL) {
+            $env:WINDOWS_CODESIGN_TIMESTAMP_URL
+          } else {
+            "http://timestamp.digicert.com"
+          }
+
+          & $signtool sign `
+            /fd SHA256 `
+            /td SHA256 `
+            /tr $timestampUrl `
+            /f $pfxPath `
+            /p $env:WINDOWS_CODESIGN_CERT_PFX_PASSWORD `
+            /v `
+            $env:INSTALLER_PATH
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool sign failed with exit code $LASTEXITCODE"
+          }
+
+          & $signtool verify /pa /v $env:INSTALLER_PATH
+          if ($LASTEXITCODE -ne 0) {
+            throw "signtool verify failed with exit code $LASTEXITCODE"
+          }
+
+          $signature = Get-AuthenticodeSignature $env:INSTALLER_PATH
+          "status=signed" >> $env:GITHUB_OUTPUT
+          "subject=$($signature.SignerCertificate.Subject)" >> $env:GITHUB_OUTPUT
+
+      - name: Generate checksum files
+        id: hashes
+        shell: pwsh
+        run: |
+          $installerPath = Join-Path "installer" "${{ steps.version.outputs.output_name }}"
+          $sha256 = (Get-FileHash $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $shaPath = "$installerPath.sha256"
+
+          "$sha256 *${{ steps.version.outputs.output_name }}" | Set-Content -Path $shaPath -NoNewline
+
+          "sha256=$sha256" >> $env:GITHUB_OUTPUT
+          "sha_path=$shaPath" >> $env:GITHUB_OUTPUT
+
+      - name: Submit installer to VirusTotal
+        id: vt
+        if: env.HAS_VT_KEY == 'true'
+        continue-on-error: true
+        env:
+          VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        shell: pwsh
+        run: |
+          .github\scripts\virustotal_scan.ps1 `
+            -FilePath "installer\${{ steps.version.outputs.output_name }}" `
+            -OutputJsonPath "installer\${{ steps.version.outputs.output_name }}.virustotal.json"
+
+      - name: Write VirusTotal placeholder
+        if: env.HAS_VT_KEY != 'true'
+        shell: pwsh
+        run: |
+          @{
+            status = "skipped"
+            summary = "VirusTotal scan skipped because VIRUSTOTAL_API_KEY is not configured."
+            file = "${{ steps.version.outputs.output_name }}"
+          } | ConvertTo-Json -Depth 5 | Set-Content "installer\${{ steps.version.outputs.output_name }}.virustotal.json"
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.version.outputs.output_name }}
-          path: installer/${{ steps.version.outputs.output_name }}
+          path: |
+            installer/${{ steps.version.outputs.output_name }}
+            installer/${{ steps.version.outputs.output_name }}.sha256
+            installer/${{ steps.version.outputs.output_name }}.virustotal.json
           if-no-files-found: error
 
       - name: Generate release notes from installer commits
         id: notes
+        env:
+          INSTALLER_SHA256: ${{ steps.hashes.outputs.sha256 }}
+          SIGNING_STATUS: ${{ steps.sign.outputs.status }}
+          SIGNING_SUBJECT: ${{ steps.sign.outputs.subject }}
+          VT_STATUS: ${{ steps.vt.outputs.status }}
+          VT_SUMMARY: ${{ steps.vt.outputs.summary }}
+          VT_PERMALINK: ${{ steps.vt.outputs.permalink }}
+          VT_FLAGGED_ENGINES: ${{ steps.vt.outputs.flagged_engines }}
         shell: pwsh
         run: |
           $lastRelease = git tag --list "installer-v*" --sort=-creatordate | Select-Object -First 1
@@ -69,10 +195,47 @@ jobs:
           }
           if (-not $log) { $log = "- Installer update" }
           $log = $log -join "`n"
+
+          $securityNotes = @()
+          $securityNotes += "- SHA-256: ``$($env:INSTALLER_SHA256)``"
+
+          if ($env:SIGNING_STATUS -eq "signed") {
+            $securityNotes += "- Code signing: signed in CI (``$($env:SIGNING_SUBJECT)``)"
+          } else {
+            $securityNotes += "- Code signing: not configured in CI"
+          }
+
+          if ($env:VT_STATUS) {
+            $vtLine = "- VirusTotal: $env:VT_SUMMARY"
+            if ($env:VT_PERMALINK) {
+              $vtLine += " ($env:VT_PERMALINK)"
+            }
+            $securityNotes += $vtLine
+            if ($env:VT_FLAGGED_ENGINES) {
+              $securityNotes += "- Flagged engines: $env:VT_FLAGGED_ENGINES"
+            }
+          } else {
+            $securityNotes += "- VirusTotal: not configured in CI"
+          }
+
+          $securityBlock = $securityNotes -join "`n"
+
           # Write multiline output
           "notes<<ENDOFNOTES" >> $env:GITHUB_OUTPUT
           $log >> $env:GITHUB_OUTPUT
           "ENDOFNOTES" >> $env:GITHUB_OUTPUT
+          "security<<ENDOFSECURITY" >> $env:GITHUB_OUTPUT
+          $securityBlock >> $env:GITHUB_OUTPUT
+          "ENDOFSECURITY" >> $env:GITHUB_OUTPUT
+
+      - name: Write workflow summary
+        shell: pwsh
+        run: |
+          @"
+          ## HWOnline installer release summary
+
+          ${{ steps.notes.outputs.security }}
+          "@ >> $env:GITHUB_STEP_SUMMARY
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -84,7 +247,14 @@ jobs:
 
             ${{ steps.notes.outputs.notes }}
 
+            ## Integrity
+
+            ${{ steps.notes.outputs.security }}
+
             Download `${{ steps.version.outputs.output_name }}` below, run as Administrator, and follow the prompts.
-          files: installer/${{ steps.version.outputs.output_name }}
+          files: |
+            installer/${{ steps.version.outputs.output_name }}
+            installer/${{ steps.version.outputs.output_name }}.sha256
           fail_on_unmatched_files: true
+          overwrite_files: true
           make_latest: true
