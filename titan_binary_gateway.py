@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, urlsplit
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Deque, Dict, Optional, Tuple
+import hashlib
 import json
 import binascii
 
@@ -89,6 +90,11 @@ class DashboardLogHandler(logging.Handler):
         if limit <= 0:
             return []
         return list(self.records)[-limit:]
+
+    def clear(self) -> int:
+        count = len(self.records)
+        self.records.clear()
+        return count
 
 
 DASHBOARD_LOG_HANDLER = DashboardLogHandler()
@@ -1813,6 +1819,45 @@ class SilencerRoutingServer:
         if not self._native_clients and not self._pending_reconnects:
             self._reset_room_state(f"empty_after_{disconnect_reason}")
 
+    async def admin_kick_client(self, client_id: int) -> bool:
+        """Admin action: forcibly disconnect a client by id."""
+        client = self._native_clients.get(client_id)
+        if client is None:
+            return False
+        LOGGER.info(
+            "Routing(admin): kicking client_id=%d name=%r ip=%s",
+            client.client_id, client.client_name, client.client_ip,
+        )
+        try:
+            client.writer.close()
+            await client.writer.wait_closed()
+        except Exception:
+            pass
+        return True
+
+    async def admin_broadcast_chat(self, text: str) -> int:
+        """Admin action: send a chat message from [ADMIN] to all clients."""
+        data = text.encode("utf-8", errors="replace")
+        peer_chat = _build_mini_routing_peer_chat(
+            client_id=0,
+            chat_type=CHAT_GROUP_ID,
+            data=data,
+            addressees=[],
+            include_exclude_flag=False,
+        )
+        delivered = 0
+        for client in list(self._native_clients.values()):
+            try:
+                await self._send_native_route_client_reply(client, peer_chat)
+                delivered += 1
+            except Exception as exc:
+                LOGGER.warning(
+                    "Routing(admin): failed broadcast to client_id=%d: %s",
+                    client.client_id, exc,
+                )
+        LOGGER.info("Routing(admin): broadcast delivered to %d clients", delivered)
+        return delivered
+
     async def _expire_pending_reconnects(self) -> None:
         now = time.time()
         expired_ids = [
@@ -3359,6 +3404,26 @@ class RoutingServerManager:
             "rooms": room_snapshots,
         }
 
+    def get_server(self, port: int) -> Optional[SilencerRoutingServer]:
+        return self._servers.get(port)
+
+    async def admin_kick_player(self, port: int, client_id: int) -> bool:
+        server = self._servers.get(port)
+        if server is None:
+            return False
+        return await server.admin_kick_client(client_id)
+
+    async def admin_broadcast(self, message: str, room_port: Optional[int] = None) -> int:
+        total = 0
+        if room_port is not None:
+            server = self._servers.get(room_port)
+            if server is not None:
+                total += await server.admin_broadcast_chat(message)
+        else:
+            for server in self._servers.values():
+                total += await server.admin_broadcast_chat(message)
+        return total
+
     async def close_all(self) -> None:
         listeners = list(self._listeners.values())
         for server in list(self._servers.values()):
@@ -3529,563 +3594,560 @@ class AdminDashboardServer:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Homeworld WON OSS Dashboard</title>
+  <title>WON Admin</title>
   <style>
     :root {
-      --bg: #f2efe8;
-      --panel: #fffdf8;
-      --ink: #1f2a33;
-      --accent: #8b2e1d;
-      --muted: #6f7a80;
-      --line: #d8d0c2;
-      --good: #1f7a4c;
+      --bg-0:#09090b;--bg-1:#111113;--bg-2:#1a1a1e;--bg-3:#252529;
+      --border:#2e2e33;--border-active:#3e3e44;
+      --text-0:#fafafa;--text-1:#a1a1aa;--text-2:#71717a;
+      --accent:#3b82f6;--accent-hover:#2563eb;
+      --success:#22c55e;--warning:#eab308;--danger:#ef4444;--danger-hover:#dc2626;
     }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-      color: var(--ink);
-      background: linear-gradient(180deg, #e7e1d4 0%, var(--bg) 100%);
-    }
-    header {
-      padding: 20px 24px 12px;
-      border-bottom: 1px solid var(--line);
-      background: rgba(255,255,255,0.55);
-      backdrop-filter: blur(8px);
-      position: sticky;
-      top: 0;
-      z-index: 10;
-    }
-    h1 { margin: 0 0 6px; font-size: 28px; }
-    h2 { margin: 0 0 12px; font-size: 18px; }
-    h3 { margin: 12px 0 8px; font-size: 15px; }
-    .sub { color: var(--muted); font-size: 14px; }
-    .section-note {
-      margin-bottom: 10px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    main {
-      display: block;
-      padding: 20px 24px 28px;
-    }
-    .tabbar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 16px;
-    }
-    .tab-btn {
-      border: 1px solid var(--line);
-      background: #efe8db;
-      color: var(--ink);
-      border-radius: 999px;
-      padding: 10px 14px;
-      font-size: 13px;
-      cursor: pointer;
-    }
-    .tab-btn.active {
-      background: #fffdf8;
-      box-shadow: 0 6px 18px rgba(31, 42, 51, 0.08);
-    }
-    .tab-page { display: none; }
-    .tab-page.active { display: block; }
-    .panel-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 16px;
-      align-items: start;
-    }
-    section {
-      min-width: 0;
-      overflow: hidden;
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 16px;
-      box-shadow: 0 10px 30px rgba(31, 42, 51, 0.06);
-    }
-    .wide { grid-column: span 2; }
-    .full { grid-column: 1 / -1; }
-    .kv {
-      display: grid;
-      grid-template-columns: 150px minmax(0, 1fr);
-      gap: 6px 10px;
-      font-size: 14px;
-    }
-    .k { color: var(--muted); }
-    .pill {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 999px;
-      background: #f4e3de;
-      color: var(--accent);
-      font-size: 12px;
-      margin-right: 6px;
-      margin-bottom: 6px;
-    }
-    .chip {
-      display: inline-block;
-      padding: 4px 10px;
-      border-radius: 999px;
-      background: #efe8db;
-      color: var(--ink);
-      font-size: 12px;
-      margin: 0 6px 6px 0;
-      max-width: 100%;
-      overflow-wrap: anywhere;
-    }
-    details {
-      border-top: 1px solid var(--line);
-      padding-top: 10px;
-      margin-top: 10px;
-      min-width: 0;
-    }
-    summary {
-      cursor: pointer;
-      font-weight: 600;
-      overflow-wrap: anywhere;
-    }
-    .table-wrap {
-      width: 100%;
-      overflow: auto;
-    }
-    pre {
-      margin: 10px 0 0;
-      padding: 12px;
-      background: #1b1f23;
-      color: #d8e0e8;
-      border-radius: 10px;
-      overflow: auto;
-      font-size: 12px;
-      line-height: 1.45;
-      max-height: 68vh;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
-      table-layout: fixed;
-    }
-    th, td {
-      text-align: left;
-      padding: 6px 8px;
-      border-bottom: 1px solid var(--line);
-      vertical-align: top;
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
-    .mono { font-family: Consolas, "Courier New", monospace; }
-    .muted { color: var(--muted); }
-    .hw-strong { font-weight: 700; }
-    @media (max-width: 960px) {
-      .wide { grid-column: span 1; }
-    }
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:Inter,-apple-system,system-ui,sans-serif;background:var(--bg-1);color:var(--text-0);display:flex;height:100vh;overflow:hidden;}
+    .sidebar{width:220px;background:var(--bg-0);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;}
+    .brand{padding:20px 16px 16px;font-size:15px;font-weight:700;letter-spacing:-.3px;color:var(--text-0);border-bottom:1px solid var(--border);}
+    .brand span{color:var(--accent);font-weight:800;}
+    .sidebar nav{flex:1;padding:8px;overflow-y:auto;}
+    .nav-item{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:13px;color:var(--text-1);transition:all .15s;border:none;background:none;width:100%;text-align:left;}
+    .nav-item:hover{background:var(--bg-2);color:var(--text-0);}
+    .nav-item.active{background:var(--bg-3);color:var(--text-0);font-weight:600;}
+    .nav-item svg{width:16px;height:16px;flex-shrink:0;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
+    .nav-badge{margin-left:auto;background:var(--bg-3);color:var(--text-1);font-size:11px;padding:1px 6px;border-radius:99px;min-width:18px;text-align:center;}
+    .nav-item.active .nav-badge{background:var(--accent);color:#fff;}
+    .sidebar-footer{padding:12px 16px;border-top:1px solid var(--border);font-size:11px;color:var(--text-2);}
+    .sidebar-footer .status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;}
+    .sidebar-footer .status-dot.ok{background:var(--success);}
+    .sidebar-footer .status-dot.err{background:var(--danger);}
+    .main-wrap{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+    .topbar{padding:14px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;background:var(--bg-1);flex-shrink:0;}
+    .topbar h1{font-size:16px;font-weight:600;}
+    .topbar .meta{font-size:12px;color:var(--text-2);}
+    #content{flex:1;overflow-y:auto;padding:20px 24px 32px;}
+    .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;}
+    .stat-card{background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:16px;}
+    .stat-card .label{font-size:12px;color:var(--text-2);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;}
+    .stat-card .value{font-size:28px;font-weight:700;line-height:1.2;}
+    .stat-card .value.accent{color:var(--accent);}
+    .stat-card .value.success{color:var(--success);}
+    .stat-card .value.warning{color:var(--warning);}
+    .card{background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px;}
+    .card h2{font-size:14px;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:8px;}
+    .card h3{font-size:13px;font-weight:600;margin:12px 0 8px;color:var(--text-1);}
+    .card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;}
+    .kv{display:grid;grid-template-columns:140px minmax(0,1fr);gap:4px 12px;font-size:13px;}
+    .kv .k{color:var(--text-2);}
+    .kv .v{color:var(--text-0);word-break:break-all;}
+    .badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;}
+    .badge-join{background:rgba(34,197,94,.15);color:var(--success);}
+    .badge-leave{background:rgba(239,68,68,.15);color:var(--danger);}
+    .badge-chat{background:rgba(59,130,246,.15);color:var(--accent);}
+    .badge-default{background:var(--bg-3);color:var(--text-1);}
+    .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;background:var(--bg-3);color:var(--text-1);margin-left:6px;}
+    .table-wrap{width:100%;overflow-x:auto;}
+    table{width:100%;border-collapse:collapse;font-size:13px;}
+    th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text-2);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.3px;}
+    td{padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top;word-break:break-word;color:var(--text-0);}
+    tr:hover td{background:var(--bg-3);}
+    .mono{font-family:Consolas,"Courier New",monospace;font-size:12px;}
+    .muted{color:var(--text-2);}
+    pre{margin:8px 0 0;padding:14px;background:var(--bg-0);border:1px solid var(--border);border-radius:6px;overflow:auto;font-size:12px;line-height:1.5;max-height:65vh;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-1);font-family:Consolas,"Courier New",monospace;}
+    .log-error{color:var(--danger);}
+    .log-warn{color:var(--warning);}
+    .log-info{color:var(--text-1);}
+    .btn{display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--border);background:var(--bg-3);color:var(--text-0);transition:all .15s;}
+    .btn:hover{background:var(--border-active);border-color:var(--border-active);}
+    .btn-danger{border-color:var(--danger);color:var(--danger);background:transparent;}
+    .btn-danger:hover{background:var(--danger);color:#fff;}
+    .btn-accent{border-color:var(--accent);color:#fff;background:var(--accent);}
+    .btn-accent:hover{background:var(--accent-hover);}
+    .btn-sm{padding:3px 8px;font-size:11px;}
+    .action-bar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap;}
+    .action-bar input[type=text]{flex:1;min-width:200px;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-0);color:var(--text-0);font-size:13px;outline:none;}
+    .action-bar input[type=text]:focus{border-color:var(--accent);}
+    .action-bar select{padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-0);color:var(--text-0);font-size:13px;outline:none;}
+    details{margin-top:8px;}
+    details summary{cursor:pointer;font-weight:600;font-size:13px;color:var(--text-1);padding:6px 0;}
+    details summary:hover{color:var(--text-0);}
+    details[open] summary{margin-bottom:8px;}
+    .hw-strong{font-weight:700;color:var(--accent);}
+    .db-tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px;}
+    .db-tab{padding:4px 10px;border-radius:6px;font-size:12px;cursor:pointer;background:var(--bg-0);color:var(--text-2);border:1px solid transparent;}
+    .db-tab:hover{color:var(--text-0);}
+    .db-tab.active{background:var(--bg-3);color:var(--text-0);border-color:var(--border);}
+    #modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center;}
+    #modal-overlay.show{display:flex;}
+    .modal-box{background:var(--bg-2);border:1px solid var(--border);border-radius:10px;padding:20px;width:420px;max-width:90vw;}
+    .modal-box h3{font-size:15px;margin-bottom:12px;}
+    .modal-box p{font-size:13px;color:var(--text-1);margin-bottom:16px;line-height:1.5;}
+    .modal-box .modal-actions{display:flex;gap:8px;justify-content:flex-end;}
+    .modal-box input[type=text],.modal-box input[type=password]{width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-0);color:var(--text-0);font-size:13px;margin-bottom:12px;outline:none;}
+    .modal-box input:focus{border-color:var(--accent);}
+    #toast-container{position:fixed;bottom:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:8px;}
+    .toast{padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;animation:toastin .25s ease;min-width:200px;}
+    .toast-success{background:#14532d;color:var(--success);border:1px solid #166534;}
+    .toast-error{background:#450a0a;color:var(--danger);border:1px solid #7f1d1d;}
+    @keyframes toastin{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0);}}
+    @media(max-width:760px){.sidebar{display:none;}.card-grid{grid-template-columns:1fr;}}
   </style>
 </head>
 <body>
-  <header>
-    <h1>Homeworld WON OSS Dashboard</h1>
-    <div class="sub">Gateway view. Auto-refreshes every 3 seconds.</div>
-    <div class="sub" id="status">Loading...</div>
-  </header>
-  <main id="app"></main>
+  <aside class="sidebar">
+    <div class="brand"><span>WON</span> Admin</div>
+    <nav id="nav"></nav>
+    <div class="sidebar-footer" id="sidebar-footer">Loading...</div>
+  </aside>
+  <div class="main-wrap">
+    <header class="topbar">
+      <h1 id="page-title">Overview</h1>
+      <div class="meta" id="topbar-meta">Loading...</div>
+    </header>
+    <main id="content"></main>
+  </div>
+  <div id="modal-overlay"><div class="modal-box" id="modal-box"></div></div>
+  <div id="toast-container"></div>
   <script>
-    const app = document.getElementById("app");
-    const status = document.getElementById("status");
+    const content = document.getElementById("content");
+    const nav = document.getElementById("nav");
+    const pageTitle = document.getElementById("page-title");
+    const topbarMeta = document.getElementById("topbar-meta");
+    const sidebarFooter = document.getElementById("sidebar-footer");
+    const modalOverlay = document.getElementById("modal-overlay");
+    const modalBox = document.getElementById("modal-box");
+    const toastContainer = document.getElementById("toast-container");
     const adminToken = __ADMIN_TOKEN__;
-    let activeTab = "dashboard";
+    let activePage = "overview";
+    let pauseRefresh = false;
+    let lastSnapshot = null;
+    let activeDbTable = "";
 
-    function esc(value) {
-      return String(value ?? "").replace(/[&<>"]/g, (ch) => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;"
-      }[ch]));
+    const pages = [
+      {id:"overview",label:"Overview",icon:'<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>'},
+      {id:"players",label:"Players",icon:'<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>'},
+      {id:"rooms",label:"Rooms",icon:'<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>'},
+      {id:"activity",label:"Activity",icon:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'},
+      {id:"ips",label:"IP Metrics",icon:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'},
+      {id:"database",label:"Database",icon:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>'},
+      {id:"sessions",label:"Sessions",icon:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>'},
+      {id:"logs",label:"Logs",icon:'<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>'},
+    ];
+
+    function esc(v){return String(v??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+    function pretty(v){return JSON.stringify(v,null,2);}
+    function age(s){const n=Math.max(0,Math.floor(Number(s||0)));if(n<60)return n+"s";if(n<3600)return Math.floor(n/60)+"m "+n%60+"s";return Math.floor(n/3600)+"h "+Math.floor((n%3600)/60)+"m";}
+    function stamp(ts){return ts?new Date(ts*1000).toLocaleTimeString():"";}
+    function hwPlain(v){return String(v??"").replace(/&(.)/g,"$1");}
+    function hwMarkup(v){const s=String(v??"");let o="";for(let i=0;i<s.length;i++){if(s[i]==="&"&&i+1<s.length){i++;o+=`<strong class="hw-strong">${esc(s[i])}</strong>`;}else{o+=esc(s[i]);}}return o;}
+    function nameList(vs){return(vs||[]).map(v=>hwMarkup(v)).join(", ");}
+    function kindBadge(k){const m={join:"badge-join",leave:"badge-leave",chat:"badge-chat"};return `<span class="badge ${m[k]||"badge-default"}">${esc(k)}</span>`;}
+
+    function renderNav(snapshot){
+      const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const act=gw.activity||[];const logs=snapshot.logs||[];
+      const counts={players:rt.current_player_count||0,rooms:rt.room_count||0,activity:act.length,logs:logs.length};
+      nav.innerHTML=pages.map(p=>{
+        const badge=counts[p.id]!=null?`<span class="nav-badge">${counts[p.id]}</span>`:"";
+        return `<button class="nav-item${activePage===p.id?" active":""}" data-page="${p.id}"><svg viewBox="0 0 24 24">${p.icon}</svg>${esc(p.label)}${badge}</button>`;
+      }).join("");
+      nav.querySelectorAll("[data-page]").forEach(btn=>{btn.addEventListener("click",()=>{activePage=btn.dataset.page;renderAll(lastSnapshot);});});
     }
 
-    function pretty(value) {
-      return JSON.stringify(value, null, 2);
+    function renderSidebarFooter(snapshot){
+      const up=snapshot.uptime_seconds||0;
+      const gw=snapshot.gateway||{};
+      sidebarFooter.innerHTML=`<span class="status-dot ok"></span> Online ${age(up)}<br>${esc(gw.version_str||"")} &middot; ${esc(gw.public_host||"")}`;
     }
 
-    function age(seconds) {
-      const n = Math.max(0, Number(seconds || 0));
-      if (n < 60) return `${n}s`;
-      if (n < 3600) return `${Math.floor(n / 60)}m ${n % 60}s`;
-      const hours = Math.floor(n / 3600);
-      const mins = Math.floor((n % 3600) / 60);
-      return `${hours}h ${mins}m`;
+    function renderTopbar(snapshot){
+      const p=pages.find(x=>x.id===activePage);
+      pageTitle.textContent=p?p.label:"Dashboard";
+      topbarMeta.textContent="Last refresh: "+new Date((snapshot.generated_at||0)*1000).toLocaleTimeString();
     }
 
-    function stamp(ts) {
-      if (!ts) return "";
-      return new Date(ts * 1000).toLocaleTimeString();
-    }
-
-    function hwPlain(value) {
-      return String(value ?? "").replace(/&(.)/g, "$1");
-    }
-
-    function hwMarkup(value) {
-      const input = String(value ?? "");
-      let out = "";
-      for (let i = 0; i < input.length; i += 1) {
-        if (input[i] === "&" && i + 1 < input.length) {
-          i += 1;
-          out += `<strong class="hw-strong">${esc(input[i])}</strong>`;
-        } else {
-          out += esc(input[i]);
-        }
-      }
-      return out;
-    }
-
-    function renderNameList(values) {
-      return (values || []).map((value) => hwMarkup(value)).join(", ");
-    }
-
-    function kv(obj) {
-      return Object.entries(obj).map(([k, v]) =>
-        `<div class="k">${esc(k)}</div><div>${esc(v)}</div>`
-      ).join("");
-    }
-
-    function bindTabs() {
-      app.querySelectorAll("[data-tab-btn]").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          activeTab = btn.getAttribute("data-tab-btn") || "dashboard";
-          applyTabs();
-        });
-      });
-      applyTabs();
-    }
-
-    function applyTabs() {
-      app.querySelectorAll("[data-tab-btn]").forEach((btn) => {
-        btn.classList.toggle("active", btn.getAttribute("data-tab-btn") === activeTab);
-      });
-      app.querySelectorAll("[data-tab-page]").forEach((page) => {
-        page.classList.toggle("active", page.getAttribute("data-tab-page") === activeTab);
-      });
-    }
-
-    function render(snapshot) {
-      const gateway = snapshot.gateway ?? {};
-      const routing = gateway.routing_manager ?? { rooms: [], players: [], servers: [] };
-      const db = snapshot.db ?? { tables: {} };
-      const logs = snapshot.logs ?? [];
-      const activity = gateway.activity ?? [];
-      const activityMetrics = gateway.activity_metrics ?? {};
-      const ipMetrics = gateway.ip_metrics ?? [];
-      const validVersions = gateway.valid_versions ?? [];
-      const players = routing.players ?? [];
-      const servers = routing.servers ?? [];
-      const dbTables = Object.entries(db.tables || {});
-      const dbNonEmpty = dbTables.filter(([, info]) => (info.count || 0) > 0);
-      const dbEmpty = dbTables.filter(([, info]) => (info.count || 0) === 0);
-
-      const overview = `
-        <section>
-          <h2>Overview</h2>
-          <div class="kv">
-            ${kv({
-              public_host: gateway.public_host,
-              gateway_port: gateway.public_port,
-              routing_port: gateway.routing_port,
-              backend: `${gateway.backend_host}:${gateway.backend_port}`,
-              version_str: gateway.version_str,
-              valid_versions: validVersions.length,
-              auth_keys_loaded: gateway.auth_keys_loaded,
-              peer_sessions: gateway.peer_session_count,
-              rooms_live: routing.room_count ?? 0,
-              players_live: routing.current_player_count ?? 0,
-              games_live: routing.current_game_count ?? 0,
-              ips_live: routing.current_unique_ip_count ?? 0,
-              ips_seen_total: activityMetrics.unique_ip_count ?? 0,
-              uptime_seconds: snapshot.uptime_seconds,
-              db_path: db.path,
-              db_exists: db.exists
-            })}
-          </div>
-          <div style="margin-top:12px;">
-            ${validVersions.map((entry) => `<span class="chip">${esc(entry)}</span>`).join("")}
-            <span class="chip">joins: ${esc(activityMetrics.join_count ?? 0)}</span>
-            <span class="chip">leaves: ${esc(activityMetrics.leave_count ?? 0)}</span>
-            <span class="chip">chat lines: ${esc(activityMetrics.chat_count ?? 0)}</span>
-            <span class="chip">rooms opened: ${esc(activityMetrics.room_open_count ?? 0)}</span>
-          </div>
-        </section>`;
-
-      const playersPanel = `
-        <section class="wide">
-          <h2>Players</h2>
-          <div class="section-note">Live routing players aggregated across all rooms. Detailed player records stay collapsed so the page stays readable.</div>
-          ${(players.length > 0) ? `
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Player</th>
-                    <th>IP</th>
-                    <th>Room</th>
-                    <th>Chat</th>
-                    <th>Connected</th>
-                    <th>Idle</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${players.map((player) => `
-                    <tr>
-                      <td>${hwMarkup(player.client_name)}</td>
-                      <td class="mono">${esc(player.client_ip)}</td>
-                      <td>${esc(player.room_name)} <span class="muted">:${esc(player.room_port)}</span></td>
-                      <td>${esc(player.chat_count)}</td>
-                      <td>${esc(age(player.connected_seconds))}</td>
-                      <td>${esc(age(player.idle_seconds))}</td>
-                    </tr>
-                  `).join("")}
-                </tbody>
-              </table>
+    function renderOverview(snapshot){
+      const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const am=gw.activity_metrics||{};const db=snapshot.db||{};
+      const banned=gw.banned_ips||[];
+      return `
+        <div class="stat-grid">
+          <div class="stat-card"><div class="label">Players Online</div><div class="value accent">${esc(rt.current_player_count||0)}</div></div>
+          <div class="stat-card"><div class="label">Active Rooms</div><div class="value">${esc(rt.room_count||0)}</div></div>
+          <div class="stat-card"><div class="label">Live Games</div><div class="value success">${esc(rt.current_game_count||0)}</div></div>
+          <div class="stat-card"><div class="label">Unique IPs</div><div class="value">${esc(rt.current_unique_ip_count||0)}</div></div>
+        </div>
+        <div class="card-grid">
+          <div class="card">
+            <h2>Server Info</h2>
+            <div class="kv">
+              <div class="k">Public Host</div><div class="v">${esc(gw.public_host)}</div>
+              <div class="k">Gateway Port</div><div class="v">${esc(gw.public_port)}</div>
+              <div class="k">Routing Port</div><div class="v">${esc(gw.routing_port)}</div>
+              <div class="k">Backend</div><div class="v">${esc(gw.backend_host)}:${esc(gw.backend_port)}</div>
+              <div class="k">Version</div><div class="v">${esc(gw.version_str)}</div>
+              <div class="k">Auth Keys</div><div class="v">${gw.auth_keys_loaded?'<span style="color:var(--success)">Loaded</span>':'<span style="color:var(--danger)">Not loaded</span>'}</div>
+              <div class="k">Peer Sessions</div><div class="v">${esc(gw.peer_session_count)}</div>
+              <div class="k">Uptime</div><div class="v">${age(snapshot.uptime_seconds)}</div>
+              <div class="k">Valid Versions</div><div class="v">${(gw.valid_versions||[]).map(v=>`<span class="pill" style="margin-left:0;margin-right:4px;">${esc(v)}</span>`).join("")}</div>
             </div>
-            ${players.map((player) => `
-              <details>
-                <summary>${hwMarkup(player.client_name)} <span class="muted">${esc(player.client_ip)} in ${esc(player.room_name)}:${esc(player.room_port)}</span></summary>
-                <div class="kv">
-                  ${kv({
-                    client_id: player.client_id,
-                    player_name: hwPlain(player.client_name),
-                    ip: player.client_ip,
-                    room: `${player.room_name}:${player.room_port}`,
-                    path: player.room_path,
-                    room_password_set: player.room_password_set,
-                    subscriptions: player.subscription_count,
-                    chat_count: player.chat_count,
-                    peer_data_messages: player.peer_data_messages,
-                    peer_data_bytes: player.peer_data_bytes,
-                    last_activity: player.last_activity_kind,
-                    connected_for: age(player.connected_seconds),
-                    idle_for: age(player.idle_seconds)
-                  })}
-                </div>
-              </details>
-            `).join("")}
-          ` : '<div class="muted">No live players connected.</div>'}
-        </section>`;
-
-      const activityPanel = `
-        <section class="full">
-          <h2>Chat</h2>
-          <div class="section-note">Join, leave, and chat feed separated from the raw gateway log. Homeworld '&' markup is rendered locally as bold characters.</div>
-          ${(activity.length > 0) ? `
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Event</th>
-                    <th>Player</th>
-                    <th>Room</th>
-                    <th>IP</th>
-                    <th>Detail</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${activity.map((entry) => `
-                    <tr>
-                      <td>${esc(stamp(entry.ts))}</td>
-                      <td>${esc(entry.kind)}</td>
-                      <td>${hwMarkup(entry.player_name || "")}</td>
-                      <td>${esc(entry.room_name || "")}${entry.room_port ? ` <span class="muted">:${esc(entry.room_port)}</span>` : ""}</td>
-                      <td class="mono">${esc(entry.player_ip || "")}</td>
-                      <td>${hwMarkup(entry.text || "")}</td>
-                    </tr>
-                  `).join("")}
-                </tbody>
-              </table>
+          </div>
+          <div class="card">
+            <h2>Activity Counters</h2>
+            <div class="kv">
+              <div class="k">Joins</div><div class="v">${esc(am.join_count||0)}</div>
+              <div class="k">Leaves</div><div class="v">${esc(am.leave_count||0)}</div>
+              <div class="k">Chat Messages</div><div class="v">${esc(am.chat_count||0)}</div>
+              <div class="k">Rooms Opened</div><div class="v">${esc(am.room_open_count||0)}</div>
+              <div class="k">IPs Seen (total)</div><div class="v">${esc(am.unique_ip_count||0)}</div>
             </div>
-          ` : '<div class="muted">No chat or presence activity recorded yet.</div>'}
-        </section>`;
-
-      const serverPanel = `
-        <section class="wide">
-          <h2>Servers & Rooms</h2>
-          <div class="section-note">Current room listeners, room settings, published game listings, and who is connected where.</div>
-          ${(servers || []).map((room) => `
-            <details>
-              <summary>${esc(room.room_name || "(unnamed)")} <span class="muted">:${esc(room.listen_port)}</span> <span class="pill">${esc(room.player_count)} players</span> <span class="pill">${esc(room.game_count)} games</span></summary>
-              <div class="kv">
-                ${kv({
-                  description: room.room_description,
-                  path: room.room_path,
-                  published: room.published,
-                  room_password_set: room.room_password_set,
-                  room_flags: "0x" + Number(room.room_flags || 0).toString(16)
-                })}
-              </div>
-              <h3>Players</h3>
-              ${(room.players || []).length ? `
-                <div class="table-wrap">
-                  <table>
-                    <thead><tr><th>Name</th><th>IP</th><th>Chat</th><th>Idle</th></tr></thead>
-                    <tbody>
-                      ${(room.players || []).map((player) => `
-                        <tr>
-                          <td>${hwMarkup(player.client_name)}</td>
-                          <td class="mono">${esc(player.client_ip)}</td>
-                          <td>${esc(player.chat_count)}</td>
-                          <td>${esc(age(player.idle_seconds))}</td>
-                        </tr>
-                      `).join("")}
-                    </tbody>
-                  </table>
-                </div>
-              ` : '<div class="muted">No players in this room.</div>'}
-              <h3>Published Games</h3>
-              ${(room.games || []).length ? `
-                <div class="table-wrap">
-                  <table>
-                    <thead><tr><th>Name</th><th>Owner</th><th>Link</th><th>Data</th></tr></thead>
-                    <tbody>
-                      ${(room.games || []).map((game) => `
-                        <tr>
-                          <td>${esc(game.name)}</td>
-                          <td>${hwMarkup(game.owner_name || String(game.owner_id))}</td>
-                          <td>${esc(game.link_id)}</td>
-                          <td>${esc(game.data_len)} bytes</td>
-                        </tr>
-                      `).join("")}
-                    </tbody>
-                  </table>
-                </div>
-              ` : '<div class="muted">No published games in this room.</div>'}
-            </details>
-          `).join("") || '<div class="muted">No routing rooms yet.</div>'}
-        </section>`;
-
-      const ipPanel = `
-        <section>
-          <h2>IP Metrics</h2>
-          <div class="section-note">Aggregated from live join/chat activity recorded by the gateway.</div>
-          ${(ipMetrics.length > 0) ? `
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>IP</th>
-                    <th>Players Seen</th>
-                    <th>Joins</th>
-                    <th>Chats</th>
-                    <th>Last Seen</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${ipMetrics.map((entry) => `
-                    <tr>
-                      <td class="mono">${esc(entry.ip)}</td>
-                      <td>${renderNameList(entry.player_names)}</td>
-                      <td>${esc(entry.join_count)}</td>
-                      <td>${esc(entry.chat_count)}</td>
-                      <td>${esc(stamp(entry.last_seen))}</td>
-                    </tr>
-                  `).join("")}
-                </tbody>
-              </table>
+            <h3>Database</h3>
+            <div class="kv">
+              <div class="k">Tables</div><div class="v">${esc(db.table_count||0)}</div>
+              <div class="k">Non-empty</div><div class="v">${esc(db.nonempty_table_count||0)}</div>
+              <div class="k">Total Rows</div><div class="v">${esc(db.total_rows||0)}</div>
             </div>
-          ` : '<div class="muted">No IP activity recorded yet.</div>'}
-        </section>`;
-
-      const dbPanel = `
-        <section>
-          <h2>SQLite Snapshot</h2>
-          <div class="section-note">Backend DB snapshot only. Most native Homeworld routing state currently lives in gateway memory, so empty backend tables do not mean the lobby is idle.</div>
-          <div style="margin-bottom: 10px;">
-            <span class="chip">tables: ${esc(db.table_count ?? 0)}</span>
-            <span class="chip">non-empty: ${esc(db.nonempty_table_count ?? 0)}</span>
-            <span class="chip">rows: ${esc(db.total_rows ?? 0)}</span>
-          </div>
-          ${dbNonEmpty.map(([name, info]) => `
-            <details>
-              <summary>${esc(name)} <span class="pill">${esc(info.count)}</span></summary>
-              <pre>${esc(pretty(info.rows || []))}</pre>
-            </details>
-          `).join("") || '<div class="muted">No non-empty backend tables yet.</div>'}
-          ${dbEmpty.length ? `
-            <details>
-              <summary>Empty Tables <span class="pill">${esc(dbEmpty.length)}</span></summary>
-              <pre>${esc(pretty(dbEmpty.map(([name, info]) => ({ name, count: info.count }))))}</pre>
-            </details>
-          ` : ""}
-        </section>`;
-
-      const peerSessions = `
-        <section>
-          <h2>Peer Sessions</h2>
-          <pre>${esc(pretty(gateway.peer_sessions || {}))}</pre>
-        </section>`;
-
-      const logPanel = `
-        <section class="full">
-          <h2>Recent Logs</h2>
-          <div class="section-note">Raw gateway log stream. Kept on its own tab so it does not dominate the main dashboard.</div>
-          <pre>${esc(logs.map((entry) => entry.rendered).join("\\n"))}</pre>
-        </section>`;
-
-      app.innerHTML = `
-        <div class="tabbar">
-          <button class="tab-btn" data-tab-btn="dashboard">Dashboard</button>
-          <button class="tab-btn" data-tab-btn="chat">Chat <span class="pill">${esc(activity.length)}</span></button>
-          <button class="tab-btn" data-tab-btn="logs">Logs <span class="pill">${esc(logs.length)}</span></button>
-        </div>
-        <div class="tab-page" data-tab-page="dashboard">
-          <div class="panel-grid">
-            ${overview}
-            ${playersPanel}
-            ${serverPanel}
-            ${ipPanel}
-            ${dbPanel}
-            ${peerSessions}
           </div>
         </div>
-        <div class="tab-page" data-tab-page="chat">
-          <div class="panel-grid">
-            ${activityPanel}
-          </div>
-        </div>
-        <div class="tab-page" data-tab-page="logs">
-          <div class="panel-grid">
-            ${logPanel}
-          </div>
-        </div>
-      `;
-      bindTabs();
-      status.textContent = `Last refresh: ${new Date((snapshot.generated_at || 0) * 1000).toLocaleTimeString()}`;
+        ${banned.length?`
+        <div class="card">
+          <h2>Banned IPs <span class="pill">${banned.length}</span></h2>
+          <div class="table-wrap"><table>
+            <thead><tr><th>IP</th><th>Reason</th><th style="width:80px">Action</th></tr></thead>
+            <tbody>${banned.map(b=>`<tr><td class="mono">${esc(b.ip)}</td><td>${esc(b.reason)}</td><td><button class="btn btn-sm" data-action="unban-ip" data-ip="${esc(b.ip)}">Unban</button></td></tr>`).join("")}</tbody>
+          </table></div>
+        </div>`:""}`;
     }
 
-    async function refresh() {
-      const tokenQuery = adminToken ? `&token=${encodeURIComponent(adminToken)}` : "";
-      const res = await fetch(`/api/snapshot?rows=25&logs=200&activity=150${tokenQuery}`, { cache: "no-store" });
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
-      render(await res.json());
+    function renderPlayers(snapshot){
+      const rt=(snapshot.gateway||{}).routing_manager||{};const players=rt.players||[];
+      if(!players.length)return '<div class="card"><h2>Players</h2><p class="muted">No live players connected.</p></div>';
+      return `<div class="card"><h2>Players <span class="pill">${players.length}</span></h2>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Player</th><th>IP</th><th>Room</th><th>Chat</th><th>Connected</th><th>Idle</th><th style="width:120px">Actions</th></tr></thead>
+          <tbody>${players.map(p=>`<tr>
+            <td>${hwMarkup(p.client_name)}</td>
+            <td class="mono">${esc(p.client_ip)}</td>
+            <td>${esc(p.room_name)} <span class="muted">:${esc(p.room_port)}</span></td>
+            <td>${esc(p.chat_count)}</td>
+            <td>${age(p.connected_seconds)}</td>
+            <td>${age(p.idle_seconds)}</td>
+            <td><button class="btn btn-danger btn-sm" data-action="kick" data-room-port="${esc(p.room_port)}" data-client-id="${esc(p.client_id)}">Kick</button> <button class="btn btn-danger btn-sm" data-action="ban-ip" data-ip="${esc(p.client_ip)}">Ban</button></td>
+          </tr>`).join("")}</tbody>
+        </table></div>
+        ${players.map(p=>`<details><summary>${hwMarkup(p.client_name)} <span class="muted">${esc(p.client_ip)} &middot; ${esc(p.room_name)}:${esc(p.room_port)}</span></summary>
+          <div class="kv" style="padding:8px 0;">
+            <div class="k">Client ID</div><div class="v">${esc(p.client_id)}</div>
+            <div class="k">Name</div><div class="v">${hwPlain(p.client_name)}</div>
+            <div class="k">Subscriptions</div><div class="v">${esc(p.subscription_count)}</div>
+            <div class="k">Peer Data Msgs</div><div class="v">${esc(p.peer_data_messages)}</div>
+            <div class="k">Peer Data Bytes</div><div class="v">${esc(p.peer_data_bytes)}</div>
+            <div class="k">Last Activity</div><div class="v">${esc(p.last_activity_kind)}</div>
+          </div></details>`).join("")}
+      </div>`;
     }
 
-    async function loop() {
-      try {
+    function renderRooms(snapshot){
+      const rt=(snapshot.gateway||{}).routing_manager||{};const servers=rt.servers||[];
+      if(!servers.length)return '<div class="card"><h2>Rooms</h2><p class="muted">No routing rooms yet.</p></div>';
+      return servers.map(room=>`<div class="card">
+        <h2>${esc(room.room_name||"(unnamed)")} <span class="muted" style="font-weight:400;font-size:12px;">:${esc(room.listen_port)}</span> <span class="pill">${esc(room.player_count)} players</span> <span class="pill">${esc(room.game_count)} games</span></h2>
+        <div class="kv">
+          <div class="k">Description</div><div class="v">${esc(room.room_description)}</div>
+          <div class="k">Path</div><div class="v">${esc(room.room_path)}</div>
+          <div class="k">Published</div><div class="v">${esc(room.published)}</div>
+          <div class="k">Password Set</div><div class="v">${esc(room.room_password_set)}</div>
+          <div class="k">Flags</div><div class="v">0x${Number(room.room_flags||0).toString(16)}</div>
+        </div>
+        ${(room.players||[]).length?`<h3>Players</h3><div class="table-wrap"><table>
+          <thead><tr><th>Name</th><th>IP</th><th>Chat</th><th>Idle</th><th style="width:60px">Action</th></tr></thead>
+          <tbody>${room.players.map(p=>`<tr><td>${hwMarkup(p.client_name)}</td><td class="mono">${esc(p.client_ip)}</td><td>${esc(p.chat_count)}</td><td>${age(p.idle_seconds)}</td><td><button class="btn btn-danger btn-sm" data-action="kick" data-room-port="${esc(room.listen_port)}" data-client-id="${esc(p.client_id)}">Kick</button></td></tr>`).join("")}</tbody>
+        </table></div>`:'<p class="muted" style="margin-top:8px;">No players in this room.</p>'}
+        ${(room.games||[]).length?`<h3>Published Games</h3><div class="table-wrap"><table>
+          <thead><tr><th>Name</th><th>Owner</th><th>Link</th><th>Data</th></tr></thead>
+          <tbody>${room.games.map(g=>`<tr><td>${esc(g.name)}</td><td>${hwMarkup(g.owner_name||String(g.owner_id))}</td><td>${esc(g.link_id)}</td><td>${esc(g.data_len)} bytes</td></tr>`).join("")}</tbody>
+        </table></div>`:'<p class="muted" style="margin-top:8px;">No published games.</p>'}
+      </div>`).join("");
+    }
+
+    function renderActivity(snapshot){
+      const gw=snapshot.gateway||{};const activity=gw.activity||[];const servers=(gw.routing_manager||{}).servers||[];
+      const roomOpts=servers.map(r=>`<option value="${esc(r.listen_port)}">${esc(r.room_name)}:${esc(r.listen_port)}</option>`).join("");
+      return `<div class="card">
+        <h2>Activity Feed <span class="pill">${activity.length}</span></h2>
+        <div class="action-bar">
+          <input type="text" id="broadcast-msg" placeholder="Broadcast message...">
+          <select id="broadcast-room"><option value="">All rooms</option>${roomOpts}</select>
+          <button class="btn btn-accent" data-action="broadcast">Send</button>
+          <button class="btn btn-danger" data-action="clear-activity">Clear</button>
+        </div>
+        ${activity.length?`<div class="table-wrap"><table>
+          <thead><tr><th style="width:80px">Time</th><th style="width:70px">Event</th><th>Player</th><th>Room</th><th>IP</th><th>Detail</th></tr></thead>
+          <tbody>${activity.map(e=>`<tr>
+            <td class="mono">${esc(stamp(e.ts))}</td>
+            <td>${kindBadge(e.kind)}</td>
+            <td>${hwMarkup(e.player_name||"")}</td>
+            <td>${esc(e.room_name||"")}${e.room_port?` <span class="muted">:${esc(e.room_port)}</span>`:""}</td>
+            <td class="mono">${esc(e.player_ip||"")}</td>
+            <td>${hwMarkup(e.text||"")}</td>
+          </tr>`).join("")}</tbody>
+        </table></div>`:'<p class="muted">No activity recorded yet.</p>'}
+      </div>`;
+    }
+
+    function renderIPs(snapshot){
+      const gw=snapshot.gateway||{};const ips=gw.ip_metrics||[];
+      return `<div class="card"><h2>IP Metrics <span class="pill">${ips.length}</span></h2>
+        ${ips.length?`<div class="table-wrap"><table>
+          <thead><tr><th>IP</th><th>Players Seen</th><th>Joins</th><th>Chats</th><th>Last Seen</th><th style="width:60px">Action</th></tr></thead>
+          <tbody>${ips.map(e=>`<tr>
+            <td class="mono">${esc(e.ip)}</td>
+            <td>${nameList(e.player_names)}</td>
+            <td>${esc(e.join_count)}</td>
+            <td>${esc(e.chat_count)}</td>
+            <td>${esc(stamp(e.last_seen))}</td>
+            <td><button class="btn btn-danger btn-sm" data-action="ban-ip" data-ip="${esc(e.ip)}">Ban</button></td>
+          </tr>`).join("")}</tbody>
+        </table></div>`:'<p class="muted">No IP activity recorded yet.</p>'}
+      </div>`;
+    }
+
+    function renderDatabase(snapshot){
+      const db=snapshot.db||{};const tables=Object.entries(db.tables||{});
+      if(!tables.length)return '<div class="card"><h2>Database</h2><p class="muted">No tables found.</p></div>';
+      if(!activeDbTable||!db.tables[activeDbTable])activeDbTable=tables[0][0];
+      const info=db.tables[activeDbTable]||{count:0,rows:[]};
+      const rows=info.rows||[];
+      const cols=rows.length?Object.keys(rows[0]):[];
+      const isUsersTable=activeDbTable==="users";
+      return `<div class="card">
+        <h2>Database <span class="pill">${esc(db.table_count||0)} tables</span> <span class="pill">${esc(db.total_rows||0)} rows</span></h2>
+        <div class="db-tabs">${tables.map(([name,info])=>`<button class="db-tab${name===activeDbTable?" active":""}" data-db-table="${esc(name)}">${esc(name)} <span class="muted">(${info.count})</span></button>`).join("")}</div>
+        ${rows.length?`<div class="table-wrap"><table>
+          <thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}${isUsersTable?'<th style="width:140px">Actions</th>':""}</tr></thead>
+          <tbody>${rows.map(r=>`<tr>${cols.map(c=>{
+            const v=r[c];
+            if(v&&typeof v==="object")return '<td class="mono">'+esc(JSON.stringify(v))+"</td>";
+            return "<td>"+esc(v)+"</td>";
+          }).join("")}${isUsersTable?`<td><button class="btn btn-sm" data-action="reset-pw" data-username="${esc(r.username)}">Reset PW</button> <button class="btn btn-danger btn-sm" data-action="delete-user" data-username="${esc(r.username)}">Delete</button></td>`:""}</tr>`).join("")}</tbody>
+        </table></div>`:'<p class="muted">Table is empty.</p>'}
+      </div>`;
+    }
+
+    function renderSessions(snapshot){
+      const gw=snapshot.gateway||{};const sessions=Object.entries(gw.peer_sessions||{});
+      return `<div class="card"><h2>Peer Sessions <span class="pill">${sessions.length}</span></h2>
+        ${sessions.length?`<div class="table-wrap"><table>
+          <thead><tr><th>ID</th><th>Role</th><th>Sequenced</th><th>In Seq</th><th>Out Seq</th><th>Created</th><th>Last Used</th><th>Key Len</th></tr></thead>
+          <tbody>${sessions.map(([id,s])=>`<tr>
+            <td>${esc(id)}</td><td>${esc(s.role)}</td><td>${esc(s.sequenced)}</td>
+            <td>${esc(s.in_seq)}</td><td>${esc(s.out_seq)}</td>
+            <td>${esc(stamp(s.created_at))}</td><td>${esc(stamp(s.last_used_at))}</td>
+            <td>${esc(s.session_key_len)}</td>
+          </tr>`).join("")}</tbody>
+        </table></div>`:'<p class="muted">No peer sessions.</p>'}
+      </div>`;
+    }
+
+    function renderLogs(snapshot){
+      const logs=snapshot.logs||[];
+      const colored=logs.map(e=>{
+        const r=esc(e.rendered||"");
+        if(e.level==="ERROR")return '<span class="log-error">'+r+"</span>";
+        if(e.level==="WARNING")return '<span class="log-warn">'+r+"</span>";
+        return '<span class="log-info">'+r+"</span>";
+      }).join("\\n");
+      return `<div class="card">
+        <h2>Logs <span class="pill">${logs.length}</span></h2>
+        <div class="action-bar"><button class="btn btn-danger" data-action="clear-logs">Clear Logs</button></div>
+        <pre id="log-pre">${colored||'<span class="muted">No logs yet.</span>'}</pre>
+      </div>`;
+    }
+
+    function renderAll(snapshot){
+      if(!snapshot)return;
+      lastSnapshot=snapshot;
+      renderNav(snapshot);
+      renderSidebarFooter(snapshot);
+      renderTopbar(snapshot);
+      const renderers={overview:renderOverview,players:renderPlayers,rooms:renderRooms,activity:renderActivity,ips:renderIPs,database:renderDatabase,sessions:renderSessions,logs:renderLogs};
+      const fn=renderers[activePage]||renderOverview;
+      content.innerHTML=fn(snapshot);
+      if(activePage==="logs"){const pre=document.getElementById("log-pre");if(pre)pre.scrollTop=pre.scrollHeight;}
+      content.querySelectorAll("[data-db-table]").forEach(btn=>{btn.addEventListener("click",()=>{activeDbTable=btn.dataset.dbTable;content.innerHTML=renderDatabase(lastSnapshot);bindDbTabs();});});
+    }
+    function bindDbTabs(){content.querySelectorAll("[data-db-table]").forEach(btn=>{btn.addEventListener("click",()=>{activeDbTable=btn.dataset.dbTable;content.innerHTML=renderDatabase(lastSnapshot);bindDbTabs();});});}
+
+    function tokenQuery(){return adminToken?`?token=${encodeURIComponent(adminToken)}`:"";}
+
+    async function adminAction(endpoint,payload){
+      try{
+        const res=await fetch(`/api/admin/${endpoint}${tokenQuery()}`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+        const data=await res.json();
+        if(data.ok){showToast("Action succeeded","success");}else{showToast(data.error||"Action failed","error");}
         await refresh();
-      } catch (err) {
-        status.textContent = `Dashboard refresh failed: ${err}`;
-      }
-      setTimeout(loop, 3000);
+      }catch(err){showToast("Request failed: "+err,"error");}
     }
 
+    function showToast(msg,type){
+      const t=document.createElement("div");
+      t.className="toast toast-"+(type||"success");
+      t.textContent=msg;
+      toastContainer.appendChild(t);
+      setTimeout(()=>t.remove(),3500);
+    }
+
+    function showModal(title,bodyHtml,onConfirm){
+      pauseRefresh=true;
+      modalBox.innerHTML=`<h3>${esc(title)}</h3>${bodyHtml}<div class="modal-actions"><button class="btn" id="modal-cancel">Cancel</button><button class="btn btn-danger" id="modal-confirm">Confirm</button></div>`;
+      modalOverlay.classList.add("show");
+      document.getElementById("modal-cancel").addEventListener("click",closeModal);
+      document.getElementById("modal-confirm").addEventListener("click",()=>{closeModal();onConfirm();});
+    }
+    function closeModal(){modalOverlay.classList.remove("show");pauseRefresh=false;}
+    modalOverlay.addEventListener("click",e=>{if(e.target===modalOverlay)closeModal();});
+
+    content.addEventListener("click",e=>{
+      const btn=e.target.closest("[data-action]");
+      if(!btn)return;
+      const action=btn.dataset.action;
+
+      if(action==="kick"){
+        const port=btn.dataset.roomPort,cid=btn.dataset.clientId;
+        showModal("Kick Player",`<p>Kick client #${esc(cid)} from room :${esc(port)}?</p>`,()=>adminAction("kick",{room_port:Number(port),client_id:Number(cid)}));
+      }
+      if(action==="ban-ip"){
+        const ip=btn.dataset.ip;
+        showModal("Ban IP",`<p>Ban <strong>${esc(ip)}</strong>?</p><input type="text" id="ban-reason" placeholder="Reason (optional)">`,()=>{
+          const reason=(document.getElementById("ban-reason")||{}).value||"admin ban";
+          adminAction("ban-ip",{ip,reason});
+        });
+      }
+      if(action==="unban-ip"){
+        const ip=btn.dataset.ip;
+        adminAction("unban-ip",{ip});
+      }
+      if(action==="broadcast"){
+        const msg=(document.getElementById("broadcast-msg")||{}).value||"";
+        const roomPort=(document.getElementById("broadcast-room")||{}).value||"";
+        if(!msg.trim()){showToast("Enter a message","error");return;}
+        adminAction("broadcast",{message:msg,room_port:roomPort?Number(roomPort):null});
+      }
+      if(action==="clear-activity"){
+        showModal("Clear Activity","<p>Clear all activity logs and counters?</p>",()=>adminAction("clear-activity",{}));
+      }
+      if(action==="clear-logs"){
+        showModal("Clear Logs","<p>Clear the gateway log buffer?</p>",()=>adminAction("clear-logs",{}));
+      }
+      if(action==="delete-user"){
+        const u=btn.dataset.username;
+        showModal("Delete User",`<p>Permanently delete user <strong>${esc(u)}</strong>?</p>`,()=>adminAction("delete-user",{username:u}));
+      }
+      if(action==="reset-pw"){
+        const u=btn.dataset.username;
+        showModal("Reset Password",`<p>Reset password for <strong>${esc(u)}</strong>:</p><input type="password" id="new-pw" placeholder="New password">`,()=>{
+          const pw=(document.getElementById("new-pw")||{}).value||"";
+          if(!pw){showToast("Enter a password","error");return;}
+          adminAction("reset-password",{username:u,new_password:pw});
+        });
+      }
+    });
+
+    async function refresh(){
+      const res=await fetch(`/api/snapshot?rows=50&logs=300&activity=200${tokenQuery()}`,{cache:"no-store"});
+      if(!res.ok)throw new Error("HTTP "+res.status);
+      renderAll(await res.json());
+    }
+
+    async function loop(){
+      try{if(!pauseRefresh)await refresh();}catch(err){topbarMeta.textContent="Refresh failed: "+err;}
+      setTimeout(loop,3000);
+    }
     loop();
   </script>
 </body>
 </html>""".replace("__ADMIN_TOKEN__", json.dumps(embedded_token))
+
+    async def _handle_admin_post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Dispatch POST admin action requests."""
+        try:
+            if path == "/api/admin/kick":
+                room_port = int(body.get("room_port", 0))
+                client_id = int(body.get("client_id", 0))
+                if not room_port or not client_id:
+                    return {"ok": False, "error": "room_port and client_id required"}
+                if self.gateway.routing_manager is None:
+                    return {"ok": False, "error": "routing manager not available"}
+                result = await self.gateway.routing_manager.admin_kick_player(room_port, client_id)
+                return {"ok": result, "error": "" if result else "client not found"}
+
+            if path == "/api/admin/ban-ip":
+                ip = str(body.get("ip", "")).strip()
+                reason = str(body.get("reason", "admin ban")).strip()
+                if not ip:
+                    return {"ok": False, "error": "ip required"}
+                self.gateway.ban_ip(ip, reason)
+                return {"ok": True, "banned": ip, "reason": reason}
+
+            if path == "/api/admin/unban-ip":
+                ip = str(body.get("ip", "")).strip()
+                if not ip:
+                    return {"ok": False, "error": "ip required"}
+                result = self.gateway.unban_ip(ip)
+                return {"ok": result, "error": "" if result else "ip not in ban list"}
+
+            if path == "/api/admin/broadcast":
+                message = str(body.get("message", "")).strip()
+                if not message:
+                    return {"ok": False, "error": "message required"}
+                room_port = body.get("room_port")
+                if room_port is not None:
+                    room_port = int(room_port)
+                if self.gateway.routing_manager is None:
+                    return {"ok": False, "error": "routing manager not available"}
+                delivered = await self.gateway.routing_manager.admin_broadcast(message, room_port)
+                return {"ok": True, "delivered": delivered}
+
+            if path == "/api/admin/clear-activity":
+                self.gateway.clear_activity()
+                return {"ok": True}
+
+            if path == "/api/admin/clear-logs":
+                count = self.log_handler.clear()
+                return {"ok": True, "cleared": count}
+
+            if path == "/api/admin/delete-user":
+                username = str(body.get("username", "")).strip()
+                if not username:
+                    return {"ok": False, "error": "username required"}
+                db_path = Path(self.db_path).resolve()
+                if not db_path.exists():
+                    return {"ok": False, "error": "database not found"}
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    cur = conn.execute("DELETE FROM users WHERE username=?", (username,))
+                    conn.commit()
+                    return {"ok": cur.rowcount > 0, "error": "" if cur.rowcount > 0 else "user not found"}
+                finally:
+                    conn.close()
+
+            if path == "/api/admin/reset-password":
+                username = str(body.get("username", "")).strip()
+                new_password = str(body.get("new_password", ""))
+                if not username or not new_password:
+                    return {"ok": False, "error": "username and new_password required"}
+                db_path = Path(self.db_path).resolve()
+                if not db_path.exists():
+                    return {"ok": False, "error": "database not found"}
+                password_hash = hashlib.sha256(new_password.encode("utf-8")).hexdigest()
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    cur = conn.execute("UPDATE users SET password_hash=? WHERE username=?", (password_hash, username))
+                    conn.commit()
+                    return {"ok": cur.rowcount > 0, "error": "" if cur.rowcount > 0 else "user not found"}
+                finally:
+                    conn.close()
+
+            return {"ok": False, "error": "unknown endpoint"}
+        except Exception as exc:
+            LOGGER.warning("Admin POST %s failed: %s", path, exc)
+            return {"ok": False, "error": str(exc)}
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -4113,7 +4175,7 @@ class AdminDashboardServer:
             return
 
         method, target = parts[0], parts[1]
-        if method != "GET":
+        if method not in ("GET", "POST"):
             writer.write(self._http_response(b"method not allowed", "text/plain; charset=utf-8", "405 Method Not Allowed"))
             await writer.drain()
             writer.close()
@@ -4135,6 +4197,45 @@ class AdminDashboardServer:
             writer.close()
             await writer.wait_closed()
             return
+
+        if method == "POST":
+            content_length = 0
+            with contextlib.suppress(TypeError, ValueError):
+                content_length = int(headers.get("content-length", "0"))
+            if content_length < 0 or content_length > 65536:
+                writer.write(self._http_response(b"bad content length", "text/plain; charset=utf-8", "400 Bad Request"))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+            body_raw = b""
+            if content_length > 0:
+                try:
+                    body_raw = await asyncio.wait_for(reader.readexactly(content_length), timeout=5.0)
+                except Exception:
+                    writer.write(self._http_response(b"failed to read body", "text/plain; charset=utf-8", "400 Bad Request"))
+                    await writer.drain()
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+            try:
+                body_json = json.loads(body_raw) if body_raw else {}
+            except json.JSONDecodeError:
+                writer.write(self._http_response(b"invalid json", "text/plain; charset=utf-8", "400 Bad Request"))
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+            resp = await self._handle_admin_post(parsed.path, body_json)
+            resp_body = json.dumps(resp).encode("utf-8")
+            status_code = "200 OK" if resp.get("ok") else "400 Bad Request"
+            writer.write(self._http_response(resp_body, "application/json; charset=utf-8", status_code))
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        # GET requests
         rows = 25
         log_limit = 200
         activity_limit = 150
@@ -4443,6 +4544,7 @@ class BinaryGatewayServer:
         self._activity: Deque[Dict[str, object]] = deque(maxlen=500)
         self._activity_counts: Dict[str, int] = {}
         self._ip_activity: Dict[str, Dict[str, object]] = {}
+        self._banned_ips: Dict[str, str] = {}
         self.routing_manager: Optional[RoutingServerManager] = None
         self._maintenance_task: Optional[asyncio.Task] = None
         if keys_dir:
@@ -4609,6 +4711,17 @@ class BinaryGatewayServer:
         rows.sort(key=lambda item: (-item["join_count"], -item["chat_count"], item["ip"]))
         return rows[:max(1, limit)]
 
+    def ban_ip(self, ip: str, reason: str = "") -> None:
+        self._banned_ips[ip.strip()] = reason
+
+    def unban_ip(self, ip: str) -> bool:
+        return self._banned_ips.pop(ip.strip(), None) is not None
+
+    def clear_activity(self) -> None:
+        self._activity.clear()
+        self._activity_counts.clear()
+        self._ip_activity.clear()
+
     def dashboard_snapshot(self, activity_limit: int = 150) -> Dict[str, object]:
         self._prune_ip_activity()
         routing_snapshot = (
@@ -4650,6 +4763,10 @@ class BinaryGatewayServer:
                 for session_id, session in sorted(self._peer_sessions.items())
             },
             "routing_manager": routing_snapshot,
+            "banned_ips": [
+                {"ip": ip, "reason": reason}
+                for ip, reason in sorted(self._banned_ips.items())
+            ],
         }
 
     def _load_keys(self, keys_dir: str) -> None:
