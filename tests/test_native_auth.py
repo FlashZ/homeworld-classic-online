@@ -114,3 +114,44 @@ def test_native_login_rejects_invalid_cd_key(tmp_path) -> None:
             )
     finally:
         store.close()
+
+
+def test_native_login_does_not_rotate_password_for_existing_accounts(tmp_path) -> None:
+    db_path = tmp_path / "won_native_auth_existing_password.db"
+    store = won_server.StateStore(str(db_path))
+    state = won_server.WONLikeState(store)
+
+    try:
+        state.login_native(
+            "Zero",
+            "hunter2",
+            cd_key="NYX7-ZEC9-FYZ6-GUX8-4253",
+            create_account=True,
+        )
+
+        relogin = state.login_native(
+            "Zero",
+            "hunter2",
+            cd_key="NYX7-ZEC9-FYZ6-GUX8-4253",
+            new_password="rotate-me",
+            create_account=False,
+        )
+        assert relogin["created"] is False
+        assert relogin["binding_changed"] is False
+
+        state.login_native(
+            "Zero",
+            "hunter2",
+            cd_key="NYX7-ZEC9-FYZ6-GUX8-4253",
+            create_account=False,
+        )
+
+        with pytest.raises(ValueError, match="invalid_credentials"):
+            state.login_native(
+                "Zero",
+                "rotate-me",
+                cd_key="NYX7-ZEC9-FYZ6-GUX8-4253",
+                create_account=False,
+            )
+    finally:
+        store.close()

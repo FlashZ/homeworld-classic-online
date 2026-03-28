@@ -571,13 +571,6 @@ class WONLikeState:
             )
             binding_changed = True
 
-        if new_password and new_password != password:
-            cur.execute(
-                "UPDATE users SET password_hash=? WHERE username=?",
-                (self._hash_password(new_password), username),
-            )
-            binding_changed = True
-
         if binding_changed:
             self.store.conn.commit()
 

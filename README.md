@@ -208,7 +208,6 @@ Supporting modules:
 ## Self-hosting with your own keys
 
 The source code is public, but network identity is defined by the key material in `keys/`. The two private `.der` files are the sensitive part - do not publish them if you want to remain the sole operator of your network.
-
 To run an independent network:
 
 1. Generate a fresh key set: `python generate_keys.py --keys-dir keys`
