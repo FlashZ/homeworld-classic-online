@@ -4187,7 +4187,7 @@ class AdminDashboardServer:
     function hwPlain(v){return String(v??"").replace(/&(.)/g,"$1");}
     function hwMarkup(v){const s=String(v??"");let o="";for(let i=0;i<s.length;i++){if(s[i]==="&"&&i+1<s.length){i++;o+=`<strong class="hw-strong">${esc(s[i])}</strong>`;}else{o+=esc(s[i]);}}return o;}
     function nameList(vs){return(vs||[]).map(v=>hwMarkup(v)).join(", ");}
-    function kindBadge(k){const m={join:"badge-join",leave:"badge-leave",chat:"badge-chat"};return `<span class="badge ${m[k]||"badge-default"}">${esc(k)}</span>`;}
+    function kindBadge(k){const m={join:"badge-join",rejoin:"badge-join",leave:"badge-leave",chat:"badge-chat",broadcast:"badge-chat"};return `<span class="badge ${m[k]||"badge-default"}">${esc(k)}</span>`;}
     function shortHex(hex,maxChars=24){const s=String(hex||"").trim();if(!s)return "";return s.length>maxChars?`${s.slice(0,maxChars)}...`:s;}
     function displayRoomName(snapshot,roomName,roomPort,gameCount=0){
       const gw=snapshot.gateway||{};
@@ -4706,6 +4706,25 @@ class AdminDashboardServer:
                     return {"ok": False, "error": "routing manager not available"}
                 delivered = await self.gateway.routing_manager.admin_broadcast(message, room_port)
                 scope = f"room :{room_port}" if room_port is not None else "all rooms"
+                room_name = "All Rooms"
+                room_path = ""
+                if room_port is not None and hasattr(self.gateway.routing_manager, "get_server"):
+                    server = self.gateway.routing_manager.get_server(room_port)
+                    if server is not None:
+                        room_name = str(getattr(server, "_room_display_name", "") or room_name)
+                        room_path = str(getattr(server, "_room_path", "") or "")
+                self.gateway.record_activity(
+                    "broadcast",
+                    room_port=room_port,
+                    room_name=room_name,
+                    room_path=room_path,
+                    player_name="[ADMIN]",
+                    text=message,
+                    details={
+                        "delivered": delivered,
+                        "scope": scope,
+                    },
+                )
                 return {
                     "ok": True,
                     "delivered": delivered,
@@ -5318,7 +5337,7 @@ class BinaryGatewayServer:
             return []
         join_leave_chat = [
             entry for entry in self._activity
-            if entry.get("kind") in {"join", "rejoin", "leave", "chat"}
+            if entry.get("kind") in {"join", "rejoin", "leave", "chat", "broadcast"}
         ]
         return list(join_leave_chat)[-limit:][::-1]
 

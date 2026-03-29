@@ -6,6 +6,10 @@ import titan_binary_gateway
 
 
 class _FakeGateway:
+    def __init__(self) -> None:
+        self.activities: list[dict[str, object]] = []
+        self.routing_manager = _FakeRoutingManager()
+
     def dashboard_snapshot(self, activity_limit: int = 150) -> dict[str, object]:
         return {
             "public_host": "homeworld.kerrbell.dev",
@@ -30,6 +34,33 @@ class _FakeGateway:
             },
             "banned_ips": [],
         }
+
+    def record_activity(self, kind: str, **kwargs: object) -> None:
+        entry = {"kind": kind}
+        entry.update(kwargs)
+        self.activities.append(entry)
+
+
+class _FakeServer:
+    _room_display_name = "Default"
+    _room_path = "/Homeworld"
+
+
+class _FakeRoutingManager:
+    def __init__(self) -> None:
+        self.last_message = ""
+        self.last_room_port: int | None = None
+        self._server = _FakeServer()
+
+    async def admin_broadcast(self, message: str, room_port: int | None = None) -> int:
+        self.last_message = message
+        self.last_room_port = room_port
+        return 2
+
+    def get_server(self, port: int) -> _FakeServer | None:
+        if port == 15100:
+            return self._server
+        return None
 
 
 class _FakeRepoMonitor:
@@ -145,3 +176,30 @@ def test_admin_repo_update_endpoint_surfaces_restart_message() -> None:
     assert "Restart the gateway" in result["message"]
     assert result["git"]["restart_required"] is True
     assert repo.updated == 1
+
+
+def test_admin_broadcast_endpoint_records_activity() -> None:
+    gateway = _FakeGateway()
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=gateway,
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    result = asyncio.run(
+        dashboard._handle_admin_post(
+            "/api/admin/broadcast",
+            {"message": "Server notice", "room_port": 15100},
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["delivered"] == 2
+    assert gateway.activities
+    activity = gateway.activities[-1]
+    assert activity["kind"] == "broadcast"
+    assert activity["player_name"] == "[ADMIN]"
+    assert activity["text"] == "Server notice"
+    assert activity["room_name"] == "Default"
+    assert activity["details"] == {"delivered": 2, "scope": "room :15100"}
