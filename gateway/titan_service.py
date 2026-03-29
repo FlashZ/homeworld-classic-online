@@ -2686,6 +2686,8 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.admin_port > 0 and not _is_loopback_host(args.admin_host) and not str(args.admin_token or "").strip():
         raise ValueError("Refusing to expose the admin dashboard on a non-loopback host without --admin-token.")
     db_path = ""
+    db_paths: Dict[str, str] = {}
+    default_db_product = ""
     routing_managers: list[RoutingServerManager] = []
     routing_servers: list[asyncio.base_events.Server] = []
 
@@ -2744,6 +2746,11 @@ async def main_async(args: argparse.Namespace) -> None:
             default_product_key=str(shared_config["default_product_key"]),
         )
         db_path = str(shared_config["admin_db_path"])
+        db_paths = {
+            product_key: str(runtime_config["db_path"])
+            for product_key, runtime_config in dict(shared_config["runtimes"]).items()
+        }
+        default_db_product = str(shared_config["default_product_key"])
     else:
         product_profile, version_str, valid_versions, db_path, keys_dir = (
             _resolve_gateway_runtime_config(args)
@@ -2783,6 +2790,8 @@ async def main_async(args: argparse.Namespace) -> None:
             publish_in_directory=True,
         )
         routing_servers.append(routing_server)
+        db_paths = {product_profile.key: str(db_path)}
+        default_db_product = product_profile.key
 
     server = await asyncio.start_server(srv.handle_client, args.host, args.port)
     firewall_server = await asyncio.start_server(
@@ -2792,6 +2801,8 @@ async def main_async(args: argparse.Namespace) -> None:
         srv,
         db_path,
         DASHBOARD_LOG_HANDLER,
+        db_paths=db_paths,
+        default_db_product=default_db_product,
         admin_token=args.admin_token,
         stats_token=args.stats_token,
     )

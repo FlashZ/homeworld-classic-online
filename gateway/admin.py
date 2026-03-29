@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import contextlib
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -62,12 +63,32 @@ class AdminDashboardServer:
         gateway: BinaryGatewayServer,
         db_path: str,
         log_handler: DashboardLogHandler,
+        db_paths: Optional[Dict[str, str]] = None,
+        default_db_product: str = "",
         admin_token: str = "",
         stats_token: str = "",
         repo_monitor: Optional[GitRepoMonitor] = None,
     ) -> None:
         self.gateway = gateway
         self.db_path = db_path
+        self.db_paths = {
+            str(product).strip(): str(path)
+            for product, path in dict(db_paths or {}).items()
+            if str(product).strip() and str(path).strip()
+        }
+        if not self.db_paths and str(db_path).strip():
+            fallback_product = ""
+            product_profile = getattr(gateway, "product_profile", None)
+            if product_profile is not None:
+                fallback_product = str(getattr(product_profile, "key", "") or "").strip()
+            if not fallback_product:
+                fallback_product = str(getattr(gateway, "default_product_key", "") or "").strip()
+            if not fallback_product:
+                fallback_product = "default"
+            self.db_paths = {fallback_product: str(db_path)}
+        self.default_db_product = str(default_db_product or "").strip()
+        if self.default_db_product not in self.db_paths:
+            self.default_db_product = next(iter(self.db_paths), "")
         self.log_handler = log_handler
         self.admin_token = admin_token.strip()
         self.stats_token = stats_token.strip()
@@ -156,8 +177,21 @@ class AdminDashboardServer:
         return value
 
     def _db_snapshot(self, rows_per_table: int = 25) -> Dict[str, object]:
-        path = Path(self.db_path).resolve()
-        if not path.exists():
+        raw_path = str(self.db_path or "").strip()
+        if not raw_path:
+            return {
+                "path": "",
+                "exists": False,
+                "table_count": 0,
+                "nonempty_table_count": 0,
+                "total_rows": 0,
+                "tables": {},
+            }
+        path = Path(raw_path).resolve()
+        return self._db_snapshot_for_path(path, rows_per_table=max(1, rows_per_table))
+
+    def _db_snapshot_for_path(self, path: Path, rows_per_table: int = 25) -> Dict[str, object]:
+        if not path.exists() or path.is_dir():
             return {
                 "path": str(path),
                 "exists": False,
@@ -205,18 +239,44 @@ class AdminDashboardServer:
         finally:
             conn.close()
 
+    def _db_snapshots(self, rows_per_table: int = 25) -> Dict[str, Dict[str, object]]:
+        snapshots: Dict[str, Dict[str, object]] = {}
+        for product, path in self.db_paths.items():
+            snapshots[product] = self._db_snapshot_for_path(
+                Path(path).resolve(),
+                rows_per_table=max(1, rows_per_table),
+            )
+        return snapshots
+
+    def _resolve_db_path(self, product: str = "") -> Path:
+        product_key = str(product or "").strip()
+        if product_key and product_key in self.db_paths:
+            return Path(self.db_paths[product_key]).resolve()
+        if self.default_db_product and self.default_db_product in self.db_paths:
+            return Path(self.db_paths[self.default_db_product]).resolve()
+        if str(self.db_path).strip():
+            return Path(self.db_path).resolve()
+        return (Path(__file__).resolve().parent / "__admin_db_missing__.sqlite").resolve()
+
     def snapshot(
         self,
         rows_per_table: int = 25,
         log_limit: int = 200,
         activity_limit: int = 150,
     ) -> Dict[str, object]:
+        dbs = self._db_snapshots(rows_per_table=max(1, rows_per_table))
+        default_db = (
+            dbs.get(self.default_db_product)
+            or next(iter(dbs.values()), self._db_snapshot(rows_per_table=max(1, rows_per_table)))
+        )
         return {
             "generated_at": time.time(),
             "uptime_seconds": int(time.time() - self.started_at),
             "gateway": self.gateway.dashboard_snapshot(activity_limit=max(1, activity_limit)),
             "repo": self.repo_monitor.snapshot(),
-            "db": self._db_snapshot(rows_per_table=max(1, rows_per_table)),
+            "db": default_db,
+            "dbs": dbs,
+            "db_default_product": self.default_db_product,
             "logs": self.log_handler.snapshot(limit=max(1, log_limit)),
         }
 
@@ -371,6 +431,7 @@ class AdminDashboardServer:
     let pauseRefreshUntil = 0;
     let pointerInteractionActive = false;
     let lastSnapshot = null;
+    let activeDbProduct = "";
     let activeDbTable = "";
     let uiState = {
       pageId: "overview",
@@ -1046,15 +1107,35 @@ class AdminDashboardServer:
     }
 
     function renderDatabase(snapshot){
-      const db=snapshot.db||{};const tables=Object.entries(db.tables||{});
-      if(!tables.length)return '<div class="card"><h2>Database</h2><p class="muted">No tables found.</p></div>';
+      const dbs=snapshot.dbs||{};
+      const productKeys=sortedProductKeys(Object.keys(dbs));
+      if(!productKeys.length)return '<div class="card"><h2>Database</h2><p class="muted">No databases configured.</p></div>';
+      if(!activeDbProduct||!dbs[activeDbProduct]){
+        activeDbProduct=snapshot.db_default_product&&dbs[snapshot.db_default_product]?snapshot.db_default_product:productKeys[0];
+      }
+      const db=dbs[activeDbProduct]||snapshot.db||{};
+      const infoCardProduct=snapshotProductInfo(snapshot,activeDbProduct);
+      const tables=Object.entries(db.tables||{});
+      if(!tables.length){
+        return `<div class="card">
+          <h2>Database ${productBadge(activeDbProduct)}${esc(infoCardProduct.community_name||activeDbProduct)}</h2>
+          ${productKeys.length>1?`<div class="db-tabs">${productKeys.map(product=>`<button class="db-tab${product===activeDbProduct?" active":""}" data-db-product="${esc(product)}">${esc(snapshotProductInfo(snapshot,product).community_name||product)}</button>`).join("")}</div>`:""}
+          <p class="muted">No tables found in this database.</p>
+        </div>`;
+      }
       if(!activeDbTable||!db.tables[activeDbTable])activeDbTable=tables[0][0];
       const info=db.tables[activeDbTable]||{count:0,rows:[]};
       const rows=info.rows||[];
       const cols=rows.length?Object.keys(rows[0]):[];
       const isUsersTable=activeDbTable==="users";
       return `<div class="card">
-        <h2>Database <span class="pill">${esc(db.table_count||0)} tables</span> <span class="pill">${esc(db.total_rows||0)} rows</span></h2>
+        <h2>Database ${productBadge(activeDbProduct)}${esc(infoCardProduct.community_name||activeDbProduct)} <span class="pill">${esc(db.table_count||0)} tables</span> <span class="pill">${esc(db.total_rows||0)} rows</span></h2>
+        <div class="kv" style="margin-bottom:12px;">
+          <div class="k">Product</div><div class="v">${esc(activeDbProduct)}</div>
+          <div class="k">Path</div><div class="v">${esc(db.path||"")}</div>
+          <div class="k">Non-empty Tables</div><div class="v">${esc(db.nonempty_table_count||0)}</div>
+        </div>
+        ${productKeys.length>1?`<div class="db-tabs">${productKeys.map(product=>`<button class="db-tab${product===activeDbProduct?" active":""}" data-db-product="${esc(product)}">${esc(snapshotProductInfo(snapshot,product).community_name||product)}</button>`).join("")}</div>`:""}
         <div class="db-tabs">${tables.map(([name,info])=>`<button class="db-tab${name===activeDbTable?" active":""}" data-db-table="${esc(name)}">${esc(name)} <span class="muted">(${info.count})</span></button>`).join("")}</div>
         ${rows.length?`<div class="table-wrap"><table>
           <thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}${isUsersTable?'<th style="width:140px">Actions</th>':""}</tr></thead>
@@ -1062,7 +1143,7 @@ class AdminDashboardServer:
             const v=r[c];
             if(v&&typeof v==="object")return '<td class="mono">'+esc(JSON.stringify(v))+"</td>";
             return "<td>"+esc(v)+"</td>";
-          }).join("")}${isUsersTable?`<td><button class="btn btn-sm" data-action="reset-pw" data-username="${esc(r.username)}">Reset PW</button> <button class="btn btn-danger btn-sm" data-action="delete-user" data-username="${esc(r.username)}">Delete</button></td>`:""}</tr>`).join("")}</tbody>
+          }).join("")}${isUsersTable?`<td><button class="btn btn-sm" data-action="reset-pw" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Reset PW</button> <button class="btn btn-danger btn-sm" data-action="delete-user" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Delete</button></td>`:""}</tr>`).join("")}</tbody>
         </table></div>`:'<p class="muted">Table is empty.</p>'}
       </div>`;
     }
@@ -1110,9 +1191,25 @@ class AdminDashboardServer:
       const fn=renderers[activePage]||renderOverview;
       content.innerHTML=fn(snapshot);
       restoreUiState();
-      content.querySelectorAll("[data-db-table]").forEach(btn=>{btn.addEventListener("click",()=>{activeDbTable=btn.dataset.dbTable;content.innerHTML=renderDatabase(lastSnapshot);bindDbTabs();});});
+      bindDbTabs();
     }
-    function bindDbTabs(){content.querySelectorAll("[data-db-table]").forEach(btn=>{btn.addEventListener("click",()=>{activeDbTable=btn.dataset.dbTable;content.innerHTML=renderDatabase(lastSnapshot);bindDbTabs();});});}
+    function bindDbTabs(){
+      content.querySelectorAll("[data-db-product]").forEach(btn=>{
+        btn.addEventListener("click",()=>{
+          activeDbProduct=btn.dataset.dbProduct||"";
+          activeDbTable="";
+          content.innerHTML=renderDatabase(lastSnapshot);
+          bindDbTabs();
+        });
+      });
+      content.querySelectorAll("[data-db-table]").forEach(btn=>{
+        btn.addEventListener("click",()=>{
+          activeDbTable=btn.dataset.dbTable||"";
+          content.innerHTML=renderDatabase(lastSnapshot);
+          bindDbTabs();
+        });
+      });
+    }
 
     function withToken(path){
       if(!adminToken)return path;
@@ -1191,14 +1288,16 @@ class AdminDashboardServer:
       }
       if(action==="delete-user"){
         const u=btn.dataset.username;
-        showModal("Delete User",`<p>Permanently delete user <strong>${esc(u)}</strong>?</p>`,()=>adminAction("delete-user",{username:u}));
+        const product=btn.dataset.product||activeDbProduct||"";
+        showModal("Delete User",`<p>Permanently delete user <strong>${esc(u)}</strong>${product?` from <strong>${esc(product)}</strong>`:""}?</p>`,()=>adminAction("delete-user",{product,username:u}));
       }
       if(action==="reset-pw"){
         const u=btn.dataset.username;
-        showModal("Reset Password",`<p>Reset password for <strong>${esc(u)}</strong>:</p><input type="password" id="new-pw" placeholder="New password">`,()=>{
+        const product=btn.dataset.product||activeDbProduct||"";
+        showModal("Reset Password",`<p>Reset password for <strong>${esc(u)}</strong>${product?` in <strong>${esc(product)}</strong>`:""}:</p><input type="password" id="new-pw" placeholder="New password">`,()=>{
           const pw=(document.getElementById("new-pw")||{}).value||"";
           if(!pw){showToast("Enter a password","error");return;}
-          adminAction("reset-password",{username:u,new_password:pw});
+          adminAction("reset-password",{product,username:u,new_password:pw});
         });
       }
     });
@@ -1335,14 +1434,19 @@ class AdminDashboardServer:
                 username = str(body.get("username", "")).strip()
                 if not username:
                     return {"ok": False, "error": "username required"}
-                db_path = Path(self.db_path).resolve()
+                product = str(body.get("product", "")).strip()
+                db_path = self._resolve_db_path(product)
                 if not db_path.exists():
                     return {"ok": False, "error": "database not found"}
                 conn = sqlite3.connect(str(db_path))
                 try:
                     cur = conn.execute("DELETE FROM users WHERE username=?", (username,))
                     conn.commit()
-                    return {"ok": cur.rowcount > 0, "error": "" if cur.rowcount > 0 else "user not found"}
+                    return {
+                        "ok": cur.rowcount > 0,
+                        "error": "" if cur.rowcount > 0 else "user not found",
+                        "product": product or self.default_db_product,
+                    }
                 finally:
                     conn.close()
 
@@ -1351,7 +1455,8 @@ class AdminDashboardServer:
                 new_password = str(body.get("new_password", ""))
                 if not username or not new_password:
                     return {"ok": False, "error": "username and new_password required"}
-                db_path = Path(self.db_path).resolve()
+                product = str(body.get("product", "")).strip()
+                db_path = self._resolve_db_path(product)
                 if not db_path.exists():
                     return {"ok": False, "error": "database not found"}
                 password_hash = hashlib.sha256(new_password.encode("utf-8")).hexdigest()
@@ -1359,7 +1464,11 @@ class AdminDashboardServer:
                 try:
                     cur = conn.execute("UPDATE users SET password_hash=? WHERE username=?", (password_hash, username))
                     conn.commit()
-                    return {"ok": cur.rowcount > 0, "error": "" if cur.rowcount > 0 else "user not found"}
+                    return {
+                        "ok": cur.rowcount > 0,
+                        "error": "" if cur.rowcount > 0 else "user not found",
+                        "product": product or self.default_db_product,
+                    }
                 finally:
                     conn.close()
 

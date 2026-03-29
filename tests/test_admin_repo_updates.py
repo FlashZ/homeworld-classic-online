@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
+import sqlite3
 import struct
 
 import titan_binary_gateway
@@ -129,6 +131,35 @@ class _FakeRepoMonitor:
         }
 
 
+def _init_user_db(path: Path, username: str, password: str) -> None:
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE users (
+              username TEXT PRIMARY KEY,
+              password_hash TEXT NOT NULL,
+              created_at REAL NOT NULL,
+              native_cd_key TEXT,
+              native_login_key TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO users(username,password_hash,created_at,native_cd_key,native_login_key) VALUES(?,?,?,?,?)",
+            (
+                username,
+                hashlib.sha256(password.encode("utf-8")).hexdigest(),
+                0.0,
+                "",
+                "",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_admin_snapshot_includes_repo_metadata() -> None:
     repo = _FakeRepoMonitor()
     dashboard = titan_binary_gateway.AdminDashboardServer(
@@ -143,6 +174,33 @@ def test_admin_snapshot_includes_repo_metadata() -> None:
     assert snapshot["repo"]["local_version"] == "installer-v1"
     assert snapshot["repo"]["remote_version"] == "installer-v2"
     assert snapshot["repo"]["update_available"] is True
+
+
+def test_admin_snapshot_includes_product_scoped_databases(tmp_path: Path) -> None:
+    hw_db = tmp_path / "homeworld.db"
+    cata_db = tmp_path / "cataclysm.db"
+    _init_user_db(hw_db, "alpha", "pw1")
+    _init_user_db(cata_db, "zero", "pw2")
+
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=_FakeGateway(),
+        db_path=str(hw_db),
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        db_paths={
+            "homeworld": str(hw_db),
+            "cataclysm": str(cata_db),
+        },
+        default_db_product="homeworld",
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    snapshot = dashboard.snapshot(rows_per_table=5, log_limit=1, activity_limit=1)
+
+    assert snapshot["db_default_product"] == "homeworld"
+    assert set(snapshot["dbs"]) == {"homeworld", "cataclysm"}
+    assert snapshot["db"]["path"] == str(hw_db.resolve())
+    assert snapshot["dbs"]["homeworld"]["tables"]["users"]["count"] == 1
+    assert snapshot["dbs"]["cataclysm"]["tables"]["users"]["rows"][0]["username"] == "zero"
 
 
 def test_admin_repo_check_endpoint_uses_repo_monitor() -> None:
@@ -205,6 +263,83 @@ def test_admin_broadcast_endpoint_records_activity() -> None:
     assert activity["text"] == "Server notice"
     assert activity["room_name"] == "Default"
     assert activity["details"] == {"delivered": 2, "scope": "room :15100"}
+
+
+def test_admin_account_actions_target_selected_product_db(tmp_path: Path) -> None:
+    hw_db = tmp_path / "homeworld.db"
+    cata_db = tmp_path / "cataclysm.db"
+    _init_user_db(hw_db, "shared_user", "homeworld-old")
+    _init_user_db(cata_db, "shared_user", "cataclysm-old")
+
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=_FakeGateway(),
+        db_path=str(hw_db),
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        db_paths={
+            "homeworld": str(hw_db),
+            "cataclysm": str(cata_db),
+        },
+        default_db_product="homeworld",
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    reset_result = asyncio.run(
+        dashboard._handle_admin_post(
+            "/api/admin/reset-password",
+            {
+                "product": "cataclysm",
+                "username": "shared_user",
+                "new_password": "cataclysm-new",
+            },
+        )
+    )
+    assert reset_result["ok"] is True
+    assert reset_result["product"] == "cataclysm"
+
+    hw_conn = sqlite3.connect(str(hw_db))
+    cata_conn = sqlite3.connect(str(cata_db))
+    try:
+        hw_hash = hw_conn.execute(
+            "SELECT password_hash FROM users WHERE username=?",
+            ("shared_user",),
+        ).fetchone()[0]
+        cata_hash = cata_conn.execute(
+            "SELECT password_hash FROM users WHERE username=?",
+            ("shared_user",),
+        ).fetchone()[0]
+    finally:
+        hw_conn.close()
+        cata_conn.close()
+
+    assert hw_hash == hashlib.sha256("homeworld-old".encode("utf-8")).hexdigest()
+    assert cata_hash == hashlib.sha256("cataclysm-new".encode("utf-8")).hexdigest()
+
+    delete_result = asyncio.run(
+        dashboard._handle_admin_post(
+            "/api/admin/delete-user",
+            {
+                "product": "homeworld",
+                "username": "shared_user",
+            },
+        )
+    )
+    assert delete_result["ok"] is True
+    assert delete_result["product"] == "homeworld"
+
+    hw_conn = sqlite3.connect(str(hw_db))
+    cata_conn = sqlite3.connect(str(cata_db))
+    try:
+        assert hw_conn.execute(
+            "SELECT COUNT(*) FROM users WHERE username=?",
+            ("shared_user",),
+        ).fetchone()[0] == 0
+        assert cata_conn.execute(
+            "SELECT COUNT(*) FROM users WHERE username=?",
+            ("shared_user",),
+        ).fetchone()[0] == 1
+    finally:
+        hw_conn.close()
+        cata_conn.close()
 
 
 def test_admin_broadcast_chat_uses_visible_room_chat_sender() -> None:
