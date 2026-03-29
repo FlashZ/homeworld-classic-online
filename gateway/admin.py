@@ -1138,12 +1138,12 @@ class AdminDashboardServer:
         ${productKeys.length>1?`<div class="db-tabs">${productKeys.map(product=>`<button class="db-tab${product===activeDbProduct?" active":""}" data-db-product="${esc(product)}">${esc(snapshotProductInfo(snapshot,product).community_name||product)}</button>`).join("")}</div>`:""}
         <div class="db-tabs">${tables.map(([name,info])=>`<button class="db-tab${name===activeDbTable?" active":""}" data-db-table="${esc(name)}">${esc(name)} <span class="muted">(${info.count})</span></button>`).join("")}</div>
         ${rows.length?`<div class="table-wrap"><table>
-          <thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}${isUsersTable?'<th style="width:140px">Actions</th>':""}</tr></thead>
+          <thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}${isUsersTable?'<th style="width:220px">Actions</th>':""}</tr></thead>
           <tbody>${rows.map(r=>`<tr>${cols.map(c=>{
             const v=r[c];
             if(v&&typeof v==="object")return '<td class="mono">'+esc(JSON.stringify(v))+"</td>";
             return "<td>"+esc(v)+"</td>";
-          }).join("")}${isUsersTable?`<td><button class="btn btn-sm" data-action="reset-pw" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Reset PW</button> <button class="btn btn-danger btn-sm" data-action="delete-user" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Delete</button></td>`:""}</tr>`).join("")}</tbody>
+          }).join("")}${isUsersTable?`<td><button class="btn btn-sm" data-action="reset-pw" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Reset PW</button> <button class="btn btn-sm" data-action="clear-cd-key" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Clear CD Key</button> <button class="btn btn-danger btn-sm" data-action="delete-user" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Delete</button></td>`:""}</tr>`).join("")}</tbody>
         </table></div>`:'<p class="muted">Table is empty.</p>'}
       </div>`;
     }
@@ -1299,6 +1299,11 @@ class AdminDashboardServer:
           if(!pw){showToast("Enter a password","error");return;}
           adminAction("reset-password",{product,username:u,new_password:pw});
         });
+      }
+      if(action==="clear-cd-key"){
+        const u=btn.dataset.username;
+        const product=btn.dataset.product||activeDbProduct||"";
+        showModal("Clear CD Key",`<p>Clear the native CD key and login key binding for <strong>${esc(u)}</strong>${product?` in <strong>${esc(product)}</strong>`:""}?</p><p class="muted">This lets the next retail login bind a fresh key for that account.</p>`,()=>adminAction("clear-cd-key",{product,username:u}));
       }
     });
 
@@ -1463,6 +1468,29 @@ class AdminDashboardServer:
                 conn = sqlite3.connect(str(db_path))
                 try:
                     cur = conn.execute("UPDATE users SET password_hash=? WHERE username=?", (password_hash, username))
+                    conn.commit()
+                    return {
+                        "ok": cur.rowcount > 0,
+                        "error": "" if cur.rowcount > 0 else "user not found",
+                        "product": product or self.default_db_product,
+                    }
+                finally:
+                    conn.close()
+
+            if path == "/api/admin/clear-cd-key":
+                username = str(body.get("username", "")).strip()
+                if not username:
+                    return {"ok": False, "error": "username required"}
+                product = str(body.get("product", "")).strip()
+                db_path = self._resolve_db_path(product)
+                if not db_path.exists():
+                    return {"ok": False, "error": "database not found"}
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    cur = conn.execute(
+                        "UPDATE users SET native_cd_key='', native_login_key='' WHERE username=?",
+                        (username,),
+                    )
                     conn.commit()
                     return {
                         "ok": cur.rowcount > 0,

@@ -131,7 +131,14 @@ class _FakeRepoMonitor:
         }
 
 
-def _init_user_db(path: Path, username: str, password: str) -> None:
+def _init_user_db(
+    path: Path,
+    username: str,
+    password: str,
+    *,
+    native_cd_key: str = "",
+    native_login_key: str = "",
+) -> None:
     conn = sqlite3.connect(str(path))
     try:
         conn.execute(
@@ -151,8 +158,8 @@ def _init_user_db(path: Path, username: str, password: str) -> None:
                 username,
                 hashlib.sha256(password.encode("utf-8")).hexdigest(),
                 0.0,
-                "",
-                "",
+                native_cd_key,
+                native_login_key,
             ),
         )
         conn.commit()
@@ -340,6 +347,82 @@ def test_admin_account_actions_target_selected_product_db(tmp_path: Path) -> Non
     finally:
         hw_conn.close()
         cata_conn.close()
+
+
+def test_admin_clear_cd_key_targets_selected_product_db(tmp_path: Path) -> None:
+    hw_db = tmp_path / "homeworld.db"
+    cata_db = tmp_path / "cataclysm.db"
+    _init_user_db(
+        hw_db,
+        "shared_user",
+        "homeworld-old",
+        native_cd_key="HW-KEEP",
+        native_login_key="hw-login",
+    )
+    _init_user_db(
+        cata_db,
+        "shared_user",
+        "cataclysm-old",
+        native_cd_key="CATA-CLEAR",
+        native_login_key="cata-login",
+    )
+
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=_FakeGateway(),
+        db_path=str(hw_db),
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        db_paths={
+            "homeworld": str(hw_db),
+            "cataclysm": str(cata_db),
+        },
+        default_db_product="homeworld",
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    result = asyncio.run(
+        dashboard._handle_admin_post(
+            "/api/admin/clear-cd-key",
+            {
+                "product": "cataclysm",
+                "username": "shared_user",
+            },
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["product"] == "cataclysm"
+
+    hw_conn = sqlite3.connect(str(hw_db))
+    cata_conn = sqlite3.connect(str(cata_db))
+    try:
+        hw_keys = hw_conn.execute(
+            "SELECT native_cd_key, native_login_key FROM users WHERE username=?",
+            ("shared_user",),
+        ).fetchone()
+        cata_keys = cata_conn.execute(
+            "SELECT native_cd_key, native_login_key FROM users WHERE username=?",
+            ("shared_user",),
+        ).fetchone()
+    finally:
+        hw_conn.close()
+        cata_conn.close()
+
+    assert hw_keys == ("HW-KEEP", "hw-login")
+    assert cata_keys == ("", "")
+
+
+def test_admin_html_contains_clear_cd_key_action() -> None:
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=_FakeGateway(),
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    html = dashboard._html("")
+
+    assert 'data-action="clear-cd-key"' in html
+    assert "Clear CD Key" in html
 
 
 def test_admin_broadcast_chat_uses_visible_room_chat_sender() -> None:

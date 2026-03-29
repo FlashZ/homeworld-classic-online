@@ -366,13 +366,14 @@ internal static class HWClientSetup
         }
 
         ExistingInstallState existingState = DetectExistingInstallState(gameDirectory);
-        bool defaultWriteRegistryKeys = options.WriteRegistryKeys ?? !existingState.HasAnyRegistryCdKey;
+        bool shouldRefreshInstallerOwnedKey = existingState.HasAnyRegistryCdKey && existingState.RegistryOwnedByInstaller;
+        bool defaultWriteRegistryKeys = options.WriteRegistryKeys ?? (!existingState.HasAnyRegistryCdKey || shouldRefreshInstallerOwnedKey);
 
         // Generate a unique random key by default so users don't all share the
         // same hardcoded key.  The known-good default is only used as a self-test
         // for the keygen (validated inside GetDefaultRegistryCdKey).
         GetDefaultRegistryCdKey(); // self-test only
-        RegistryCdKeyOption initialCdKey = PickRandomRegistryCdKey(null);
+        RegistryCdKeyOption initialCdKey = PickRandomRegistryCdKey(existingState.SierraCdKeyDisplay);
 
         InstallChoices installChoices = string.IsNullOrWhiteSpace(options.ServerHost)
             ? PromptForInstallChoices(CurrentGame.DefaultServerHost, defaultWriteRegistryKeys, initialCdKey, existingState)
@@ -1242,7 +1243,14 @@ internal static class HWClientSetup
         if (existingState.HasAnyRegistryCdKey)
         {
             summary.AppendLine();
-            summary.Append("An existing CD key was detected and will be preserved unless you opt in below.");
+            if (existingState.RegistryOwnedByInstaller)
+            {
+                summary.Append("An installer-managed CD key was detected and will be refreshed with a new random key by default.");
+            }
+            else
+            {
+                summary.Append("An existing CD key was detected and will be preserved unless you opt in below.");
+            }
         }
 
         return summary.ToString();
@@ -1254,6 +1262,10 @@ internal static class HWClientSetup
         {
             if (existingState.HasAnyRegistryCdKey)
             {
+                if (existingState.RegistryOwnedByInstaller)
+                {
+                    return "Existing installer-managed " + CurrentGame.DisplayName + " registry key values were detected. Leave this off to keep the current installer key instead of refreshing it.";
+                }
                 return "Existing " + CurrentGame.DisplayName + " registry key values were detected. Leave this off to preserve them.";
             }
 
@@ -1262,6 +1274,10 @@ internal static class HWClientSetup
 
         if (existingState.HasAnyRegistryCdKey)
         {
+            if (existingState.RegistryOwnedByInstaller)
+            {
+                return "Existing installer-managed " + CurrentGame.DisplayName + " registry key values were detected. Keeping this enabled will refresh them to " + selectedCdKey.DisplayCdKey + ".";
+            }
             return "Existing " + CurrentGame.DisplayName + " registry key values were detected. Keeping this enabled will overwrite them with " + selectedCdKey.DisplayCdKey + ".";
         }
 
@@ -1547,7 +1563,7 @@ internal static class HWClientSetup
                     return;
                 }
 
-                if (registryCheckBox.Checked && existingState.HasAnyRegistryCdKey)
+                if (registryCheckBox.Checked && existingState.HasAnyRegistryCdKey && !existingState.RegistryOwnedByInstaller)
                 {
                     DialogResult overwriteResult = MessageBox.Show(
                         form,
