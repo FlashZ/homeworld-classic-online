@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app/won_oss_server
 
 COPY requirements-server.txt /tmp/requirements-server.txt
+RUN apk add --no-cache git
 RUN pip install --no-cache-dir -r /tmp/requirements-server.txt
 
 COPY . /app/won_oss_server

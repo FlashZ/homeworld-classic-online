@@ -59,6 +59,8 @@ services:
       - "${ADMIN_PORT:-8080}"
       - --admin-token
       - "${ADMIN_TOKEN:?set ADMIN_TOKEN in .env for the Docker-published dashboard}"
+      - --stats-token
+      - "${STATS_TOKEN:-}"
       - --db-path
       - /data/won_server.db
       - --keys-dir
