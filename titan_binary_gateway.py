@@ -34,6 +34,7 @@ import secrets
 import socket as _socket
 import sqlite3
 import struct
+import subprocess
 import time
 import unicodedata
 from urllib.parse import parse_qs, urlsplit
@@ -98,6 +99,263 @@ class DashboardLogHandler(logging.Handler):
 
 
 DASHBOARD_LOG_HANDLER = DashboardLogHandler()
+
+REPO_CHECK_INTERVAL_SECONDS = 900
+
+
+class GitRepoMonitor:
+    """Cache local/upstream git state for the admin dashboard."""
+
+    def __init__(
+        self,
+        repo_path: str,
+        remote_name: str = "origin",
+        check_interval_s: int = REPO_CHECK_INTERVAL_SECONDS,
+    ) -> None:
+        self.repo_path = Path(repo_path).resolve()
+        self.remote_name = str(remote_name or "origin").strip() or "origin"
+        self.check_interval_s = max(60, int(check_interval_s or REPO_CHECK_INTERVAL_SECONDS))
+        self._lock = asyncio.Lock()
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._startup_task: Optional[asyncio.Task] = None
+        self._last_update_at = 0.0
+        self._last_update_message = ""
+        self._restart_required = False
+        self._snapshot_cache = self._finalize_snapshot(
+            {
+                "available": False,
+                "repo_path": str(self.repo_path),
+                "remote_name": self.remote_name,
+                "remote_url": "",
+                "branch": "",
+                "upstream": "",
+                "local_commit": "",
+                "local_short": "",
+                "local_version": "",
+                "remote_commit": "",
+                "remote_short": "",
+                "remote_version": "",
+                "ahead": 0,
+                "behind": 0,
+                "dirty": False,
+                "can_update": False,
+                "update_available": False,
+                "status": "pending",
+                "last_checked_at": 0.0,
+                "last_error": "",
+            }
+        )
+
+    def _finalize_snapshot(self, snapshot: Dict[str, object]) -> Dict[str, object]:
+        snapshot["check_interval_seconds"] = self.check_interval_s
+        snapshot["last_update_at"] = float(self._last_update_at)
+        snapshot["last_update_message"] = self._last_update_message
+        snapshot["restart_required"] = bool(self._restart_required)
+        return snapshot
+
+    def snapshot(self) -> Dict[str, object]:
+        return dict(self._snapshot_cache)
+
+    def start_background_tasks(self) -> None:
+        if self._startup_task is None or self._startup_task.done():
+            self._startup_task = asyncio.create_task(self.force_refresh())
+        if self._refresh_task is None:
+            self._refresh_task = asyncio.create_task(self._refresh_loop())
+
+    async def stop_background_tasks(self) -> None:
+        tasks = [self._startup_task, self._refresh_task]
+        self._startup_task = None
+        self._refresh_task = None
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _refresh_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.check_interval_s)
+                try:
+                    await self.force_refresh()
+                except Exception as exc:
+                    LOGGER.warning("Dashboard(repo): background refresh failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+
+    def _run_git(self, *args: str, timeout: float = 20.0) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        return subprocess.run(
+            ["git", *args],
+            cwd=str(self.repo_path),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+
+    def _git_text(self, *args: str, timeout: float = 20.0) -> str:
+        result = self._run_git(*args, timeout=timeout)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git {' '.join(args)} failed")
+        return result.stdout.strip()
+
+    def _collect_snapshot_sync(self, fetch_remote: bool = True) -> Dict[str, object]:
+        snapshot: Dict[str, object] = {
+            "available": False,
+            "repo_path": str(self.repo_path),
+            "remote_name": self.remote_name,
+            "remote_url": "",
+            "branch": "",
+            "upstream": "",
+            "local_commit": "",
+            "local_short": "",
+            "local_version": "",
+            "remote_commit": "",
+            "remote_short": "",
+            "remote_version": "",
+            "ahead": 0,
+            "behind": 0,
+            "dirty": False,
+            "can_update": False,
+            "update_available": False,
+            "status": "unavailable",
+            "last_checked_at": time.time(),
+            "last_error": "",
+        }
+        try:
+            inside = self._git_text("rev-parse", "--is-inside-work-tree")
+            if inside.lower() != "true":
+                snapshot["last_error"] = "not a git work tree"
+                return self._finalize_snapshot(snapshot)
+
+            snapshot["available"] = True
+            snapshot["status"] = "up_to_date"
+            snapshot["repo_path"] = self._git_text("rev-parse", "--show-toplevel")
+            snapshot["branch"] = self._git_text("rev-parse", "--abbrev-ref", "HEAD")
+            snapshot["local_commit"] = self._git_text("rev-parse", "HEAD")
+            snapshot["local_short"] = str(snapshot["local_commit"])[:12]
+            with contextlib.suppress(Exception):
+                snapshot["local_version"] = self._git_text("describe", "--tags", "--always", "--dirty")
+            with contextlib.suppress(Exception):
+                snapshot["remote_url"] = self._git_text("remote", "get-url", self.remote_name)
+
+            status_lines = self._git_text("status", "--porcelain").splitlines()
+            snapshot["dirty"] = bool(status_lines)
+
+            fetch_error = ""
+            if fetch_remote and snapshot["remote_url"]:
+                fetch = self._run_git("fetch", "--quiet", "--tags", self.remote_name, timeout=60.0)
+                if fetch.returncode != 0:
+                    fetch_error = fetch.stderr.strip() or fetch.stdout.strip() or "git fetch failed"
+
+            upstream = self._run_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+            if upstream.returncode == 0:
+                upstream_ref = upstream.stdout.strip()
+                snapshot["upstream"] = upstream_ref
+                with contextlib.suppress(Exception):
+                    snapshot["remote_commit"] = self._git_text("rev-parse", "@{u}")
+                snapshot["remote_short"] = str(snapshot["remote_commit"])[:12] if snapshot["remote_commit"] else ""
+                with contextlib.suppress(Exception):
+                    snapshot["remote_version"] = self._git_text("describe", "--tags", "--always", "@{u}")
+                counts = self._git_text("rev-list", "--left-right", "--count", "HEAD...@{u}")
+                ahead_str, behind_str = (counts.split() + ["0", "0"])[:2]
+                snapshot["ahead"] = int(ahead_str or "0")
+                snapshot["behind"] = int(behind_str or "0")
+                snapshot["update_available"] = int(snapshot["behind"]) > 0 and int(snapshot["ahead"]) == 0
+                if int(snapshot["ahead"]) > 0 and int(snapshot["behind"]) > 0:
+                    snapshot["status"] = "diverged"
+                elif int(snapshot["behind"]) > 0:
+                    snapshot["status"] = "update_available"
+                elif int(snapshot["ahead"]) > 0:
+                    snapshot["status"] = "ahead"
+                else:
+                    snapshot["status"] = "up_to_date"
+            else:
+                snapshot["status"] = "no_upstream"
+
+            snapshot["can_update"] = bool(
+                snapshot["available"]
+                and snapshot["upstream"]
+                and not snapshot["dirty"]
+                and int(snapshot["behind"]) > 0
+                and int(snapshot["ahead"]) == 0
+            )
+            if fetch_error:
+                snapshot["last_error"] = fetch_error
+        except FileNotFoundError:
+            snapshot["last_error"] = "git is not installed in this environment"
+        except subprocess.TimeoutExpired:
+            snapshot["last_error"] = "git command timed out"
+            snapshot["status"] = "error"
+        except Exception as exc:
+            snapshot["last_error"] = str(exc)
+            snapshot["status"] = "error"
+        return self._finalize_snapshot(snapshot)
+
+    async def force_refresh(self, fetch_remote: bool = True) -> Dict[str, object]:
+        async with self._lock:
+            snapshot = await asyncio.to_thread(self._collect_snapshot_sync, fetch_remote)
+            self._snapshot_cache = snapshot
+            return dict(snapshot)
+
+    async def update_from_upstream(self) -> Dict[str, object]:
+        async with self._lock:
+            result = await asyncio.to_thread(self._update_from_upstream_sync)
+            self._snapshot_cache = dict(result.get("git") or self._snapshot_cache)
+            return result
+
+    def _update_from_upstream_sync(self) -> Dict[str, object]:
+        before = self._collect_snapshot_sync(fetch_remote=True)
+        if not before.get("available"):
+            return {"ok": False, "error": before.get("last_error") or "git repo unavailable", "git": before}
+        if before.get("last_error"):
+            return {"ok": False, "error": before["last_error"], "git": before}
+        if not before.get("upstream"):
+            return {"ok": False, "error": "no upstream branch configured", "git": before}
+        if before.get("dirty"):
+            return {"ok": False, "error": "working tree has local changes", "git": before}
+        if int(before.get("ahead") or 0) > 0 and int(before.get("behind") or 0) > 0:
+            return {"ok": False, "error": "branch has diverged from upstream", "git": before}
+        if int(before.get("ahead") or 0) > 0:
+            return {"ok": False, "error": "local branch is ahead of upstream", "git": before}
+        if int(before.get("behind") or 0) <= 0:
+            return {"ok": True, "updated": False, "message": "Already up to date.", "git": before}
+
+        old_commit = str(before.get("local_commit") or "")
+        old_label = str(before.get("local_version") or before.get("local_short") or old_commit[:12])
+        merge = self._run_git("merge", "--ff-only", str(before["upstream"]), timeout=60.0)
+        if merge.returncode != 0:
+            after_fail = self._collect_snapshot_sync(fetch_remote=False)
+            error = merge.stderr.strip() or merge.stdout.strip() or "git merge --ff-only failed"
+            after_fail["last_error"] = error
+            after_fail = self._finalize_snapshot(after_fail)
+            return {"ok": False, "error": error, "git": after_fail}
+
+        self._last_update_at = time.time()
+        self._restart_required = True
+
+        after = self._collect_snapshot_sync(fetch_remote=False)
+        new_commit = str(after.get("local_commit") or "")
+        new_label = str(after.get("local_version") or after.get("local_short") or new_commit[:12])
+        diff = self._run_git("diff", "--name-only", f"{old_commit}..{new_commit}", timeout=20.0)
+        changed_files = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
+        self._last_update_message = (
+            f"Updated from {old_label} to {new_label}. Restart the gateway to load the new code."
+        )
+        after = self._finalize_snapshot(after)
+        return {
+            "ok": True,
+            "updated": old_commit != new_commit,
+            "message": self._last_update_message,
+            "changed_files": changed_files,
+            "git": after,
+        }
 
 from won_oss_server.titan_messages import (
     STATUS_FAIL,
@@ -3462,12 +3720,22 @@ class AdminDashboardServer:
         db_path: str,
         log_handler: DashboardLogHandler,
         admin_token: str = "",
+        stats_token: str = "",
+        repo_monitor: Optional[GitRepoMonitor] = None,
     ) -> None:
         self.gateway = gateway
         self.db_path = db_path
         self.log_handler = log_handler
         self.admin_token = admin_token.strip()
+        self.stats_token = stats_token.strip()
+        self.repo_monitor = repo_monitor or GitRepoMonitor(str(Path(__file__).resolve().parent))
         self.started_at = time.time()
+
+    def start_background_tasks(self) -> None:
+        self.repo_monitor.start_background_tasks()
+
+    async def stop_background_tasks(self) -> None:
+        await self.repo_monitor.stop_background_tasks()
 
     @staticmethod
     def _parse_headers(request_text: str) -> Dict[str, str]:
@@ -3479,21 +3747,58 @@ class AdminDashboardServer:
             headers[name.strip().lower()] = value.strip()
         return headers
 
-    def _is_authorized(self, query: Dict[str, list[str]], headers: Dict[str, str]) -> bool:
-        if not self.admin_token:
+    @staticmethod
+    def _matches_token(
+        required_token: str,
+        query: Dict[str, list[str]],
+        headers: Dict[str, str],
+        header_names: Tuple[str, ...] = (),
+    ) -> bool:
+        if not required_token:
             return True
         query_token = str(query.get("token", [""])[0] or "")
-        if query_token and secrets.compare_digest(query_token, self.admin_token):
+        if query_token and secrets.compare_digest(query_token, required_token):
             return True
-        header_token = str(headers.get("x-admin-token", "") or "")
-        if header_token and secrets.compare_digest(header_token, self.admin_token):
-            return True
+        for header_name in header_names:
+            header_token = str(headers.get(header_name, "") or "")
+            if header_token and secrets.compare_digest(header_token, required_token):
+                return True
         auth_header = str(headers.get("authorization", "") or "")
         if auth_header.lower().startswith("bearer "):
             bearer_token = auth_header[7:].strip()
-            if bearer_token and secrets.compare_digest(bearer_token, self.admin_token):
+            if bearer_token and secrets.compare_digest(bearer_token, required_token):
                 return True
         return False
+
+    def _is_authorized(
+        self,
+        path: str,
+        query: Dict[str, list[str]],
+        headers: Dict[str, str],
+    ) -> bool:
+        if path == "/api/stats":
+            if self.stats_token and self._matches_token(
+                self.stats_token,
+                query,
+                headers,
+                header_names=("x-stats-token",),
+            ):
+                return True
+            if self.admin_token and self._matches_token(
+                self.admin_token,
+                query,
+                headers,
+                header_names=("x-admin-token",),
+            ):
+                return True
+            return not self.stats_token and not self.admin_token
+
+        return self._matches_token(
+            self.admin_token,
+            query,
+            headers,
+            header_names=("x-admin-token",),
+        )
 
     @staticmethod
     def _coerce_db_value(value: object) -> object:
@@ -3566,6 +3871,7 @@ class AdminDashboardServer:
             "generated_at": time.time(),
             "uptime_seconds": int(time.time() - self.started_at),
             "gateway": self.gateway.dashboard_snapshot(activity_limit=max(1, activity_limit)),
+            "repo": self.repo_monitor.snapshot(),
             "db": self._db_snapshot(rows_per_table=max(1, rows_per_table)),
             "logs": self.log_handler.snapshot(limit=max(1, log_limit)),
         }
@@ -3718,6 +4024,7 @@ class AdminDashboardServer:
     const adminToken = __ADMIN_TOKEN__;
     let activePage = "overview";
     let pauseRefresh = false;
+    let pauseRefreshUntil = 0;
     let lastSnapshot = null;
     let activeDbTable = "";
 
@@ -3740,6 +4047,18 @@ class AdminDashboardServer:
     function hwMarkup(v){const s=String(v??"");let o="";for(let i=0;i<s.length;i++){if(s[i]==="&"&&i+1<s.length){i++;o+=`<strong class="hw-strong">${esc(s[i])}</strong>`;}else{o+=esc(s[i]);}}return o;}
     function nameList(vs){return(vs||[]).map(v=>hwMarkup(v)).join(", ");}
     function kindBadge(k){const m={join:"badge-join",leave:"badge-leave",chat:"badge-chat"};return `<span class="badge ${m[k]||"badge-default"}">${esc(k)}</span>`;}
+    function pauseAutoRefresh(ms=6000){pauseRefreshUntil=Math.max(pauseRefreshUntil,Date.now()+ms);}
+    function repoSummary(repo){
+      if(!repo||!repo.available)return '<span class="muted">Git metadata unavailable.</span>';
+      let label="Up to date",color="var(--success)";
+      if(repo.last_error){label="Check failed";color="var(--danger)";}
+      else if(repo.status==="diverged"){label="Diverged";color="var(--danger)";}
+      else if(repo.status==="ahead"){label="Local ahead";color="var(--warning)";}
+      else if(repo.status==="no_upstream"){label="No upstream";color="var(--warning)";}
+      else if(repo.update_available){label="Update available";color="var(--warning)";}
+      const dirty=repo.dirty?` <span class="pill">dirty</span>`:"";
+      return `<span style="color:${color};font-weight:600;">${esc(label)}</span>${dirty}`;
+    }
 
     function renderNav(snapshot){
       const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const act=gw.activity||[];const logs=snapshot.logs||[];
@@ -3754,7 +4073,9 @@ class AdminDashboardServer:
     function renderSidebarFooter(snapshot){
       const up=snapshot.uptime_seconds||0;
       const gw=snapshot.gateway||{};
-      sidebarFooter.innerHTML=`<span class="status-dot ok"></span> Online ${age(up)}<br>${esc(gw.version_str||"")} &middot; ${esc(gw.public_host||"")}`;
+      const repo=snapshot.repo||{};
+      const extra=repo.local_version?`<br>${esc(repo.local_version)}${repo.update_available?' &middot; update available':''}`:"";
+      sidebarFooter.innerHTML=`<span class="status-dot ok"></span> Online ${age(up)}<br>${esc(gw.version_str||"")} &middot; ${esc(gw.public_host||"")}${extra}`;
     }
 
     function renderTopbar(snapshot){
@@ -3764,7 +4085,7 @@ class AdminDashboardServer:
     }
 
     function renderOverview(snapshot){
-      const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const am=gw.activity_metrics||{};const db=snapshot.db||{};
+      const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const am=gw.activity_metrics||{};const db=snapshot.db||{};const repo=snapshot.repo||{};
       const banned=gw.banned_ips||[];
       return `
         <div class="stat-grid">
@@ -3803,6 +4124,27 @@ class AdminDashboardServer:
               <div class="k">Non-empty</div><div class="v">${esc(db.nonempty_table_count||0)}</div>
               <div class="k">Total Rows</div><div class="v">${esc(db.total_rows||0)}</div>
             </div>
+          </div>
+          <div class="card">
+            <h2>GitHub Updates</h2>
+            <div class="action-bar">
+              <button class="btn" data-action="github-check">Check GitHub</button>
+              <button class="btn ${repo.can_update?'btn-accent':''}" data-action="github-update">Update From GitHub</button>
+            </div>
+            <div class="kv">
+              <div class="k">Status</div><div class="v">${repoSummary(repo)}</div>
+              <div class="k">Branch</div><div class="v">${esc(repo.branch||"")}</div>
+              <div class="k">Upstream</div><div class="v">${esc(repo.upstream||"")}</div>
+              <div class="k">Local Version</div><div class="v">${esc(repo.local_version||repo.local_short||"")}</div>
+              <div class="k">GitHub Version</div><div class="v">${esc(repo.remote_version||repo.remote_short||"")}</div>
+              <div class="k">Ahead / Behind</div><div class="v">${esc(repo.ahead||0)} / ${esc(repo.behind||0)}</div>
+              <div class="k">Last Checked</div><div class="v">${repo.last_checked_at?esc(new Date(repo.last_checked_at*1000).toLocaleString()):"Never"}</div>
+              <div class="k">Last Updated</div><div class="v">${repo.last_update_at?esc(new Date(repo.last_update_at*1000).toLocaleString()):"Never"}</div>
+              <div class="k">Remote</div><div class="v">${esc(repo.remote_url||"")}</div>
+            </div>
+            ${repo.last_error?`<p class="muted" style="margin-top:12px;color:var(--danger);">${esc(repo.last_error)}</p>`:""}
+            ${repo.last_update_message?`<p class="muted" style="margin-top:12px;">${esc(repo.last_update_message)}</p>`:""}
+            ${repo.restart_required?`<p class="muted" style="margin-top:8px;color:var(--warning);">Restart the gateway service to apply the updated code.</p>`:""}
           </div>
         </div>
         ${banned.length?`
@@ -3981,12 +4323,15 @@ class AdminDashboardServer:
     }
 
     async function adminAction(endpoint,payload){
+      pauseAutoRefresh(10000);
+      pauseRefresh=true;
       try{
         const res=await fetch(withToken(`/api/admin/${endpoint}`),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
         const data=await res.json();
-        if(data.ok){showToast("Action succeeded","success");}else{showToast(data.error||"Action failed","error");}
+        if(data.ok){showToast(data.message||"Action succeeded","success");}else{showToast(data.error||"Action failed","error");}
         await refresh();
       }catch(err){showToast("Request failed: "+err,"error");}
+      finally{pauseRefresh=false;pauseAutoRefresh(6000);}
     }
 
     function showToast(msg,type){
@@ -3999,6 +4344,7 @@ class AdminDashboardServer:
 
     function showModal(title,bodyHtml,onConfirm){
       pauseRefresh=true;
+      pauseAutoRefresh(15000);
       modalBox.innerHTML=`<h3>${esc(title)}</h3>${bodyHtml}<div class="modal-actions"><button class="btn" id="modal-cancel">Cancel</button><button class="btn btn-danger" id="modal-confirm">Confirm</button></div>`;
       modalOverlay.classList.add("show");
       document.getElementById("modal-cancel").addEventListener("click",closeModal);
@@ -4033,6 +4379,12 @@ class AdminDashboardServer:
         if(!msg.trim()){showToast("Enter a message","error");return;}
         adminAction("broadcast",{message:msg,room_port:roomPort?Number(roomPort):null});
       }
+      if(action==="github-check"){
+        adminAction("github-check",{});
+      }
+      if(action==="github-update"){
+        showModal("Update From GitHub","<p>Fetch the latest code from GitHub and fast-forward this checkout if possible? This refuses dirty or diverged branches, and you still need to restart the gateway afterwards.</p>",()=>adminAction("github-update",{}));
+      }
       if(action==="clear-activity"){
         showModal("Clear Activity","<p>Clear all activity logs and counters?</p>",()=>adminAction("clear-activity",{}));
       }
@@ -4059,9 +4411,14 @@ class AdminDashboardServer:
       renderAll(await res.json());
     }
 
+    ["pointerdown","keydown","focusin","mouseover"].forEach(evt=>{
+      content.addEventListener(evt,()=>pauseAutoRefresh(6000),true);
+      modalOverlay.addEventListener(evt,()=>pauseAutoRefresh(10000),true);
+    });
+
     async function loop(){
-      try{if(!pauseRefresh)await refresh();}catch(err){topbarMeta.textContent="Refresh failed: "+err;}
-      setTimeout(loop,3000);
+      try{if(!pauseRefresh&&Date.now()>=pauseRefreshUntil)await refresh();}catch(err){topbarMeta.textContent="Refresh failed: "+err;}
+      setTimeout(loop,8000);
     }
     loop();
   </script>
@@ -4106,7 +4463,12 @@ class AdminDashboardServer:
                 if self.gateway.routing_manager is None:
                     return {"ok": False, "error": "routing manager not available"}
                 delivered = await self.gateway.routing_manager.admin_broadcast(message, room_port)
-                return {"ok": True, "delivered": delivered}
+                scope = f"room :{room_port}" if room_port is not None else "all rooms"
+                return {
+                    "ok": True,
+                    "delivered": delivered,
+                    "message": f"Broadcast delivered to {delivered} client(s) in {scope}.",
+                }
 
             if path == "/api/admin/clear-activity":
                 self.gateway.clear_activity()
@@ -4115,6 +4477,25 @@ class AdminDashboardServer:
             if path == "/api/admin/clear-logs":
                 count = self.log_handler.clear()
                 return {"ok": True, "cleared": count}
+
+            if path == "/api/admin/github-check":
+                git_state = await self.repo_monitor.force_refresh(fetch_remote=True)
+                if git_state.get("last_error"):
+                    return {"ok": False, "error": git_state["last_error"], "git": git_state}
+                if git_state.get("update_available"):
+                    return {
+                        "ok": True,
+                        "message": "Update available from GitHub.",
+                        "git": git_state,
+                    }
+                return {
+                    "ok": True,
+                    "message": "GitHub check complete. Already up to date.",
+                    "git": git_state,
+                }
+
+            if path == "/api/admin/github-update":
+                return await self.repo_monitor.update_from_upstream()
 
             if path == "/api/admin/delete-user":
                 username = str(body.get("username", "")).strip()
@@ -4188,10 +4569,10 @@ class AdminDashboardServer:
 
         parsed = urlsplit(target)
         query = parse_qs(parsed.query)
-        if not self._is_authorized(query, headers):
+        if not self._is_authorized(parsed.path, query, headers):
             writer.write(
                 self._http_response(
-                    b"dashboard authentication required",
+                    b"authentication required",
                     "text/plain; charset=utf-8",
                     "401 Unauthorized",
                     extra_headers=["WWW-Authenticate: Bearer"],
@@ -4259,6 +4640,9 @@ class AdminDashboardServer:
                 ),
                 indent=2,
             ).encode("utf-8")
+            writer.write(self._http_response(body, "application/json; charset=utf-8"))
+        elif parsed.path == "/api/stats":
+            body = json.dumps(self.gateway.stats_snapshot(), indent=2).encode("utf-8")
             writer.write(self._http_response(body, "application/json; charset=utf-8"))
         elif parsed.path == "/":
             writer.write(
@@ -4725,6 +5109,122 @@ class BinaryGatewayServer:
         self._activity.clear()
         self._activity_counts.clear()
         self._ip_activity.clear()
+
+    def stats_snapshot(self) -> Dict[str, object]:
+        routing_snapshot = (
+            self.routing_manager.dashboard_snapshot()
+            if self.routing_manager is not None
+            else {}
+        )
+        if not isinstance(routing_snapshot, dict):
+            routing_snapshot = {}
+
+        rooms_raw = routing_snapshot.get("rooms", [])
+        servers_raw = routing_snapshot.get("servers", [])
+        players_raw = routing_snapshot.get("players", [])
+        games_raw = routing_snapshot.get("games", [])
+
+        room_has_games: Dict[int, bool] = {}
+        room_reconnect_counts: Dict[int, int] = {}
+        reconnecting_players: list[Dict[str, object]] = []
+
+        for room in rooms_raw:
+            if not isinstance(room, dict):
+                continue
+            port = int(room.get("listen_port") or 0)
+            room_has_games[port] = bool(room.get("game_count", 0) or room.get("games"))
+            pending_reconnects = room.get("pending_reconnects", []) or []
+            room_reconnect_counts[port] = len(pending_reconnects)
+            room_name = str(room.get("room_display_name") or room.get("room_name") or "")
+            for reservation in pending_reconnects:
+                if not isinstance(reservation, dict):
+                    continue
+                reconnecting_players.append(
+                    {
+                        "name": str(reservation.get("client_name") or ""),
+                        "client_id": int(reservation.get("client_id") or 0),
+                        "room_name": room_name,
+                        "room_port": port,
+                        "seconds_remaining": int(reservation.get("seconds_remaining") or 0),
+                        "last_activity_kind": str(reservation.get("last_activity_kind") or ""),
+                    }
+                )
+
+        players: list[Dict[str, object]] = []
+        for player in players_raw:
+            if not isinstance(player, dict):
+                continue
+            room_port = int(player.get("room_port") or 0)
+            players.append(
+                {
+                    "name": str(player.get("client_name") or ""),
+                    "client_id": int(player.get("client_id") or 0),
+                    "room_name": str(player.get("room_name") or ""),
+                    "room_port": room_port,
+                    # Retail routing does not expose a dedicated per-player presence
+                    # flag, so we infer "game" from whether the room has live games.
+                    "state": "game" if room_has_games.get(room_port, False) else "lobby",
+                    "connected_seconds": int(player.get("connected_seconds") or 0),
+                    "idle_seconds": int(player.get("idle_seconds") or 0),
+                    "last_activity_kind": str(player.get("last_activity_kind") or ""),
+                }
+            )
+
+        rooms: list[Dict[str, object]] = []
+        for room in servers_raw:
+            if not isinstance(room, dict):
+                continue
+            port = int(room.get("listen_port") or 0)
+            rooms.append(
+                {
+                    "name": str(room.get("room_name") or ""),
+                    "port": port,
+                    "description": str(room.get("room_description") or ""),
+                    "path": str(room.get("room_path") or ""),
+                    "published": bool(room.get("published", False)),
+                    "password_protected": bool(room.get("room_password_set", False)),
+                    "player_count": int(room.get("player_count") or 0),
+                    "game_count": int(room.get("game_count") or 0),
+                    "reconnecting_count": int(room_reconnect_counts.get(port, 0)),
+                }
+            )
+
+        games: list[Dict[str, object]] = []
+        for game in games_raw:
+            if not isinstance(game, dict):
+                continue
+            games.append(
+                {
+                    "name": str(game.get("name") or ""),
+                    "owner_name": str(game.get("owner_name") or ""),
+                    "room_name": str(game.get("room_name") or ""),
+                    "room_port": int(game.get("room_port") or 0),
+                    "data_len": int(game.get("data_len") or 0),
+                }
+            )
+
+        return {
+            "generated_at": time.time(),
+            "server": {
+                "public_host": self.public_host,
+                "public_port": self.public_port,
+                "routing_port": self.routing_port,
+                "version": self.version_str,
+                "valid_versions": list(self.valid_versions),
+            },
+            "counts": {
+                "players_online": len(players),
+                "rooms_open": len(rooms),
+                "rooms_published": sum(1 for room in rooms if room["published"]),
+                "games_live": len(games),
+                "unique_ips": int(routing_snapshot.get("current_unique_ip_count") or 0),
+                "players_reconnecting": len(reconnecting_players),
+            },
+            "players": players,
+            "reconnecting_players": reconnecting_players,
+            "rooms": rooms,
+            "games": games,
+        }
 
     def dashboard_snapshot(self, activity_limit: int = 150) -> Dict[str, object]:
         self._prune_ip_activity()
@@ -5232,12 +5732,14 @@ class BinaryGatewayServer:
         process_name = str(req["process_name"])
         game_name = "homeworld" if process_name == "RoutingServHWGame" else "chat"
         room_password = _extract_factory_password(str(req["cmd_line"]))
+        managed_locally = False
 
         if self.routing_manager is not None and process_name in {"RoutingServHWChat", "RoutingServHWGame"}:
             try:
                 selected_port = await self.routing_manager.allocate_server(
                     publish_in_directory=(process_name == "RoutingServHWChat")
                 )
+                managed_locally = True
                 routing_server = self.routing_manager._servers.get(selected_port)
                 if routing_server is not None and process_name == "RoutingServHWChat":
                     routing_server._room_password = room_password
@@ -5261,24 +5763,32 @@ class BinaryGatewayServer:
                     "max_processes": 4,
                 }
             )
-            backend = await self._call_backend(
-                {
-                    "action": "FACTORY_START_PROCESS",
-                    "factory_id": factory_id,
-                    "process_name": process_name,
-                    "game_name": game_name,
-                    "port": selected_port,
-                }
-            )
-            if backend.get("ok"):
-                server = backend.get("server", {})
-                if isinstance(server, dict):
-                    selected_port = int(server.get("port", selected_port))
-            else:
-                LOGGER.warning(
-                    "Factory(session): backend FACTORY_START_PROCESS failed: %s",
-                    backend.get("error", "unknown_error"),
+            if managed_locally:
+                LOGGER.info(
+                    "Factory(session): using local routing manager for %r on port=%d; "
+                    "skipping backend FACTORY_START_PROCESS",
+                    process_name,
+                    selected_port,
                 )
+            else:
+                backend = await self._call_backend(
+                    {
+                        "action": "FACTORY_START_PROCESS",
+                        "factory_id": factory_id,
+                        "process_name": process_name,
+                        "game_name": game_name,
+                        "port": selected_port,
+                    }
+                )
+                if backend.get("ok"):
+                    server = backend.get("server", {})
+                    if isinstance(server, dict):
+                        selected_port = int(server.get("port", selected_port))
+                else:
+                    LOGGER.warning(
+                        "Factory(session): backend FACTORY_START_PROCESS failed: %s",
+                        backend.get("error", "unknown_error"),
+                    )
         except Exception as exc:
             LOGGER.warning("Factory(session): backend start-process bridge failed: %s", exc)
 
@@ -5946,6 +6456,7 @@ async def main_async(args: argparse.Namespace) -> None:
         args.db_path,
         DASHBOARD_LOG_HANDLER,
         admin_token=args.admin_token,
+        stats_token=args.stats_token,
     )
     admin_server = None
     if args.admin_port > 0:
@@ -5954,6 +6465,7 @@ async def main_async(args: argparse.Namespace) -> None:
             args.admin_host,
             args.admin_port,
         )
+        admin_dashboard.start_background_tasks()
     srv.start_background_tasks()
 
     addrs = ", ".join(str(s.getsockname()) for s in (server.sockets or []))
@@ -5985,6 +6497,7 @@ async def main_async(args: argparse.Namespace) -> None:
                     firewall_server.serve_forever(),
                 )
     finally:
+        await admin_dashboard.stop_background_tasks()
         await srv.stop_background_tasks()
         await routing_manager.close_all()
 
@@ -6024,6 +6537,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--admin-token",
         default=os.environ.get("ADMIN_TOKEN", ""),
         help="Optional token for the admin dashboard. Required if --admin-host is not loopback.",
+    )
+    p.add_argument(
+        "--stats-token",
+        default=os.environ.get("STATS_TOKEN", ""),
+        help="Optional token for the bot-friendly /api/stats endpoint. Falls back to --admin-token when unset.",
     )
     p.add_argument("--db-path", default=str(Path(__file__).with_name("won_server.db")),
                    help="Path to the SQLite backend DB shown in the admin dashboard")
