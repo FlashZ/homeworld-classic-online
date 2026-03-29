@@ -18,4 +18,3 @@ docs/*
 !docs/cataclysm-bootstrap-notes.md
 !docs/unified-edge-two-backend-architecture.md
 discord_stats_bot.py
-installer/RetailWONSetup.exe
