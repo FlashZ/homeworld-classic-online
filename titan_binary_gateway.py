@@ -3626,7 +3626,8 @@ class SilencerRoutingServer:
             LOGGER.error("Routing: error from %s:%s: %s", *peer, exc)
         finally:
             writer.close()
-            await writer.wait_closed()
+            with contextlib.suppress(ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+                await writer.wait_closed()
 
 
 class RoutingServerManager:
