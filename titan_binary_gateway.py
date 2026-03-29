@@ -4157,8 +4157,17 @@ class AdminDashboardServer:
     let activePage = "overview";
     let pauseRefresh = false;
     let pauseRefreshUntil = 0;
+    let pointerInteractionActive = false;
     let lastSnapshot = null;
     let activeDbTable = "";
+    let uiState = {
+      pageId: "overview",
+      contentScrollTop: 0,
+      broadcastMsg: "",
+      broadcastRoom: "",
+      logScrollTop: 0,
+      logStickToBottom: true,
+    };
 
     const pages = [
       {id:"overview",label:"Overview",icon:'<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>'},
@@ -4204,6 +4213,59 @@ class AdminDashboardServer:
       return "";
     }
     function pauseAutoRefresh(ms=6000){pauseRefreshUntil=Math.max(pauseRefreshUntil,Date.now()+ms);}
+    function panelContainsNode(node){
+      if(!node)return false;
+      const el=node.nodeType===Node.ELEMENT_NODE?node:node.parentElement;
+      return !!(el&&(content.contains(el)||modalOverlay.contains(el)));
+    }
+    function hasActiveEditor(){
+      const el=document.activeElement;
+      if(!el)return false;
+      if(!(content.contains(el)||modalOverlay.contains(el)))return false;
+      return !!(el.matches("input, textarea, select")||el.isContentEditable);
+    }
+    function hasActiveSelection(){
+      const sel=window.getSelection?window.getSelection():null;
+      if(!sel||sel.isCollapsed||!sel.rangeCount)return false;
+      for(let i=0;i<sel.rangeCount;i++){
+        if(panelContainsNode(sel.getRangeAt(i).commonAncestorContainer))return true;
+      }
+      return false;
+    }
+    function captureUiState(){
+      uiState.pageId=activePage;
+      uiState.contentScrollTop=content.scrollTop;
+      const msg=document.getElementById("broadcast-msg");
+      if(msg)uiState.broadcastMsg=msg.value||"";
+      const room=document.getElementById("broadcast-room");
+      if(room)uiState.broadcastRoom=room.value||"";
+      const pre=document.getElementById("log-pre");
+      if(pre){
+        uiState.logScrollTop=pre.scrollTop;
+        uiState.logStickToBottom=(pre.scrollHeight-pre.scrollTop-pre.clientHeight)<=24;
+      }
+    }
+    function restoreUiState(){
+      if(uiState.pageId===activePage&&activePage!=="logs"){
+        content.scrollTop=uiState.contentScrollTop||0;
+      }
+      const msg=document.getElementById("broadcast-msg");
+      if(msg)msg.value=uiState.broadcastMsg||"";
+      const room=document.getElementById("broadcast-room");
+      if(room&&typeof uiState.broadcastRoom!=="undefined")room.value=uiState.broadcastRoom||"";
+      const pre=document.getElementById("log-pre");
+      if(pre){
+        pre.scrollTop=uiState.logStickToBottom?pre.scrollHeight:(uiState.logScrollTop||0);
+      }
+    }
+    function shouldDeferRefresh(){
+      if(pauseRefresh)return true;
+      if(Date.now()<pauseRefreshUntil)return true;
+      if(pointerInteractionActive)return true;
+      if(hasActiveEditor())return true;
+      if(hasActiveSelection())return true;
+      return false;
+    }
     function repoSummary(repo){
       if(!repo||!repo.available)return '<span class="muted">Git metadata unavailable.</span>';
       let label="Up to date",color="var(--success)";
@@ -4471,6 +4533,7 @@ class AdminDashboardServer:
 
     function renderAll(snapshot){
       if(!snapshot)return;
+      captureUiState();
       lastSnapshot=snapshot;
       renderNav(snapshot);
       renderSidebarFooter(snapshot);
@@ -4478,7 +4541,7 @@ class AdminDashboardServer:
       const renderers={overview:renderOverview,players:renderPlayers,rooms:renderRooms,activity:renderActivity,ips:renderIPs,database:renderDatabase,sessions:renderSessions,logs:renderLogs};
       const fn=renderers[activePage]||renderOverview;
       content.innerHTML=fn(snapshot);
-      if(activePage==="logs"){const pre=document.getElementById("log-pre");if(pre)pre.scrollTop=pre.scrollHeight;}
+      restoreUiState();
       content.querySelectorAll("[data-db-table]").forEach(btn=>{btn.addEventListener("click",()=>{activeDbTable=btn.dataset.dbTable;content.innerHTML=renderDatabase(lastSnapshot);bindDbTabs();});});
     }
     function bindDbTabs(){content.querySelectorAll("[data-db-table]").forEach(btn=>{btn.addEventListener("click",()=>{activeDbTable=btn.dataset.dbTable;content.innerHTML=renderDatabase(lastSnapshot);bindDbTabs();});});}
@@ -4578,13 +4641,25 @@ class AdminDashboardServer:
       renderAll(await res.json());
     }
 
-    ["pointerdown","keydown","focusin","mouseover"].forEach(evt=>{
-      content.addEventListener(evt,()=>pauseAutoRefresh(6000),true);
-      modalOverlay.addEventListener(evt,()=>pauseAutoRefresh(10000),true);
+    ["keydown","focusin","mouseover","copy","cut","paste","selectionchange"].forEach(evt=>{
+      const handler=()=>pauseAutoRefresh(12000);
+      if(evt==="selectionchange"){
+        document.addEventListener(evt,handler,true);
+      }else{
+        content.addEventListener(evt,handler,true);
+        modalOverlay.addEventListener(evt,()=>pauseAutoRefresh(15000),true);
+      }
+    });
+    ["pointerdown","mousedown"].forEach(evt=>{
+      content.addEventListener(evt,()=>{pointerInteractionActive=true;pauseAutoRefresh(15000);},true);
+      modalOverlay.addEventListener(evt,()=>{pointerInteractionActive=true;pauseAutoRefresh(15000);},true);
+    });
+    ["pointerup","mouseup","dragend","touchend"].forEach(evt=>{
+      window.addEventListener(evt,()=>{pointerInteractionActive=false;pauseAutoRefresh(4000);},true);
     });
 
     async function loop(){
-      try{if(!pauseRefresh&&Date.now()>=pauseRefreshUntil)await refresh();}catch(err){topbarMeta.textContent="Refresh failed: "+err;}
+      try{if(!shouldDeferRefresh())await refresh();}catch(err){topbarMeta.textContent="Refresh failed: "+err;}
       setTimeout(loop,8000);
     }
     loop();
