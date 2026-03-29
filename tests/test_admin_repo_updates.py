@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 
 import titan_binary_gateway
 
@@ -203,3 +204,59 @@ def test_admin_broadcast_endpoint_records_activity() -> None:
     assert activity["text"] == "Server notice"
     assert activity["room_name"] == "Default"
     assert activity["details"] == {"delivered": 2, "scope": "room :15100"}
+
+
+def test_admin_broadcast_chat_uses_visible_room_chat_sender() -> None:
+    async def _run() -> tuple[int, titan_binary_gateway.NativeRouteClientState, list[tuple[int, bytes]]]:
+        server = titan_binary_gateway.SilencerRoutingServer()
+        sent: list[tuple[int, bytes]] = []
+
+        async def _fake_send(
+            client: titan_binary_gateway.NativeRouteClientState,
+            clear_msg: bytes,
+        ) -> None:
+            sent.append((client.client_id, clear_msg))
+
+        server._send_native_route_client_reply = _fake_send  # type: ignore[method-assign]
+        client = titan_binary_gateway.NativeRouteClientState(
+            client_id=7,
+            client_name_raw="Alpha".encode("utf-16-le"),
+            client_name="Alpha",
+            client_ip="1.2.3.4",
+            client_ip_u32=0,
+            writer=None,  # type: ignore[arg-type]
+            session_key=b"",
+            out_seq=None,
+        )
+        server._native_clients[client.client_id] = client
+
+        delivered = await server.admin_broadcast_chat("Server notice")
+        delivered2 = await server.admin_broadcast_chat("Second notice")
+        assert delivered2 == 1
+        return delivered, client, sent
+
+    delivered, client, sent = asyncio.run(_run())
+
+    assert delivered == 1
+    assert client.admin_sender_announced is True
+    assert len(sent) == 3
+
+    service_type, message_type, payload = titan_binary_gateway._parse_mini_message(sent[0][1])
+    assert service_type == titan_binary_gateway.MINI_ROUTING_SERVICE
+    assert message_type == titan_binary_gateway.ROUTING_GROUP_CHANGE_EX
+
+    service_type, message_type, payload = titan_binary_gateway._parse_mini_message(sent[1][1])
+    assert service_type == titan_binary_gateway.MINI_ROUTING_SERVICE
+    assert message_type == titan_binary_gateway.ROUTING_PEER_CHAT
+    sender_id, _flags, chat_type, data_len = struct.unpack("<HBBH", payload[:6])
+    assert sender_id == titan_binary_gateway.ADMIN_BROADCAST_CLIENT_ID
+    assert chat_type == titan_binary_gateway.CHAT_GROUP_ID
+    assert payload[6 : 6 + data_len].decode("utf-16-le") == "Server notice"
+
+    service_type, message_type, payload = titan_binary_gateway._parse_mini_message(sent[2][1])
+    assert service_type == titan_binary_gateway.MINI_ROUTING_SERVICE
+    assert message_type == titan_binary_gateway.ROUTING_PEER_CHAT
+    sender_id, _flags, chat_type, data_len = struct.unpack("<HBBH", payload[:6])
+    assert sender_id == titan_binary_gateway.ADMIN_BROADCAST_CLIENT_ID
+    assert chat_type == titan_binary_gateway.CHAT_GROUP_ID
+    assert payload[6 : 6 + data_len].decode("utf-16-le") == "Second notice"

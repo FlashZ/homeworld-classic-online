@@ -456,6 +456,10 @@ ROUTING_SEND_CHAT = 0x35
 ROUTING_PEER_CHAT = 0x36
 ROUTING_OPTIONAL_FIELD_IP = 0x01
 CHAT_GROUP_ID = 4
+ADMIN_BROADCAST_CLIENT_ID = 0xFFFE
+ADMIN_BROADCAST_CLIENT_NAME = "[ADMIN]"
+ADMIN_BROADCAST_CLIENT_NAME_RAW = ADMIN_BROADCAST_CLIENT_NAME.encode("utf-16-le")
+ADMIN_BROADCAST_CLIENT_IP_U32 = 0
 ROUTING_REASON_VOLUNTARY_DISCONNECT = 0x00
 ROUTING_REASON_NEW_CLIENT = 0x80
 STATUS_ROUTING_INVALID_PASSWORD = -2008
@@ -1839,6 +1843,7 @@ class NativeRouteClientState:
     chat_count: int = 0
     peer_data_messages: int = 0
     peer_data_bytes: int = 0
+    admin_sender_announced: bool = False
     subscriptions: list[NativeRouteSubscription] = field(default_factory=list)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -2151,9 +2156,20 @@ class SilencerRoutingServer:
 
     async def admin_broadcast_chat(self, text: str) -> int:
         """Admin action: send a chat message from [ADMIN] to all clients."""
-        data = text.encode("utf-8", errors="replace")
+        text = _sanitize_routing_chat_text(text)
+        if not text:
+            LOGGER.info("Routing(admin): broadcast suppressed empty message")
+            return 0
+        data = _encode_routing_chat_text(CHAT_GROUP_ID, text, b"")
+        join_msg = _build_mini_routing_group_change_ex(
+            CHAT_GROUP_ID,
+            ADMIN_BROADCAST_CLIENT_ID,
+            ROUTING_REASON_NEW_CLIENT,
+            ADMIN_BROADCAST_CLIENT_NAME_RAW,
+            ADMIN_BROADCAST_CLIENT_IP_U32,
+        )
         peer_chat = _build_mini_routing_peer_chat(
-            client_id=0,
+            client_id=ADMIN_BROADCAST_CLIENT_ID,
             chat_type=CHAT_GROUP_ID,
             data=data,
             addressees=[],
@@ -2162,6 +2178,9 @@ class SilencerRoutingServer:
         delivered = 0
         for client in list(self._native_clients.values()):
             try:
+                if not client.admin_sender_announced:
+                    await self._send_native_route_client_reply(client, join_msg)
+                    client.admin_sender_announced = True
                 await self._send_native_route_client_reply(client, peer_chat)
                 delivered += 1
             except Exception as exc:
