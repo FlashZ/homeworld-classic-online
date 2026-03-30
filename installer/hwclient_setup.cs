@@ -384,7 +384,7 @@ internal static class HWClientSetup
             }
 
             ExistingInstallState existingState = DetectExistingInstallState(gameDirectory);
-            bool shouldRefreshInstallerOwnedKey = existingState.HasAnyRegistryCdKey && existingState.RegistryOwnedByInstaller;
+            bool shouldRefreshInstallerOwnedKey = existingState.HasAnyRegistryCdKey && existingState.ShouldRefreshRegistryKeyByDefault;
             bool defaultWriteRegistryKeys = options.WriteRegistryKeys ?? (!existingState.HasAnyRegistryCdKey || shouldRefreshInstallerOwnedKey);
 
             // Generate a unique random key by default so users don't all share the
@@ -548,7 +548,7 @@ internal static class HWClientSetup
         {
             using (RegistryKey sierraKey = baseKey.OpenSubKey(CurrentGame.SierraRegistryPath, true))
             {
-                if (InstallerOwnsRegistryKeys(sierraKey))
+                if (InstallerOwnsRegistryKeys(sierraKey) || RegistryKeyUsesLegacySharedDefault(sierraKey))
                 {
                     ownsAnyRegistryKeys = true;
                     sierraKey.DeleteValue(SierraCdKeyValueName, false);
@@ -570,7 +570,7 @@ internal static class HWClientSetup
             using (RegistryKey currentUserKey = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Default))
             using (RegistryKey virtualStoreKey = currentUserKey.OpenSubKey(CurrentGame.SierraVirtualStoreRegistryPath, true))
             {
-                if (InstallerOwnsRegistryKeys(virtualStoreKey))
+                if (InstallerOwnsRegistryKeys(virtualStoreKey) || RegistryKeyUsesLegacySharedDefault(virtualStoreKey))
                 {
                     ownsAnyRegistryKeys = true;
                     virtualStoreKey.DeleteValue(SierraCdKeyValueName, false);
@@ -617,6 +617,17 @@ internal static class HWClientSetup
         }
 
         return false;
+    }
+
+    private static bool RegistryKeyUsesLegacySharedDefault(RegistryKey sierraKey)
+    {
+        if (sierraKey == null)
+        {
+            return false;
+        }
+
+        string plainCdKey = sierraKey.GetValue(SierraCdKeyValueName) as string;
+        return IsLegacySharedRegistryCdKeyDisplay(plainCdKey);
     }
 
     private static void BackupNetTweak(string gameDirectory)
@@ -1281,6 +1292,10 @@ internal static class HWClientSetup
                     }
 
                     state.RegistryOwnedByInstaller = InstallerOwnsRegistryKeys(sierraKey);
+                    if (IsLegacySharedRegistryCdKeyDisplay(state.SierraCdKeyDisplay))
+                    {
+                        state.RegistryUsesLegacySharedDefault = true;
+                    }
                 }
             }
 
@@ -1290,6 +1305,10 @@ internal static class HWClientSetup
                 {
                     byte[] wonCdKey = wonKeys.GetValue(CurrentGame.WonRegistryValueName) as byte[];
                     state.HasWonCdKey = wonCdKey != null && wonCdKey.Length > 0;
+                    if (IsLegacySharedRegistryCdKeyBytes(wonCdKey))
+                    {
+                        state.RegistryUsesLegacySharedDefault = true;
+                    }
                 }
             }
         }
@@ -1309,6 +1328,10 @@ internal static class HWClientSetup
                         if (string.IsNullOrWhiteSpace(state.SierraCdKeyDisplay))
                         {
                             state.SierraCdKeyDisplay = FormatDisplayCdKey(virtualStoreCdKeyString.Trim());
+                        }
+                        if (IsLegacySharedRegistryCdKeyDisplay(virtualStoreCdKeyString))
+                        {
+                            state.RegistryUsesLegacySharedDefault = true;
                         }
                     }
 
@@ -1364,6 +1387,10 @@ internal static class HWClientSetup
             {
                 summary.Append("An installer-managed CD key was detected and will be refreshed with a new random key by default.");
             }
+            else if (existingState.RegistryUsesLegacySharedDefault)
+            {
+                summary.Append("A legacy shared installer CD key was detected and will be refreshed with a new random key by default.");
+            }
             else
             {
                 summary.Append("An existing CD key was detected and will be preserved unless you opt in below.");
@@ -1383,6 +1410,10 @@ internal static class HWClientSetup
                 {
                     return "Existing installer-managed " + CurrentGame.DisplayName + " registry key values were detected. Leave this off to keep the current installer key instead of refreshing it.";
                 }
+                if (existingState.RegistryUsesLegacySharedDefault)
+                {
+                    return "A legacy shared " + CurrentGame.DisplayName + " installer key was detected. Leave this off to keep it instead of refreshing it to a new random key.";
+                }
                 return "Existing " + CurrentGame.DisplayName + " registry key values were detected. Leave this off to preserve them.";
             }
 
@@ -1394,6 +1425,10 @@ internal static class HWClientSetup
             if (existingState.RegistryOwnedByInstaller)
             {
                 return "Existing installer-managed " + CurrentGame.DisplayName + " registry key values were detected. Keeping this enabled will refresh them to " + selectedCdKey.DisplayCdKey + ".";
+            }
+            if (existingState.RegistryUsesLegacySharedDefault)
+            {
+                return "A legacy shared " + CurrentGame.DisplayName + " installer key was detected. Keeping this enabled will refresh it to " + selectedCdKey.DisplayCdKey + ".";
             }
             return "Existing " + CurrentGame.DisplayName + " registry key values were detected. Keeping this enabled will overwrite them with " + selectedCdKey.DisplayCdKey + ".";
         }
@@ -1441,8 +1476,33 @@ internal static class HWClientSetup
 
     private static RegistryCdKeyOption PickRandomRegistryCdKey(string excludeDisplayCdKey)
     {
-        return new RegistryCdKeyOption(
-            RetailCdKeyGenerator.GenerateRandom(CurrentGame.RetailProductName, excludeDisplayCdKey));
+        for (;;)
+        {
+            RegistryCdKeyOption option = new RegistryCdKeyOption(
+                RetailCdKeyGenerator.GenerateRandom(CurrentGame.RetailProductName, excludeDisplayCdKey));
+            if (!IsLegacySharedRegistryCdKeyDisplay(option.DisplayCdKey))
+            {
+                return option;
+            }
+        }
+    }
+
+    private static bool IsLegacySharedRegistryCdKeyDisplay(string plainOrDisplayCdKey)
+    {
+        if (string.IsNullOrWhiteSpace(plainOrDisplayCdKey))
+        {
+            return false;
+        }
+
+        return string.Equals(
+            FormatDisplayCdKey(plainOrDisplayCdKey),
+            FormatDisplayCdKey(CurrentGame.DefaultDisplayCdKey),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLegacySharedRegistryCdKeyBytes(byte[] encryptedCdKey)
+    {
+        return ByteArraysEqual(encryptedCdKey, CurrentGame.DefaultEncryptedCdKey);
     }
 
     private static bool ByteArraysEqual(byte[] left, byte[] right)
@@ -1784,7 +1844,7 @@ internal static class HWClientSetup
                     return;
                 }
 
-                if (registryCheckBox.Checked && selectedInstallState.HasAnyRegistryCdKey && !selectedInstallState.RegistryOwnedByInstaller)
+                if (registryCheckBox.Checked && selectedInstallState.HasAnyRegistryCdKey && !selectedInstallState.ShouldRefreshRegistryKeyByDefault)
                 {
                     DialogResult overwriteResult = MessageBox.Show(
                         form,
@@ -1953,6 +2013,7 @@ internal static class HWClientSetup
         public bool HasSierraCdKey { get; set; }
         public bool HasWonCdKey { get; set; }
         public bool RegistryOwnedByInstaller { get; set; }
+        public bool RegistryUsesLegacySharedDefault { get; set; }
         public string SierraCdKeyDisplay { get; set; }
         public bool HasNetTweakScript { get; set; }
         public bool HasNetTweakBackup { get; set; }
@@ -1966,6 +2027,11 @@ internal static class HWClientSetup
         public bool HasBootstrapFiles
         {
             get { return HasNetTweakScript || HasKverFile; }
+        }
+
+        public bool ShouldRefreshRegistryKeyByDefault
+        {
+            get { return RegistryOwnedByInstaller || RegistryUsesLegacySharedDefault; }
         }
     }
 
