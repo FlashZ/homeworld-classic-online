@@ -4,6 +4,7 @@ import asyncio
 import binascii
 import contextlib
 from dataclasses import dataclass, field
+import hashlib
 import logging
 import struct
 import time
@@ -11,10 +12,16 @@ from typing import Dict, Optional, Tuple
 
 from .protocol import *
 from . import protocol as _protocol
-from .product_profile import HOMEWORLD_PRODUCT_PROFILE, ProductProfile
+from .product_profile import (
+    CATACLYSM_PRODUCT_PROFILE,
+    HOMEWORLD_PRODUCT_PROFILE,
+    ProductProfile,
+)
 
 globals().update({name: getattr(_protocol, name) for name in dir(_protocol) if name.startswith('_')})
 LOGGER = logging.getLogger(__name__)
+
+PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS = 15.0
 
 @dataclass
 class NativeRouteSubscription:
@@ -124,6 +131,7 @@ class SilencerRoutingServer:
         self._pending_reconnects: Dict[int, PendingNativeReconnect] = {}
         self._maintenance_task: Optional[asyncio.Task] = None
         self._solo_peer_data_log_state: Dict[Tuple[str, int], Dict[str, object]] = {}
+        self._last_peer_data_at = 0.0
 
     def start_background_tasks(self) -> None:
         if self._maintenance_task is None:
@@ -192,6 +200,7 @@ class SilencerRoutingServer:
         self._room_flags = 0
         self._room_path = self.product_profile.directory_root
         self._solo_peer_data_log_state.clear()
+        self._last_peer_data_at = 0.0
 
     def mark_room_allocated(self) -> None:
         self._room_allocated = True
@@ -215,7 +224,33 @@ class SilencerRoutingServer:
     ) -> bool:
         if disconnect_reason not in {"transport_lost", "connection_reset", "eof"}:
             return False
-        return bool(self._native_clients or self._data_objects or self._published)
+        # Homeworld uses unpublished game routes, so published lobby/chat rooms
+        # should still broadcast the leave immediately to avoid stale names.
+        if not self._publish_in_directory:
+            return True
+
+        # Cataclysm can keep gameplay on the published room. When the room was
+        # just carrying active peer-data traffic, preserve a reconnect window so
+        # the client can transition back cleanly after the match ends or the
+        # connection blips.
+        now = time.time()
+        if self.product_profile.key == CATACLYSM_PRODUCT_PROFILE.key:
+            active_participant_count = len(self._native_clients) + len(self._pending_reconnects)
+            room_peer_data_messages = sum(
+                int(active.peer_data_messages)
+                for active in self._native_clients.values()
+            ) + int(client.peer_data_messages)
+            room_peer_data_bytes = sum(
+                int(active.peer_data_bytes)
+                for active in self._native_clients.values()
+            ) + int(client.peer_data_bytes)
+            return self._recent_published_game_activity(
+                now,
+                active_participant_count,
+                room_peer_data_messages,
+                room_peer_data_bytes,
+            )
+        return False
 
     def _park_disconnected_client(
         self,
@@ -483,6 +518,25 @@ class SilencerRoutingServer:
             client.peer_data_bytes += max(0, int(payload_len))
         return client
 
+    def _recent_published_game_activity(
+        self,
+        now: float,
+        active_participant_count: int,
+        room_peer_data_messages: int,
+        room_peer_data_bytes: int,
+    ) -> bool:
+        if not self._publish_in_directory:
+            return False
+        if self.product_profile.key != CATACLYSM_PRODUCT_PROFILE.key:
+            return False
+        if self._last_peer_data_at <= 0.0:
+            return False
+        if now - self._last_peer_data_at > PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS:
+            return False
+        if active_participant_count >= 2:
+            return True
+        return room_peer_data_messages >= 8 or room_peer_data_bytes >= 1024
+
     def _alloc_native_client_id(self) -> int:
         reserved_ids = set(self._native_clients) | set(self._pending_reconnects)
         for _ in range(MAX_NATIVE_CLIENT_ID):
@@ -509,32 +563,53 @@ class SilencerRoutingServer:
             kind, tracked_client_id = key
             window_started = float(state.get("window_started_monotonic", now))
             LOGGER.info(
-                "Routing(native): %s from client_id=%d suppressed %d additional no-recipient packets over %.1fs (latest_len=%d reply=%s)",
+                "Routing(native): %s from client_id=%d suppressed %d additional no-recipient packets over %.1fs (latest_len=%d reply=%s%s)",
                 kind,
                 tracked_client_id,
                 suppressed,
                 max(0.0, now - window_started),
                 int(state.get("latest_len", 0)),
                 bool(state.get("latest_reply", False)),
+                self._peer_data_fingerprint_suffix(state.get("latest_fingerprint", "")),
             )
+
+    @staticmethod
+    def _peer_data_fingerprint(data: bytes) -> str:
+        payload = bytes(data or b"")
+        if not payload:
+            return "empty"
+        digest = hashlib.blake2s(payload, digest_size=6).hexdigest()
+        head = payload[:8].hex()
+        return f"{len(payload)}b:{digest}:{head}"
+
+    def _peer_data_fingerprint_suffix(self, fingerprint: object) -> str:
+        if self._publish_in_directory:
+            return ""
+        value = str(fingerprint or "").strip()
+        if not value:
+            return ""
+        return f" fingerprint={value}"
 
     def _log_native_peer_data_event(
         self,
         kind: str,
         client_id: int,
-        data_len: int,
+        payload: bytes,
         recipients: int,
         should_send_reply: bool,
     ) -> None:
+        data_len = len(bytes(payload or b""))
+        fingerprint = self._peer_data_fingerprint(payload)
         if recipients > 0 or client_id <= 0:
             self._flush_solo_peer_data_logs(client_id if client_id > 0 else None)
             LOGGER.info(
-                "Routing(native): %s from client_id=%d data_len=%d recipients=%d reply=%s",
+                "Routing(native): %s from client_id=%d data_len=%d recipients=%d reply=%s%s",
                 kind,
                 client_id,
                 data_len,
                 recipients,
                 should_send_reply,
+                self._peer_data_fingerprint_suffix(fingerprint),
             )
             return
 
@@ -548,18 +623,21 @@ class SilencerRoutingServer:
                 "suppressed": 0,
                 "latest_len": int(data_len),
                 "latest_reply": bool(should_send_reply),
+                "latest_fingerprint": fingerprint,
             }
             LOGGER.info(
-                "Routing(native): %s from client_id=%d data_len=%d recipients=0 reply=%s (no peers connected; suppressing repeats)",
+                "Routing(native): %s from client_id=%d data_len=%d recipients=0 reply=%s%s (no peers connected; suppressing repeats)",
                 kind,
                 client_id,
                 data_len,
                 should_send_reply,
+                self._peer_data_fingerprint_suffix(fingerprint),
             )
             return
 
         state["latest_len"] = int(data_len)
         state["latest_reply"] = bool(should_send_reply)
+        state["latest_fingerprint"] = fingerprint
         last_emit = float(state.get("last_emit_monotonic", now))
         if now - last_emit < 5.0:
             state["suppressed"] = int(state.get("suppressed", 0)) + 1
@@ -569,24 +647,26 @@ class SilencerRoutingServer:
         window_started = float(state.get("window_started_monotonic", now))
         if suppressed > 0:
             LOGGER.info(
-                "Routing(native): %s from client_id=%d suppressed %d additional no-recipient packets over %.1fs (latest_len=%d reply=%s)",
+                "Routing(native): %s from client_id=%d suppressed %d additional no-recipient packets over %.1fs (latest_len=%d reply=%s%s)",
                 kind,
                 client_id,
                 suppressed,
                 max(0.0, now - window_started),
                 int(state.get("latest_len", 0)),
                 bool(state.get("latest_reply", False)),
+                self._peer_data_fingerprint_suffix(state.get("latest_fingerprint", "")),
             )
 
         state["window_started_monotonic"] = now
         state["last_emit_monotonic"] = now
         state["suppressed"] = 0
         LOGGER.info(
-            "Routing(native): %s from client_id=%d data_len=%d recipients=0 reply=%s (still no peers connected; suppressing repeats)",
+            "Routing(native): %s from client_id=%d data_len=%d recipients=0 reply=%s%s (still no peers connected; suppressing repeats)",
             kind,
             client_id,
             data_len,
             should_send_reply,
+            self._peer_data_fingerprint_suffix(fingerprint),
         )
 
     def can_host_room(self) -> bool:
@@ -713,14 +793,23 @@ class SilencerRoutingServer:
                 }
             )
 
+        active_participant_count = len(clients) + len(pending_reconnects)
         is_game_room = bool(
-            not self._publish_in_directory
-            and (
-                clients
-                or pending_reconnects
-                or data_objects
-                or room_peer_data_messages
-                or room_peer_data_bytes
+            (
+                not self._publish_in_directory
+                and (
+                    clients
+                    or pending_reconnects
+                    or data_objects
+                    or room_peer_data_messages
+                    or room_peer_data_bytes
+                )
+            )
+            or self._recent_published_game_activity(
+                now,
+                active_participant_count,
+                room_peer_data_messages,
+                room_peer_data_bytes,
             )
         )
 
@@ -1615,6 +1704,7 @@ class SilencerRoutingServer:
                     if service_type == MINI_ROUTING_SERVICE and message_type == ROUTING_SEND_DATA:
                         req = _parse_mini_routing_send_data(clear)
                         delivered = 0
+                        self._last_peer_data_at = time.time()
                         self._touch_native_client(registered_client_id, "peer_data", len(bytes(req["data"])))
                         if registered_client_id:
                             delivered = await self._broadcast_native_route_peer_data(
@@ -1626,7 +1716,7 @@ class SilencerRoutingServer:
                         self._log_native_peer_data_event(
                             "SendData",
                             int(registered_client_id),
-                            len(bytes(req["data"])),
+                            bytes(req["data"]),
                             delivered,
                             bool(req["should_send_reply"]),
                         )
@@ -1644,6 +1734,7 @@ class SilencerRoutingServer:
                     if service_type == MINI_ROUTING_SERVICE and message_type == ROUTING_SEND_DATA_BROADCAST:
                         req = _parse_mini_routing_send_data_broadcast(clear)
                         delivered = 0
+                        self._last_peer_data_at = time.time()
                         self._touch_native_client(registered_client_id, "peer_data", len(bytes(req["data"])))
                         if registered_client_id:
                             delivered = await self._broadcast_native_route_peer_data(
@@ -1655,7 +1746,7 @@ class SilencerRoutingServer:
                         self._log_native_peer_data_event(
                             "SendDataBroadcast",
                             int(registered_client_id),
-                            len(bytes(req["data"])),
+                            bytes(req["data"]),
                             delivered,
                             bool(req["should_send_reply"]),
                         )
