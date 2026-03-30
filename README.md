@@ -21,7 +21,7 @@ I was not trying to reproduce or copy the original server code. The idea was to 
 
 So alongside getting retail Homeworld and Cataclysm working online again, this project has also been me pushing on AI-assisted reverse engineering in a real practical setting.
 
-This is also an unofficial fan project. It is not affiliated with, endorsed by, sponsored by, or connected to Relic Entertainment, Sierra, or any current or former owners of the Homeworld intellectual property.
+This is also an unofficial fan project. It is not affiliated with, endorsed by, sponsored by, or connected to Relic Entertainment, Sierra, Gearbox Entertainment or Blackbird Interactive.
 
 ## For Players
 
