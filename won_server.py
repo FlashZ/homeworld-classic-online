@@ -19,6 +19,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from product_profile import (
+    HOMEWORLD_PRODUCT_PROFILE,
+    PRODUCT_PROFILES,
+    ProductProfile,
+    product_profile_from_name,
+)
 import won_crypto
 
 LOGGER = logging.getLogger("won_oss_server")
@@ -26,19 +32,17 @@ LOGGER = logging.getLogger("won_oss_server")
 SESSION_TTL_SECONDS = 24 * 60 * 60
 RATE_WINDOW_SECONDS = 5 * 60
 MAX_LOGIN_ATTEMPTS = 20
+NATIVE_KEY_WRITE_WINDOW_SECONDS = 10 * 60
+MAX_NATIVE_KEY_WRITES = 6
 MAX_EVENTS_PER_PLAYER = 256
-PROTECTED_PATHS: Set[str] = {"/Homeworld", "/TitanServers"}
 _login_attempts: Dict[str, List[float]] = {}
+_native_key_write_attempts: Dict[str, List[float]] = {}
 
-# Homeworld/Titan-oriented data object names from TitanInterface.cpp
-OBJ_VALID_VERSIONS = "HomeworldValidVersions"
+# Titan-oriented data object names from TitanInterface.cpp
 OBJ_DESCRIPTION = "Description"
 OBJ_ROOM_FLAGS = "RoomFlags"
 OBJ_ROOM_CLIENTCOUNT = "__RSClientCount"
-OBJ_FACT_CUR_SERVER_COUNT = "__FactCur_RoutingServHWGame"
-OBJ_FACT_TOTAL_SERVER_COUNT = "__FactTotal_RoutingServHWGame"
 OBJ_SERVER_UPTIME = "__ServerUptime"
-DEFAULT_FACTORY_DISPLAY_NAME = "Melbourne"
 
 
 def _is_loopback_ip(value: Optional[str]) -> bool:
@@ -216,8 +220,14 @@ class StateStore:
 
 
 class WONLikeState:
-    def __init__(self, store: StateStore, heartbeat_timeout_s: int = 45) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        heartbeat_timeout_s: int = 45,
+        product_profile: ProductProfile = HOMEWORLD_PRODUCT_PROFILE,
+    ) -> None:
         self.store = store
+        self.product_profile = product_profile
         self.players: Dict[str, Player] = {}
         self.lobbies: Dict[str, Lobby] = {}
         self.game_servers: Dict[str, GameServer] = {}
@@ -226,7 +236,10 @@ class WONLikeState:
         self.directory: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self.events_by_player: Dict[str, List[Dict[str, Any]]] = {}
         self.route_membership: Dict[str, Set[str]] = {}
-        self.protected_paths: Set[str] = set(PROTECTED_PATHS)
+        self.protected_paths: Set[str] = {
+            self.product_profile.directory_root,
+            self.product_profile.titan_servers_path,
+        }
         self.event_seq = 0
         self.heartbeat_timeout_s = heartbeat_timeout_s
         self.started_at = time.time()
@@ -284,27 +297,34 @@ class WONLikeState:
         return f"{path.rstrip('/')}/{entity_name}"
 
     def _bootstrap_directory(self) -> None:
-        self.directory.setdefault("/Homeworld", {})
-        titan = self.directory.setdefault("/TitanServers", {})
+        self.directory.setdefault(self.product_profile.directory_root, {})
+        titan = self.directory.setdefault(self.product_profile.titan_servers_path, {})
         defaults = {
-            "AuthServer": {"host": "127.0.0.1", "port": 9000},
-            "TitanRoutingServer": {"host": "127.0.0.1", "port": 9000},
-            "TitanFactoryServer": {
+            self.product_profile.auth_service_name: {"host": "127.0.0.1", "port": 9000},
+            self.product_profile.routing_service_name: {"host": "127.0.0.1", "port": 9000},
+            self.product_profile.factory_service_name: {
                 "host": "127.0.0.1",
                 "port": 9000,
-                OBJ_DESCRIPTION: DEFAULT_FACTORY_DISPLAY_NAME,
+                OBJ_DESCRIPTION: self.product_profile.default_factory_display_name,
             },
             "TitanFirewallDetector": {"host": "127.0.0.1", "port": 0},
             "TitanEventServer": {"host": "127.0.0.1", "port": 9000},
-            OBJ_VALID_VERSIONS: {"versions": ["1.00"]},
+            self.product_profile.valid_versions_service: {
+                "versions": list(self.product_profile.backend_valid_versions)
+            },
         }
         for name, payload in defaults.items():
             entry = titan.setdefault(name, {"entity_type": "service", "payload": payload})
-            if name == "TitanFactoryServer":
+            if name == self.product_profile.factory_service_name:
                 existing_payload = entry.get("payload", {})
                 if isinstance(existing_payload, dict):
-                    existing_payload.setdefault(OBJ_DESCRIPTION, DEFAULT_FACTORY_DISPLAY_NAME)
-            self.protected_paths.add(self._directory_entity_path("/TitanServers", name))
+                    existing_payload.setdefault(
+                        OBJ_DESCRIPTION,
+                        self.product_profile.default_factory_display_name,
+                    )
+            self.protected_paths.add(
+                self._directory_entity_path(self.product_profile.titan_servers_path, name)
+            )
         self._persist_directory()
 
     def _persist_table_replace(self, table: str, rows: List[Tuple[str, ...]], sql: str) -> None:
@@ -368,9 +388,9 @@ class WONLikeState:
 
     def _factory_data_objects(self, fac: Factory) -> Dict[str, Any]:
         return {
-            OBJ_DESCRIPTION: DEFAULT_FACTORY_DISPLAY_NAME,
-            OBJ_FACT_CUR_SERVER_COUNT: fac.running,
-            OBJ_FACT_TOTAL_SERVER_COUNT: fac.total_started,
+            OBJ_DESCRIPTION: self.product_profile.default_factory_display_name,
+            self.product_profile.factory_current_object_name: fac.running,
+            self.product_profile.factory_total_object_name: fac.total_started,
             OBJ_SERVER_UPTIME: int(time.time() - self.started_at),
         }
 
@@ -441,6 +461,35 @@ class WONLikeState:
         _login_attempts[key] = attempts
         return True
 
+    @staticmethod
+    def _native_key_write_attempt_key(username: str, client_ip: Optional[str]) -> str:
+        if client_ip:
+            return client_ip.strip()
+        return f"user:{username.lower()}"
+
+    @staticmethod
+    def _prune_native_key_write_attempts(key: str, now: float) -> List[float]:
+        attempts = [
+            ts
+            for ts in _native_key_write_attempts.get(key, [])
+            if now - ts <= NATIVE_KEY_WRITE_WINDOW_SECONDS
+        ]
+        if attempts:
+            _native_key_write_attempts[key] = attempts
+        else:
+            _native_key_write_attempts.pop(key, None)
+        return attempts
+
+    def _allow_native_key_write(self, username: str, client_ip: Optional[str]) -> bool:
+        now = time.time()
+        key = self._native_key_write_attempt_key(username, client_ip)
+        attempts = self._prune_native_key_write_attempts(key, now)
+        if len(attempts) >= MAX_NATIVE_KEY_WRITES:
+            return False
+        attempts.append(now)
+        _native_key_write_attempts[key] = attempts
+        return True
+
     def cleanup_expired_sessions(self) -> int:
         now = time.time()
         expired_tokens = [
@@ -465,6 +514,18 @@ class WONLikeState:
                 _login_attempts[key] = pruned
             else:
                 _login_attempts.pop(key, None)
+        for key in list(_native_key_write_attempts):
+            current = _native_key_write_attempts.get(key, [])
+            pruned = [
+                ts
+                for ts in current
+                if now - ts <= NATIVE_KEY_WRITE_WINDOW_SECONDS
+            ]
+            removed_entries += max(0, len(current) - len(pruned))
+            if pruned:
+                _native_key_write_attempts[key] = pruned
+            else:
+                _native_key_write_attempts.pop(key, None)
         return removed_entries
 
     def is_session_valid(self, token: str) -> bool:
@@ -516,7 +577,7 @@ class WONLikeState:
         requested_password = new_password if (create_account and new_password) else password
         if not normalized_cd_key:
             raise ValueError("missing_cd_key")
-        if not won_crypto.validate_cd_key(won_crypto.CDKEY_PRODUCT_HOMEWORLD, normalized_cd_key):
+        if not won_crypto.validate_cd_key(self.product_profile.cd_key_product_name, normalized_cd_key):
             raise ValueError("invalid_cd_key")
 
         cur = self.store.conn.cursor()
@@ -533,6 +594,8 @@ class WONLikeState:
         if row is None:
             if not create_account:
                 raise ValueError("create_account_required")
+            if not self._allow_native_key_write(username, client_ip):
+                raise ValueError("rate_limited")
             self.create_user(
                 username,
                 requested_password,
@@ -558,6 +621,8 @@ class WONLikeState:
             if normalized_cd_key and normalized_cd_key != existing_cd_key:
                 raise ValueError("cd_key_mismatch")
         elif normalized_cd_key:
+            if not self._allow_native_key_write(username, client_ip):
+                raise ValueError("rate_limited")
             cur.execute(
                 "UPDATE users SET native_cd_key=? WHERE username=?",
                 (normalized_cd_key, username),
@@ -599,7 +664,7 @@ class WONLikeState:
     def create_lobby(self, owner_id: str, name: str, map_name: str, max_players: int, region: str, password: str = "", metadata: Optional[Dict[str, Any]] = None) -> Lobby:
         lobby = Lobby(f"lob_{secrets.token_hex(4)}", name, owner_id, map_name, max_players, region, password=password, players=[owner_id], metadata=metadata or {})
         self.lobbies[lobby.lobby_id] = lobby
-        self.dir_upsert("/Homeworld", lobby.lobby_id, "routing_room", self._room_data_objects(lobby), internal=True)
+        self.dir_upsert(self.product_profile.directory_root, lobby.lobby_id, "routing_room", self._room_data_objects(lobby), internal=True)
         self.route_membership[lobby.lobby_id] = set(lobby.players)
         self._persist_lobbies()
         self._emit_event(lobby.players, "lobby_created", {"lobby_id": lobby.lobby_id})
@@ -613,7 +678,7 @@ class WONLikeState:
             if len(lobby.players) >= lobby.max_players:
                 raise ValueError("lobby_full")
             lobby.players.append(player_id)
-        self.dir_upsert("/Homeworld", lobby_id, "routing_room", self._room_data_objects(lobby), internal=True)
+        self.dir_upsert(self.product_profile.directory_root, lobby_id, "routing_room", self._room_data_objects(lobby), internal=True)
         self.route_membership[lobby_id] = set(lobby.players)
         self._persist_lobbies()
         self._emit_event(lobby.players, "lobby_join", {"lobby_id": lobby_id, "player_id": player_id})
@@ -626,14 +691,14 @@ class WONLikeState:
         if not lobby.players:
             del self.lobbies[lobby_id]
             with contextlib.suppress(KeyError):
-                del self.directory["/Homeworld"][lobby_id]
+                del self.directory[self.product_profile.directory_root][lobby_id]
             self.route_membership.pop(lobby_id, None)
             self._persist_directory()
             self._persist_lobbies()
             return
         if lobby.owner_id == player_id:
             lobby.owner_id = lobby.players[0]
-        self.dir_upsert("/Homeworld", lobby_id, "routing_room", self._room_data_objects(lobby), internal=True)
+        self.dir_upsert(self.product_profile.directory_root, lobby_id, "routing_room", self._room_data_objects(lobby), internal=True)
         self.route_membership[lobby_id] = set(lobby.players)
         self._persist_lobbies()
         self._emit_event(lobby.players, "lobby_leave", {"lobby_id": lobby_id, "player_id": player_id})
@@ -655,7 +720,7 @@ class WONLikeState:
         fac = self.factories.get(factory_id) or Factory(factory_id, host, region, max_processes)
         fac.host, fac.region, fac.max_processes = host, region, max_processes
         self.factories[factory_id] = fac
-        self.dir_upsert("/TitanServers", f"Factory:{factory_id}", "factory", self._factory_data_objects(fac), internal=True)
+        self.dir_upsert(self.product_profile.titan_servers_path, f"Factory:{factory_id}", "factory", self._factory_data_objects(fac), internal=True)
         self._persist_factories()
         return fac
 
@@ -665,7 +730,7 @@ class WONLikeState:
             raise ValueError("factory_capacity_exceeded")
         fac.running += 1
         fac.total_started += 1
-        self.dir_upsert("/TitanServers", f"Factory:{factory_id}", "factory", self._factory_data_objects(fac), internal=True)
+        self.dir_upsert(self.product_profile.titan_servers_path, f"Factory:{factory_id}", "factory", self._factory_data_objects(fac), internal=True)
         self._persist_factories()
         return self.register_server(f"srv_{factory_id}_{secrets.token_hex(3)}", fac.host, port, fac.region, 0, 8, game_name, source=f"factory:{process_name}")
 
@@ -674,7 +739,7 @@ class WONLikeState:
         if not fac:
             return
         fac.running = max(0, fac.running - 1)
-        self.dir_upsert("/TitanServers", f"Factory:{factory_id}", "factory", self._factory_data_objects(fac), internal=True)
+        self.dir_upsert(self.product_profile.titan_servers_path, f"Factory:{factory_id}", "factory", self._factory_data_objects(fac), internal=True)
         self._persist_factories()
 
     def prune_stale_servers(self) -> int:
@@ -723,7 +788,12 @@ class WONLikeState:
         elif self.factories:
             fac = sorted(self.factories.values(), key=lambda f: f.running)[0]
             port = int(game_port or (2300 + fac.running))
-            selected = self.factory_start_process(fac.factory_id, "RoutingServHWGame", "homeworld", port)
+            selected = self.factory_start_process(
+                fac.factory_id,
+                self.product_profile.routing_game_process_name,
+                self.product_profile.backend_default_game_name or self.product_profile.key,
+                port,
+            )
         else:
             raise ValueError("no_game_capacity")
 
@@ -920,7 +990,16 @@ class WONLikeProtocolServer:
             return {"ok": True, "lobbies": [serialize_lobby(l) for l in self.state.list_lobbies(req.get("region"))]}
 
         if action == "REGISTER_SERVER":
-            gs = self.state.register_server(req["server_id"], req["host"], int(req["port"]), req.get("region", "global"), int(req.get("current_players", 0)), int(req.get("max_players", 8)), req.get("game_type", "homeworld"), req.get("source", "manual"))
+            gs = self.state.register_server(
+                req["server_id"],
+                req["host"],
+                int(req["port"]),
+                req.get("region", "global"),
+                int(req.get("current_players", 0)),
+                int(req.get("max_players", 8)),
+                req.get("game_type", self.state.product_profile.backend_default_game_name or self.state.product_profile.key),
+                req.get("source", "manual"),
+            )
             return {"ok": True, "server": serialize_server(gs)}
         if action == "LIST_SERVERS":
             self.state.prune_stale_servers()
@@ -943,7 +1022,12 @@ class WONLikeProtocolServer:
         if action == "REGISTER_FACTORY":
             return {"ok": True, "factory": self.state.register_factory(req["factory_id"], req["host"], req.get("region", "global"), int(req.get("max_processes", 4))).__dict__}
         if action == "FACTORY_START_PROCESS":
-            gs = self.state.factory_start_process(req["factory_id"], req.get("process_name", "RoutingServHWGame"), req.get("game_name", "homeworld"), int(req["port"]))
+            gs = self.state.factory_start_process(
+                req["factory_id"],
+                req.get("process_name", self.state.product_profile.routing_game_process_name),
+                req.get("game_name", self.state.product_profile.backend_default_game_name or self.state.product_profile.key),
+                int(req["port"]),
+            )
             await self._spawn_managed_process(f"factory:{req['factory_id']}")
             return {"ok": True, "server": serialize_server(gs)}
 
@@ -991,9 +1075,15 @@ async def run_server(
     timeout_s: int,
     db_path: str,
     shared_secret: str = "",
+    product_profile: ProductProfile = HOMEWORLD_PRODUCT_PROFILE,
 ) -> Tuple[asyncio.AbstractServer, WONLikeState, StateStore]:
+    Path(db_path).resolve().parent.mkdir(parents=True, exist_ok=True)
     store = StateStore(db_path)
-    state = WONLikeState(store=store, heartbeat_timeout_s=timeout_s)
+    state = WONLikeState(
+        store=store,
+        heartbeat_timeout_s=timeout_s,
+        product_profile=product_profile,
+    )
     proto = WONLikeProtocolServer(state, shared_secret=shared_secret)
     srv = await asyncio.start_server(proto.handle_client, host=host, port=port)
     return srv, state, store
@@ -1001,12 +1091,17 @@ async def run_server(
 
 async def main_async(args: argparse.Namespace) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    product_profile = product_profile_from_name(args.product)
+    db_path = args.db_path or str(
+        Path(__file__).resolve().parent / "data" / product_profile.key / "won_server.db"
+    )
     server, state, store = await run_server(
         args.host,
         args.port,
         args.heartbeat_timeout,
-        args.db_path,
+        db_path,
         shared_secret=args.shared_secret,
+        product_profile=product_profile,
     )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -1017,7 +1112,12 @@ async def main_async(args: argparse.Namespace) -> None:
         # Windows: loop.add_signal_handler is not supported; Ctrl-C raises KeyboardInterrupt
         pass
     prune_task = asyncio.create_task(prune_loop(state))
-    LOGGER.info("WON OSS server listening on %s", ", ".join(str(s.getsockname()) for s in (server.sockets or [])))
+    LOGGER.info(
+        "WON OSS server listening on %s product=%s db=%s",
+        ", ".join(str(s.getsockname()) for s in (server.sockets or [])),
+        product_profile.key,
+        db_path,
+    )
     try:
         async with server:
             await stop.wait()
@@ -1032,9 +1132,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="WON-inspired open source lobby/matchmaking server")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9100,
-                   help="Internal backend port (gateway connects here; NOT the Homeworld-facing port)")
+                   help="Internal backend port (gateway connects here; NOT the retail client-facing port)")
+    p.add_argument(
+        "--product",
+        default=HOMEWORLD_PRODUCT_PROFILE.key,
+        choices=sorted(PRODUCT_PROFILES),
+        help="Backend product profile to expose on this instance.",
+    )
     p.add_argument("--heartbeat-timeout", type=int, default=45)
-    p.add_argument("--db-path", default=str(Path(__file__).resolve().parent / "won_server.db"))
+    p.add_argument(
+        "--db-path",
+        default="",
+        help="SQLite database path. Defaults to data/<product>/won_server.db when omitted.",
+    )
     p.add_argument(
         "--shared-secret",
         default=os.environ.get("BACKEND_SHARED_SECRET", ""),

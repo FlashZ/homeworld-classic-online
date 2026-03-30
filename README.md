@@ -45,6 +45,8 @@ The installer can:
 - install the matching `kver.kp` verifier key
 - optionally write a randomized retail CD key for the selected game
 
+No Python is required on the client machine.
+
 ### In Game (Homeworld)
 
 1. Click Internet.
@@ -74,6 +76,7 @@ The installer only touches the files and registry values needed for online play:
 - `kver.kp`
 - the Sierra/WON CD key registry values for the selected game, if you leave CD key install enabled
 
+If an older shared installer key is detected, the current installer now refreshes it to a new random key by default.
 
 ### SmartScreen and hash checking
 
@@ -97,13 +100,21 @@ The SHA-256 value printed by PowerShell must match the release `.sha256` file an
 
 Use `Change...` on the install screen and point it at the exact game folder you actually launch from.
 
+`I have both games installed`
+
+Run the latest installer and choose `Configure both detected games`.
+
 `Homeworld works, but Cataclysm does not`
 
 Run the installer again and make sure Cataclysm was selected and patched too. The two games use different product settings and different CD key families.
 
+`I updated my CD key and now login fails`
+
+Ask the server operator to clear your CD key binding for that game, then log in again so the account can bind to the new key.
+
 `Can I use this with Remastered Classic?`
 
-No. This project is for the original retail Homeworld family only as the Remastered Classic had the online option removed.
+No. This project is for the original retail Homeworld family only, as Remastered Classic had the online option removed.
 
 ## For Server Hosts
 

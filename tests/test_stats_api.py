@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import argparse
+import time
+
+from product_profile import CATACLYSM_PRODUCT_PROFILE, HOMEWORLD_PRODUCT_PROFILE
 import titan_binary_gateway
 
 
@@ -107,11 +111,30 @@ def test_gateway_stats_snapshot_returns_bot_safe_presence_summary() -> None:
     snapshot = gateway.stats_snapshot()
 
     assert snapshot["server"] == {
+        "product": "homeworld",
+        "community_name": "Homeworld",
+        "directory_root": "/Homeworld",
+        "valid_versions_service": "HomeworldValidVersions",
         "public_host": "homeworld.kerrbell.dev",
         "public_port": 15101,
         "routing_port": 15100,
+        "routing_max_port": 15100,
         "version": "0110",
         "valid_versions": ["0110"],
+        "products": [
+            {
+                "product": "homeworld",
+                "community_name": "Homeworld",
+                "directory_root": "/Homeworld",
+                "valid_versions_service": "HomeworldValidVersions",
+                "routing_port": 15100,
+                "routing_max_port": 15100,
+                "version": "0110",
+                "valid_versions": ["0110"],
+                "backend_host": "127.0.0.1",
+                "backend_port": 9100,
+            }
+        ],
     }
     assert snapshot["counts"] == {
         "players_online": 2,
@@ -123,6 +146,7 @@ def test_gateway_stats_snapshot_returns_bot_safe_presence_summary() -> None:
     }
     assert snapshot["players"] == [
         {
+            "product": "homeworld",
             "name": "Alpha",
             "client_id": 1,
             "room_name": "Default",
@@ -135,6 +159,7 @@ def test_gateway_stats_snapshot_returns_bot_safe_presence_summary() -> None:
             "peer_data_bytes": 54,
         },
         {
+            "product": "homeworld",
             "name": "Bravo",
             "client_id": 2,
             "room_name": "Fleet Battle",
@@ -155,6 +180,7 @@ def test_gateway_stats_snapshot_returns_bot_safe_presence_summary() -> None:
     }
     assert snapshot["rooms"] == [
         {
+            "product": "homeworld",
             "name": "Default",
             "port": 15100,
             "description": "Lobby",
@@ -172,6 +198,7 @@ def test_gateway_stats_snapshot_returns_bot_safe_presence_summary() -> None:
             "data_object_count": 0,
         },
         {
+            "product": "homeworld",
             "name": "Fleet Battle",
             "port": 15102,
             "description": "1v1",
@@ -191,6 +218,7 @@ def test_gateway_stats_snapshot_returns_bot_safe_presence_summary() -> None:
     ]
     assert snapshot["games"] == [
         {
+            "product": "homeworld",
             "name": "hw_game",
             "owner_name": "Bravo",
             "room_name": "Fleet Battle",
@@ -203,6 +231,7 @@ def test_gateway_stats_snapshot_returns_bot_safe_presence_summary() -> None:
     ]
     assert snapshot["reconnecting_players"] == [
         {
+            "product": "homeworld",
             "name": "Ghost",
             "client_id": 9,
             "room_name": "Default",
@@ -287,6 +316,7 @@ def test_gateway_stats_snapshot_infers_live_game_from_active_unpublished_room() 
     assert [player["state"] for player in snapshot["players"]] == ["game", "game"]
     assert snapshot["rooms"] == [
         {
+            "product": "homeworld",
             "name": "Homeworld Chat",
             "port": 15102,
             "description": "Homeworld Chat",
@@ -310,6 +340,353 @@ def test_gateway_stats_snapshot_infers_live_game_from_active_unpublished_room() 
         "game_object_count": 0,
         "game_object_bytes_total": 0,
     }
+
+
+def test_gateway_stats_snapshot_reports_selected_product_identity() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="cataclysm.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        product_profile=CATACLYSM_PRODUCT_PROFILE,
+    )
+
+    snapshot = gateway.stats_snapshot()
+
+    assert snapshot["server"]["product"] == "cataclysm"
+    assert snapshot["server"]["community_name"] == "Cataclysm"
+    assert snapshot["server"]["directory_root"] == "/Cataclysm"
+    assert snapshot["server"]["version"] == "1.0.0.1"
+    assert snapshot["server"]["valid_versions"] == ["1.0.0.1", "1001"]
+    assert snapshot["server"]["products"] == [
+        {
+            "product": "cataclysm",
+            "community_name": "Cataclysm",
+            "directory_root": "/Cataclysm",
+            "valid_versions_service": "CataclysmValidVersions",
+            "routing_port": 15100,
+            "routing_max_port": 15100,
+            "version": "1.0.0.1",
+            "valid_versions": ["1.0.0.1", "1001"],
+            "backend_host": "127.0.0.1",
+            "backend_port": 9100,
+        }
+    ]
+
+
+def test_gateway_dashboard_snapshot_tags_single_product_rows() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    gateway.routing_manager = _FakeRoutingManager()
+
+    snapshot = gateway.dashboard_snapshot()
+
+    assert snapshot["products"] == {
+        "homeworld": {
+            "community_name": "Homeworld",
+            "directory_root": "/Homeworld",
+            "valid_versions_service": "HomeworldValidVersions",
+            "routing_port": 15100,
+            "routing_max_port": 15100,
+            "backend_host": "127.0.0.1",
+            "backend_port": 9100,
+            "version_str": "0110",
+            "valid_versions": ["0110"],
+        }
+    }
+    assert snapshot["routing_manager"]["products"] == ["homeworld"]
+    assert snapshot["routing_manager"]["players"][0]["product"] == "homeworld"
+    assert snapshot["routing_manager"]["servers"][0]["product"] == "homeworld"
+    assert snapshot["routing_manager"]["games"][0]["product"] == "homeworld"
+    assert snapshot["routing_manager"]["rooms"][0]["product"] == "homeworld"
+
+
+def test_gateway_probe_snapshots_report_readiness_state() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+
+    health = gateway.health_snapshot()
+    not_ready = gateway.readiness_snapshot()
+
+    assert health["ok"] is True
+    assert health["status"] == "ok"
+    assert health["product"] == "homeworld"
+    assert not_ready["ready"] is False
+    assert not_ready["checks"] == {
+        "auth_keys_loaded": False,
+        "routing_manager_attached": False,
+    }
+
+    gateway._auth_keys_loaded = True
+    gateway.routing_manager = object()  # type: ignore[assignment]
+
+    ready = gateway.readiness_snapshot()
+
+    assert ready["ready"] is True
+    assert ready["checks"] == {
+        "auth_keys_loaded": True,
+        "routing_manager_attached": True,
+    }
+
+
+def test_peer_session_ttl_allows_post_game_return_window() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+
+    freshish = titan_binary_gateway.PeerSession(
+        session_key=b"12345678",
+        session_id=7,
+        role=titan_binary_gateway.PEER_ROLE_DIRECTORY,
+        sequenced=True,
+    )
+    freshish.last_used_at = time.time() - 600.0
+    stale = titan_binary_gateway.PeerSession(
+        session_key=b"12345678",
+        session_id=8,
+        role=titan_binary_gateway.PEER_ROLE_FACTORY,
+        sequenced=True,
+    )
+    stale.last_used_at = time.time() - 1900.0
+    gateway._peer_sessions = {
+        freshish.session_id: freshish,
+        stale.session_id: stale,
+    }
+
+    expired = gateway._expire_peer_sessions()
+
+    assert expired == 1
+    assert freshish.session_id in gateway._peer_sessions
+    assert stale.session_id not in gateway._peer_sessions
+
+
+def test_gateway_runtime_config_defaults_follow_selected_product() -> None:
+    args = argparse.Namespace(
+        product="cataclysm",
+        db_path="",
+        keys_dir="",
+        version_str="",
+        valid_version=[],
+        valid_versions_file=None,
+    )
+
+    profile, version_str, valid_versions, db_path, keys_dir = (
+        titan_binary_gateway._resolve_gateway_runtime_config(args)
+    )
+
+    assert profile.key == "cataclysm"
+    assert version_str == "1.0.0.1"
+    assert valid_versions == ["1.0.0.1", "1001"]
+    assert db_path.replace("\\", "/").endswith("/data/cataclysm/won_server.db")
+    assert keys_dir.replace("\\", "/").endswith("/keys")
+
+
+def test_shared_gateway_config_splits_routing_ranges_and_defaults_cataclysm_backend() -> None:
+    args = argparse.Namespace(
+        product="homeworld",
+        backend_host="127.0.0.1",
+        backend_port=9100,
+        routing_port=15100,
+        routing_max_port=15120,
+        homeworld_routing_max_port=0,
+        cataclysm_backend_host="",
+        cataclysm_backend_port=0,
+        cataclysm_routing_port=0,
+        cataclysm_routing_max_port=0,
+        version_str="",
+        valid_version=[],
+        valid_versions_file=None,
+        db_path="",
+        keys_dir="",
+        cataclysm_version_str="",
+        cataclysm_valid_version=[],
+        cataclysm_valid_versions_file=None,
+        cataclysm_db_path="",
+        cataclysm_keys_dir="",
+        port=15101,
+        firewall_port=2021,
+    )
+
+    config = titan_binary_gateway._resolve_shared_gateway_config(args)
+    runtimes = config["runtimes"]
+    home = runtimes["homeworld"]
+    cat = runtimes["cataclysm"]
+
+    assert home["routing_port"] == 15100
+    assert home["routing_max_port"] == 15109
+    assert cat["routing_port"] == 15110
+    assert cat["routing_max_port"] == 15120
+    assert cat["backend_host"] == "127.0.0.1"
+    assert cat["backend_port"] == 9101
+    assert home["peer_session_id_min"] == 1
+    assert home["peer_session_id_max"] == 32767
+    assert cat["peer_session_id_min"] == 32768
+    assert cat["peer_session_id_max"] == titan_binary_gateway.MAX_PEER_SESSION_ID
+
+
+def test_shared_routing_manager_dashboard_snapshot_tags_products() -> None:
+    class _Manager:
+        def __init__(self, product: str, base_port: int) -> None:
+            self.host = "127.0.0.1"
+            self.public_host = "games.example"
+            self.base_port = base_port
+            self.max_port = base_port + 1
+            self._product = product
+
+        def dashboard_snapshot(self) -> dict[str, object]:
+            return {
+                "listener_ports": [self.base_port],
+                "next_port": self.base_port + 1,
+                "current_game_room_count": 1 if self._product == "cataclysm" else 0,
+                "players": [
+                    {
+                        "client_id": 1,
+                        "client_name": self._product.title(),
+                        "client_ip": "1.2.3.4" if self._product == "homeworld" else "5.6.7.8",
+                        "room_name": self._product.title(),
+                        "room_port": self.base_port,
+                    }
+                ],
+                "servers": [
+                    {
+                        "listen_port": self.base_port,
+                        "room_name": self._product.title(),
+                        "published": self._product == "homeworld",
+                    }
+                ],
+                "games": [
+                    {
+                        "name": f"{self._product}_game",
+                        "room_name": self._product.title(),
+                        "room_port": self.base_port,
+                        "link_id": self.base_port,
+                    }
+                ],
+                "rooms": [
+                    {
+                        "listen_port": self.base_port,
+                        "room_display_name": self._product.title(),
+                        "published": self._product == "homeworld",
+                        "is_game_room": self._product == "cataclysm",
+                    }
+                ],
+            }
+
+        def get_server(self, _port: int):  # pragma: no cover - not used here
+            return None
+
+        async def admin_kick_player(self, _port: int, _client_id: int) -> bool:  # pragma: no cover
+            return False
+
+        async def admin_broadcast(self, _message: str, _room_port=None) -> int:  # pragma: no cover
+            return 0
+
+        async def close_all(self) -> None:  # pragma: no cover
+            return None
+
+    manager = titan_binary_gateway.SharedRoutingServerManager(
+        {
+            "homeworld": _Manager("homeworld", 15100),
+            "cataclysm": _Manager("cataclysm", 15110),
+        }
+    )
+
+    snapshot = manager.dashboard_snapshot()
+
+    assert snapshot["products"] == ["cataclysm", "homeworld"]
+    assert snapshot["listener_ports"] == [15100, 15110]
+    assert snapshot["current_player_count"] == 2
+    assert snapshot["current_unique_ip_count"] == 2
+    assert snapshot["current_game_room_count"] == 1
+    assert {player["product"] for player in snapshot["players"]} == {
+        "homeworld",
+        "cataclysm",
+    }
+    assert {room["product"] for room in snapshot["rooms"]} == {
+        "homeworld",
+        "cataclysm",
+    }
+
+
+def test_shared_gateway_tracks_product_from_user_and_peer_session_identity() -> None:
+    home = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        product_profile=HOMEWORLD_PRODUCT_PROFILE,
+        user_id_start=1000,
+        peer_session_id_min=1,
+        peer_session_id_max=32767,
+    )
+    cat = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9101,
+        product_profile=CATACLYSM_PRODUCT_PROFILE,
+        user_id_start=1_000_000,
+        peer_session_id_min=32768,
+        peer_session_id_max=titan_binary_gateway.MAX_PEER_SESSION_ID,
+    )
+    cat_user_id = cat._alloc_user_id()
+    cat._peer_sessions[40000] = titan_binary_gateway.PeerSession(
+        session_key=b"12345678",
+        session_id=40000,
+        role=titan_binary_gateway.PEER_ROLE_DIRECTORY,
+        sequenced=True,
+    )
+
+    shared = titan_binary_gateway.SharedBinaryGatewayServer(
+        {
+            "homeworld": home,
+            "cataclysm": cat,
+        }
+    )
+
+    assert shared._runtime_for_native_login({"community_name": "Cataclysm"}) is cat
+    assert shared._runtime_for_user_id(cat_user_id) is cat
+    assert shared._runtime_for_peer_session(40000) is cat
+
+
+def test_shared_gateway_dir_request_prefers_exact_valid_versions_service() -> None:
+    home = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        product_profile=HOMEWORLD_PRODUCT_PROFILE,
+    )
+    cat = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9101,
+        product_profile=CATACLYSM_PRODUCT_PROFILE,
+    )
+    shared = titan_binary_gateway.SharedBinaryGatewayServer(
+        {
+            "homeworld": home,
+            "cataclysm": cat,
+        }
+    )
+
+    assert shared._runtime_for_dir_request(
+        {"path": "/TitanServers", "service_name": "HomeworldValidVersions"}
+    ) is home
+    assert shared._runtime_for_dir_request(
+        {"path": "/TitanServers", "service_name": "CataclysmValidVersions"}
+    ) is cat
 
 
 def test_stats_token_is_scoped_to_stats_endpoint() -> None:

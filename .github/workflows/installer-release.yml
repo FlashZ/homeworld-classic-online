@@ -1,4 +1,4 @@
-name: HWOnlineInstaller Release
+name: Installer Release
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
     paths:
       - "installer/**"
       - "keys/kver.kp"
-      - ".github/workflows/hwonlineinstaller-release.yml"
+      - ".github/workflows/installer-release.yml"
       - ".github/scripts/**"
   workflow_dispatch:
 
@@ -20,10 +20,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version: "3.12"
           cache: pip
@@ -46,7 +46,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
 
@@ -59,7 +59,7 @@ jobs:
           $run = $env:GITHUB_RUN_NUMBER
           $tag = "installer-v$date.$run"
           $version = "$date.$run"
-          $outputName = "HWOnlineSetup-$tag.exe"
+          $outputName = "RetailWONSetup-$tag.exe"
 
           "tag=$tag"               >> $env:GITHUB_OUTPUT
           "informational_version=$tag+$sha" >> $env:GITHUB_OUTPUT
@@ -67,7 +67,7 @@ jobs:
           "assembly_version=$version" >> $env:GITHUB_OUTPUT
           "output_name=$outputName" >> $env:GITHUB_OUTPUT
 
-      - name: Build HWOnline installer
+      - name: Build installer
         env:
           INSTALLER_VERSION: ${{ steps.version.outputs.informational_version }}
           INSTALLER_FILE_VERSION: ${{ steps.version.outputs.file_version }}
@@ -165,13 +165,36 @@ jobs:
             file = "${{ steps.version.outputs.output_name }}"
           } | ConvertTo-Json -Depth 5 | Set-Content "installer\${{ steps.version.outputs.output_name }}.virustotal.json"
 
+      - name: Generate VERIFY.txt
+        id: verify
+        env:
+          INSTALLER_SHA256: ${{ steps.hashes.outputs.sha256 }}
+          SIGNING_STATUS: ${{ steps.sign.outputs.status }}
+          SIGNING_SUBJECT: ${{ steps.sign.outputs.subject }}
+          VT_SUMMARY: ${{ steps.vt.outputs.summary }}
+          VT_PERMALINK: ${{ steps.vt.outputs.permalink }}
+        shell: pwsh
+        run: |
+          $installerPath = Join-Path "installer" "${{ steps.version.outputs.output_name }}"
+          $verifyPath = "installer\${{ steps.version.outputs.output_name }}.VERIFY.txt"
+          .github\scripts\write_verify_file.ps1 `
+            -InstallerPath $installerPath `
+            -OutputPath $verifyPath `
+            -Sha256 $env:INSTALLER_SHA256 `
+            -SigningStatus $env:SIGNING_STATUS `
+            -SigningSubject $env:SIGNING_SUBJECT `
+            -VirusTotalSummary $env:VT_SUMMARY `
+            -VirusTotalPermalink $env:VT_PERMALINK
+          "verify_path=$verifyPath" >> $env:GITHUB_OUTPUT
+
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: ${{ steps.version.outputs.output_name }}
           path: |
             installer/${{ steps.version.outputs.output_name }}
             installer/${{ steps.version.outputs.output_name }}.sha256
+            installer/${{ steps.version.outputs.output_name }}.VERIFY.txt
             installer/${{ steps.version.outputs.output_name }}.virustotal.json
           if-no-files-found: error
 
@@ -232,16 +255,16 @@ jobs:
         shell: pwsh
         run: |
           @"
-          ## HWOnline installer release summary
+          ## Installer release summary
 
           ${{ steps.notes.outputs.security }}
           "@ >> $env:GITHUB_STEP_SUMMARY
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: "HWOnlineSetup ${{ steps.version.outputs.tag }}"
+          name: "RetailWONSetup ${{ steps.version.outputs.tag }}"
           body: |
             ## Installer update
 
@@ -251,10 +274,11 @@ jobs:
 
             ${{ steps.notes.outputs.security }}
 
-            Download `${{ steps.version.outputs.output_name }}` below, run as Administrator, and follow the prompts.
+            Download `${{ steps.version.outputs.output_name }}` below, run as Administrator, and follow the prompts. If SmartScreen appears, use the bundled `.sha256` and `.VERIFY.txt` files to confirm the hash before running it.
           files: |
             installer/${{ steps.version.outputs.output_name }}
             installer/${{ steps.version.outputs.output_name }}.sha256
+            installer/${{ steps.version.outputs.output_name }}.VERIFY.txt
           fail_on_unmatched_files: true
           overwrite_files: true
           make_latest: true

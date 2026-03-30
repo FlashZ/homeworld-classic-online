@@ -1,81 +1,233 @@
 services:
   backend:
     build: .
-    container_name: won-backend
     restart: unless-stopped
     command:
       - /bin/sh
       - -ec
       - |
-        mkdir -p /data /data/keys
-        if [ ! -f /data/won_server.db ]; then
-          cp /app/won_oss_server/won_server.db /data/won_server.db
+        if [ "${SHARED_EDGE:-0}" = "1" ]; then
+          PRODUCT_KEY="homeworld"
+          BACKEND_LISTEN_PORT="${BACKEND_PORT:-9100}"
+        else
+          PRODUCT_KEY="${PRODUCT:-homeworld}"
+          BACKEND_LISTEN_PORT="${BACKEND_PORT:-9100}"
+        fi
+        PRODUCT_ROOT="/data/$$PRODUCT_KEY"
+        DB_PATH="$$PRODUCT_ROOT/won_server.db"
+        KEYS_DIR="$$PRODUCT_ROOT/keys"
+        LEGACY_DB="/data/won_server.db"
+        LEGACY_KEYS="/data/keys"
+
+        mkdir -p "$$PRODUCT_ROOT" "$$KEYS_DIR"
+        if [ ! -f "$$DB_PATH" ]; then
+          if [ "$$PRODUCT_KEY" = "homeworld" ] && [ -f "$$LEGACY_DB" ]; then
+            cp "$$LEGACY_DB" "$$DB_PATH"
+          elif [ -f /app/won_oss_server/won_server.db ]; then
+            cp /app/won_oss_server/won_server.db "$$DB_PATH"
+          fi
         fi
         for key_file in authserver_private.der authserver_public.der verifier_private.der verifier_public.der kver.kp; do
-          if [ ! -f "/data/keys/$$key_file" ]; then
-            cp "/app/won_oss_server/keys/$$key_file" "/data/keys/$$key_file"
+          if [ ! -f "$$KEYS_DIR/$$key_file" ]; then
+            if [ "$$PRODUCT_KEY" = "homeworld" ] && [ -f "$$LEGACY_KEYS/$$key_file" ]; then
+              cp "$$LEGACY_KEYS/$$key_file" "$$KEYS_DIR/$$key_file"
+            elif [ -f "/app/won_oss_server/keys/$$key_file" ]; then
+              cp "/app/won_oss_server/keys/$$key_file" "$$KEYS_DIR/$$key_file"
+            fi
           fi
         done
         exec python /app/won_oss_server/won_server.py \
+          --product "$$PRODUCT_KEY" \
           --host 0.0.0.0 \
-          --port "${BACKEND_PORT:-9100}" \
-          --db-path /data/won_server.db \
+          --port "$$BACKEND_LISTEN_PORT" \
+          --db-path "$$DB_PATH" \
           --shared-secret "${BACKEND_SHARED_SECRET:?set BACKEND_SHARED_SECRET in .env}"
     volumes:
       - ./data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import os,socket; s=socket.create_connection(('127.0.0.1',
+          int(os.environ.get('BACKEND_PORT','9100'))), 2); s.close()"
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+    networks:
+      - won-network
+
+  backend-cataclysm:
+    build: .
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        if [ "${SHARED_EDGE:-0}" != "1" ]; then
+          echo "SHARED_EDGE is disabled; backend-cataclysm idle"
+          exec tail -f /dev/null
+        fi
+        PRODUCT_KEY="cataclysm"
+        PRODUCT_ROOT="/data/$$PRODUCT_KEY"
+        DB_PATH="$$PRODUCT_ROOT/won_server.db"
+        KEYS_DIR="$$PRODUCT_ROOT/keys"
+        HOMEWORLD_KEYS="/data/homeworld/keys"
+
+        mkdir -p "$$PRODUCT_ROOT" "$$KEYS_DIR"
+        if [ ! -f "$$DB_PATH" ] && [ -f /app/won_oss_server/won_server.db ]; then
+          cp /app/won_oss_server/won_server.db "$$DB_PATH"
+        fi
+        for key_file in authserver_private.der authserver_public.der verifier_private.der verifier_public.der kver.kp; do
+          if [ ! -f "$$KEYS_DIR/$$key_file" ]; then
+            if [ -f "$$HOMEWORLD_KEYS/$$key_file" ]; then
+              cp "$$HOMEWORLD_KEYS/$$key_file" "$$KEYS_DIR/$$key_file"
+            elif [ -f "/app/won_oss_server/keys/$$key_file" ]; then
+              cp "/app/won_oss_server/keys/$$key_file" "$$KEYS_DIR/$$key_file"
+            fi
+          fi
+        done
+        exec python /app/won_oss_server/won_server.py \
+          --product "$$PRODUCT_KEY" \
+          --host 0.0.0.0 \
+          --port "${CATACLYSM_BACKEND_PORT:-9101}" \
+          --db-path "$$DB_PATH" \
+          --shared-secret "${BACKEND_SHARED_SECRET:?set BACKEND_SHARED_SECRET in .env}"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          [ "${SHARED_EDGE:-0}" != "1" ] || python -c "import os,socket;
+          s=socket.create_connection(('127.0.0.1',
+          int(os.environ.get('CATACLYSM_BACKEND_PORT','9101'))), 2); s.close()"
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
     networks:
       - won-network
 
   gateway:
     build: .
-    container_name: won-gateway
     restart: unless-stopped
     command:
-      - python
-      - /app/won_oss_server/titan_binary_gateway.py
-      - --host
-      - 0.0.0.0
-      - --port
-      - "${GATEWAY_PORT:-15101}"
-      - --backend-host
-      - backend
-      - --backend-port
-      - "${BACKEND_PORT:-9100}"
-      - --backend-shared-secret
-      - "${BACKEND_SHARED_SECRET:?set BACKEND_SHARED_SECRET in .env}"
-      - --backend-timeout
-      - "${BACKEND_RPC_TIMEOUT:-5}"
-      - --public-host
-      - "${PUBLIC_HOST:?set PUBLIC_HOST to your VPS public IPv4 or DNS name}"
-      - --routing-port
-      - "${ROUTING_PORT:-15100}"
-      - --routing-max-port
-      - "${ROUTING_MAX_PORT:-15120}"
-      - --firewall-port
-      - "${FIREWALL_PORT:-2021}"
-      - --admin-host
-      - 0.0.0.0
-      - --admin-port
-      - "${ADMIN_PORT:-8080}"
-      - --admin-token
-      - "${ADMIN_TOKEN:?set ADMIN_TOKEN in .env for the Docker-published dashboard}"
-      - --stats-token
-      - "${STATS_TOKEN:-}"
-      - --db-path
-      - /data/won_server.db
-      - --keys-dir
-      - /data/keys
-      - --log
-      - "${LOG_LEVEL:-INFO}"
+      - /bin/sh
+      - -ec
+      - |
+        LEGACY_DB="/data/won_server.db"
+        LEGACY_KEYS="/data/keys"
+        HOMEWORLD_KEYS_ROOT="/data/homeworld/keys"
+
+        seed_product_root() {
+          product_key="$$1"
+          product_root="/data/$$product_key"
+          db_path="$$product_root/won_server.db"
+          keys_dir="$$product_root/keys"
+
+          mkdir -p "$$product_root" "$$keys_dir"
+          if [ ! -f "$$db_path" ]; then
+            if [ "$$product_key" = "homeworld" ] && [ -f "$$LEGACY_DB" ]; then
+              cp "$$LEGACY_DB" "$$db_path"
+            elif [ -f /app/won_oss_server/won_server.db ]; then
+              cp /app/won_oss_server/won_server.db "$$db_path"
+            fi
+          fi
+          for key_file in authserver_private.der authserver_public.der verifier_private.der verifier_public.der kver.kp; do
+            if [ ! -f "$$keys_dir/$$key_file" ]; then
+              if [ "$$product_key" = "homeworld" ] && [ -f "$$LEGACY_KEYS/$$key_file" ]; then
+                cp "$$LEGACY_KEYS/$$key_file" "$$keys_dir/$$key_file"
+              elif [ "$$product_key" = "cataclysm" ] && [ -f "$$HOMEWORLD_KEYS_ROOT/$$key_file" ]; then
+                cp "$$HOMEWORLD_KEYS_ROOT/$$key_file" "$$keys_dir/$$key_file"
+              elif [ -f "/app/won_oss_server/keys/$$key_file" ]; then
+                cp "/app/won_oss_server/keys/$$key_file" "$$keys_dir/$$key_file"
+              fi
+            fi
+          done
+        }
+
+        if [ "${SHARED_EDGE:-0}" = "1" ]; then
+          HOMEWORLD_DB="/data/homeworld/won_server.db"
+          HOMEWORLD_KEYS="/data/homeworld/keys"
+          CATACLYSM_DB="/data/cataclysm/won_server.db"
+          CATACLYSM_KEYS="/data/cataclysm/keys"
+          seed_product_root homeworld
+          seed_product_root cataclysm
+          exec python /app/won_oss_server/titan_binary_gateway.py \
+            --shared-edge \
+            --product "${EDGE_DEFAULT_PRODUCT:-homeworld}" \
+            --host 0.0.0.0 \
+            --port "${GATEWAY_PORT:-15101}" \
+            --backend-host backend \
+            --backend-port "${BACKEND_PORT:-9100}" \
+            --cataclysm-backend-host backend-cataclysm \
+            --cataclysm-backend-port "${CATACLYSM_BACKEND_PORT:-9101}" \
+            --backend-shared-secret "${BACKEND_SHARED_SECRET:?set BACKEND_SHARED_SECRET in .env}" \
+            --backend-timeout "${BACKEND_RPC_TIMEOUT:-5}" \
+            --public-host "${PUBLIC_HOST:?set PUBLIC_HOST to your VPS public IPv4 or DNS name}" \
+            --routing-port "${ROUTING_PORT:-15100}" \
+            --routing-max-port "${ROUTING_MAX_PORT:-15120}" \
+            --firewall-port "${FIREWALL_PORT:-2021}" \
+            --admin-host 0.0.0.0 \
+            --admin-port "${ADMIN_PORT:-8080}" \
+            --admin-token "${ADMIN_TOKEN:?set ADMIN_TOKEN in .env for the Docker-published dashboard}" \
+            --stats-token "${STATS_TOKEN:-}" \
+            --db-path "$$HOMEWORLD_DB" \
+            --cataclysm-db-path "$$CATACLYSM_DB" \
+            --keys-dir "$$HOMEWORLD_KEYS" \
+            --cataclysm-keys-dir "$$CATACLYSM_KEYS" \
+            --log "${LOG_LEVEL:-INFO}"
+        fi
+
+        PRODUCT_KEY="${PRODUCT:-homeworld}"
+        PRODUCT_ROOT="/data/$$PRODUCT_KEY"
+        DB_PATH="$$PRODUCT_ROOT/won_server.db"
+        KEYS_DIR="$$PRODUCT_ROOT/keys"
+        seed_product_root "$$PRODUCT_KEY"
+        exec python /app/won_oss_server/titan_binary_gateway.py \
+          --product "$$PRODUCT_KEY" \
+          --host 0.0.0.0 \
+          --port "${GATEWAY_PORT:-15101}" \
+          --backend-host backend \
+          --backend-port "${BACKEND_PORT:-9100}" \
+          --backend-shared-secret "${BACKEND_SHARED_SECRET:?set BACKEND_SHARED_SECRET in .env}" \
+          --backend-timeout "${BACKEND_RPC_TIMEOUT:-5}" \
+          --public-host "${PUBLIC_HOST:?set PUBLIC_HOST to your VPS public IPv4 or DNS name}" \
+          --routing-port "${ROUTING_PORT:-15100}" \
+          --routing-max-port "${ROUTING_MAX_PORT:-15120}" \
+          --firewall-port "${FIREWALL_PORT:-2021}" \
+          --admin-host 0.0.0.0 \
+          --admin-port "${ADMIN_PORT:-8080}" \
+          --admin-token "${ADMIN_TOKEN:?set ADMIN_TOKEN in .env for the Docker-published dashboard}" \
+          --stats-token "${STATS_TOKEN:-}" \
+          --db-path "$$DB_PATH" \
+          --keys-dir "$$KEYS_DIR" \
+          --log "${LOG_LEVEL:-INFO}"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+      backend-cataclysm:
+        condition: service_healthy
     ports:
-      - "${GATEWAY_PORT:-15101}:${GATEWAY_PORT:-15101}"
-      - "${ROUTING_PORT:-15100}-${ROUTING_MAX_PORT:-15120}:${ROUTING_PORT:-15100}-${ROUTING_MAX_PORT:-15120}"
-      - "${FIREWALL_PORT:-2021}:${FIREWALL_PORT:-2021}"
+      - "${PORT_BIND_IP:-0.0.0.0}:${GATEWAY_PORT:-15101}:${GATEWAY_PORT:-15101}"
+      - "${PORT_BIND_IP:-0.0.0.0}:${ROUTING_PORT:-15100}-${ROUTING_MAX_PORT:-15120}:${ROUTING_PORT:-15100}-${ROUTING_MAX_PORT:-15120}"
+      - "${PORT_BIND_IP:-0.0.0.0}:${FIREWALL_PORT:-2021}:${FIREWALL_PORT:-2021}"
       - "127.0.0.1:${ADMIN_PORT:-8080}:${ADMIN_PORT:-8080}"
     volumes:
       - ./data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import json,os,sys,urllib.request; port=os.environ.get('ADMIN_PORT','8080');
+          health=json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=2));
+          ready=json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/ready', timeout=2));
+          sys.exit(0 if health.get('ok') and ready.get('ready') else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
     networks:
       - won-network
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 
 import titan_binary_gateway
 
@@ -95,3 +97,174 @@ def test_dashboard_snapshot_marks_unpublished_active_room_as_game_room() -> None
     assert snapshot["servers"][0]["active_game_count"] == 1
     assert snapshot["rooms"][0]["is_game_room"] is True
     assert snapshot["rooms"][0]["active_game_count"] == 1
+
+
+def test_dashboard_snapshot_marks_cataclysm_published_room_as_game_when_peer_data_is_recent() -> None:
+    manager = titan_binary_gateway.RoutingServerManager(
+        host="127.0.0.1",
+        public_host="127.0.0.1",
+        base_port=15110,
+        product_profile=titan_binary_gateway.CATACLYSM_PRODUCT_PROFILE,
+    )
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15110,
+        publish_in_directory=True,
+        product_profile=titan_binary_gateway.CATACLYSM_PRODUCT_PROFILE,
+    )
+    for client_id, name in ((1, "Alpha"), (2, "Bravo")):
+        server._native_clients[client_id] = titan_binary_gateway.NativeRouteClientState(
+            client_id=client_id,
+            client_name_raw=name.encode("ascii"),
+            client_name=name,
+            client_ip=f"1.2.3.{client_id}",
+            client_ip_u32=0,
+            writer=None,  # type: ignore[arg-type]
+            session_key=b"",
+            out_seq=None,
+            peer_data_messages=12,
+            peer_data_bytes=4096,
+        )
+    server._last_peer_data_at = time.time()
+    manager._servers[15110] = server
+
+    snapshot = manager.dashboard_snapshot()
+
+    assert snapshot["current_game_room_count"] == 1
+    assert snapshot["servers"][0]["is_game_room"] is True
+    assert snapshot["rooms"][0]["is_game_room"] is True
+
+
+def test_dashboard_snapshot_does_not_leave_cataclysm_published_room_stuck_as_game() -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15110,
+        publish_in_directory=True,
+        product_profile=titan_binary_gateway.CATACLYSM_PRODUCT_PROFILE,
+    )
+    server._native_clients[1] = titan_binary_gateway.NativeRouteClientState(
+        client_id=1,
+        client_name_raw=b"Alpha",
+        client_name="Alpha",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+        peer_data_messages=20,
+        peer_data_bytes=8192,
+    )
+    server._last_peer_data_at = (
+        time.time() - titan_binary_gateway.PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS - 1.0
+    )
+
+    snapshot = server.dashboard_snapshot()
+
+    assert snapshot["is_game_room"] is False
+    assert snapshot["active_game_count"] == 0
+
+
+def test_reconnect_reservations_are_not_offered_for_published_lobbies() -> None:
+    lobby_server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15100,
+        publish_in_directory=True,
+    )
+    game_server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15110,
+        publish_in_directory=False,
+    )
+    client = titan_binary_gateway.NativeRouteClientState(
+        client_id=1,
+        client_name_raw=b"Alpha",
+        client_name="Alpha",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+
+    assert lobby_server._should_offer_reconnect(client, "eof") is False
+    assert game_server._should_offer_reconnect(client, "eof") is True
+
+
+def test_cataclysm_published_room_offers_reconnect_when_recent_gameplay_is_active() -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15110,
+        publish_in_directory=True,
+        product_profile=titan_binary_gateway.CATACLYSM_PRODUCT_PROFILE,
+    )
+    client = titan_binary_gateway.NativeRouteClientState(
+        client_id=1,
+        client_name_raw=b"Alpha",
+        client_name="Alpha",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+        peer_data_messages=20,
+        peer_data_bytes=8192,
+    )
+    server._last_peer_data_at = time.time()
+
+    assert server._should_offer_reconnect(client, "connection_reset") is True
+
+
+def test_cataclysm_published_room_does_not_offer_reconnect_after_gameplay_goes_stale() -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15110,
+        publish_in_directory=True,
+        product_profile=titan_binary_gateway.CATACLYSM_PRODUCT_PROFILE,
+    )
+    client = titan_binary_gateway.NativeRouteClientState(
+        client_id=1,
+        client_name_raw=b"Alpha",
+        client_name="Alpha",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+        peer_data_messages=20,
+        peer_data_bytes=8192,
+    )
+    server._last_peer_data_at = (
+        time.time() - titan_binary_gateway.PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS - 1.0
+    )
+
+    assert server._should_offer_reconnect(client, "connection_reset") is False
+
+
+def test_game_room_peer_data_logs_include_packet_fingerprint(caplog) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+
+    with caplog.at_level(logging.INFO):
+        server._log_native_peer_data_event(
+            "SendDataBroadcast",
+            7,
+            b"\x01\x02\x03\x04",
+            1,
+            False,
+        )
+
+    assert "fingerprint=4b:" in caplog.text
+
+
+def test_published_lobby_peer_data_logs_omit_packet_fingerprint(caplog) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15100,
+        publish_in_directory=True,
+    )
+
+    with caplog.at_level(logging.INFO):
+        server._log_native_peer_data_event(
+            "SendDataBroadcast",
+            7,
+            b"\x01\x02\x03\x04",
+            1,
+            False,
+        )
+
+    assert "fingerprint=" not in caplog.text
