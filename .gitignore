@@ -14,11 +14,8 @@ SERVER_CODE_WALKTHROUGH.md
 sync_cataclysm_keygen_port.ps1
 generate_keys.py
 generate_cdkeys.py
-docs/*
-!docs/cataclysm-bootstrap-notes.md
-!docs/unified-edge-two-backend-architecture.md
 discord_stats_bot.py
 HWOnlineSetup.exe
 requirements-discord-bot.txt
-docs/
+!docs/server-setup.md
 examples/
