@@ -156,9 +156,11 @@ class _FakeRepoMonitor:
             "upstream": "origin/main",
             "local_commit": "111111111111",
             "local_short": "111111111111",
+            "local_label": "111111111111",
             "local_version": "installer-v1",
             "remote_commit": "222222222222",
             "remote_short": "222222222222",
+            "remote_label": "222222222222",
             "remote_version": "installer-v2",
             "ahead": 0,
             "behind": 1,
@@ -192,6 +194,7 @@ class _FakeRepoMonitor:
         self.updated += 1
         self._snapshot["local_commit"] = "222222222222"
         self._snapshot["local_short"] = "222222222222"
+        self._snapshot["local_label"] = "222222222222"
         self._snapshot["local_version"] = "installer-v2"
         self._snapshot["behind"] = 0
         self._snapshot["can_update"] = False
@@ -254,9 +257,22 @@ def test_admin_snapshot_includes_repo_metadata() -> None:
 
     snapshot = dashboard.snapshot(rows_per_table=1, log_limit=1, activity_limit=1)
 
+    assert snapshot["repo"]["local_label"] == "111111111111"
+    assert snapshot["repo"]["remote_label"] == "222222222222"
     assert snapshot["repo"]["local_version"] == "installer-v1"
     assert snapshot["repo"]["remote_version"] == "installer-v2"
     assert snapshot["repo"]["update_available"] is True
+
+
+def test_git_repo_monitor_snapshot_exposes_commit_first_labels(tmp_path: Path) -> None:
+    monitor = titan_binary_gateway.GitRepoMonitor(str(tmp_path))
+
+    snapshot = monitor.snapshot()
+
+    assert "local_label" in snapshot
+    assert "remote_label" in snapshot
+    assert snapshot["local_label"] == ""
+    assert snapshot["remote_label"] == ""
 
 
 def test_admin_snapshot_includes_product_scoped_databases(tmp_path: Path) -> None:

@@ -937,7 +937,7 @@ class AdminDashboardServer:
       let label="Up to date",color="var(--success)";
       if(repo.last_error){label="Check failed";color="var(--danger)";}
       else if(repo.status==="diverged"){label="Diverged";color="var(--danger)";}
-      else if(repo.status==="ahead"){label="Local ahead";color="var(--warning)";}
+      else if(repo.status==="ahead"){label="Ahead of upstream";color="var(--warning)";}
       else if(repo.status==="no_upstream"){label="No upstream";color="var(--warning)";}
       else if(repo.update_available){label="Update available";color="var(--warning)";}
       const dirty=repo.dirty?` <span class="pill">dirty</span>`:"";
@@ -958,7 +958,7 @@ class AdminDashboardServer:
       const up=snapshot.uptime_seconds||0;
       const gw=snapshot.gateway||{};
       const repo=snapshot.repo||{};
-      const extra=repo.local_version?`<br>${esc(repo.local_version)}${repo.update_available?' &middot; update available':''}`:"";
+      const extra=repo.local_label?`<br>${esc(repo.local_label)}${repo.update_available?' &middot; update available':''}`:"";
       sidebarFooter.innerHTML=`<span class="status-dot ok"></span> Online ${age(up)}<br>${esc(gw.product||"")} &middot; ${esc(gw.version_str||"")} &middot; ${esc(gw.public_host||"")}${extra}`;
     }
 
@@ -1067,8 +1067,10 @@ class AdminDashboardServer:
               <div class="k">Status</div><div class="v">${repoSummary(repo)}</div>
               <div class="k">Branch</div><div class="v">${esc(repo.branch||"")}</div>
               <div class="k">Upstream</div><div class="v">${esc(repo.upstream||"")}</div>
-              <div class="k">Local Version</div><div class="v">${esc(repo.local_version||repo.local_short||"")}</div>
-              <div class="k">GitHub Version</div><div class="v">${esc(repo.remote_version||repo.remote_short||"")}</div>
+              <div class="k">Local Commit</div><div class="v">${esc(repo.local_label||repo.local_short||"")}</div>
+              <div class="k">GitHub Commit</div><div class="v">${esc(repo.remote_label||repo.remote_short||"")}</div>
+              <div class="k">Local Describe</div><div class="v">${esc(repo.local_version||"")}</div>
+              <div class="k">GitHub Describe</div><div class="v">${esc(repo.remote_version||"")}</div>
               <div class="k">Ahead / Behind</div><div class="v">${esc(repo.ahead||0)} / ${esc(repo.behind||0)}</div>
               <div class="k">Last Checked</div><div class="v">${repo.last_checked_at?esc(new Date(repo.last_checked_at*1000).toLocaleString()):"Never"}</div>
               <div class="k">Last Updated</div><div class="v">${repo.last_update_at?esc(new Date(repo.last_update_at*1000).toLocaleString()):"Never"}</div>

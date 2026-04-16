@@ -42,9 +42,11 @@ class GitRepoMonitor:
                 "upstream": "",
                 "local_commit": "",
                 "local_short": "",
+                "local_label": "",
                 "local_version": "",
                 "remote_commit": "",
                 "remote_short": "",
+                "remote_label": "",
                 "remote_version": "",
                 "ahead": 0,
                 "behind": 0,
@@ -126,9 +128,11 @@ class GitRepoMonitor:
             "upstream": "",
             "local_commit": "",
             "local_short": "",
+            "local_label": "",
             "local_version": "",
             "remote_commit": "",
             "remote_short": "",
+            "remote_label": "",
             "remote_version": "",
             "ahead": 0,
             "behind": 0,
@@ -151,6 +155,7 @@ class GitRepoMonitor:
             snapshot["branch"] = self._git_text("rev-parse", "--abbrev-ref", "HEAD")
             snapshot["local_commit"] = self._git_text("rev-parse", "HEAD")
             snapshot["local_short"] = str(snapshot["local_commit"])[:12]
+            snapshot["local_label"] = str(snapshot["local_short"] or snapshot["local_commit"])
             with contextlib.suppress(Exception):
                 snapshot["local_version"] = self._git_text("describe", "--tags", "--always", "--dirty")
             with contextlib.suppress(Exception):
@@ -172,6 +177,7 @@ class GitRepoMonitor:
                 with contextlib.suppress(Exception):
                     snapshot["remote_commit"] = self._git_text("rev-parse", "@{u}")
                 snapshot["remote_short"] = str(snapshot["remote_commit"])[:12] if snapshot["remote_commit"] else ""
+                snapshot["remote_label"] = str(snapshot["remote_short"] or snapshot["remote_commit"] or "")
                 with contextlib.suppress(Exception):
                     snapshot["remote_version"] = self._git_text("describe", "--tags", "--always", "@{u}")
                 counts = self._git_text("rev-list", "--left-right", "--count", "HEAD...@{u}")
@@ -239,7 +245,7 @@ class GitRepoMonitor:
             return {"ok": True, "updated": False, "message": "Already up to date.", "git": before}
 
         old_commit = str(before.get("local_commit") or "")
-        old_label = str(before.get("local_version") or before.get("local_short") or old_commit[:12])
+        old_label = str(before.get("local_label") or before.get("local_short") or old_commit[:12])
         merge = self._run_git("merge", "--ff-only", str(before["upstream"]), timeout=60.0)
         if merge.returncode != 0:
             after_fail = self._collect_snapshot_sync(fetch_remote=False)
@@ -253,7 +259,7 @@ class GitRepoMonitor:
 
         after = self._collect_snapshot_sync(fetch_remote=False)
         new_commit = str(after.get("local_commit") or "")
-        new_label = str(after.get("local_version") or after.get("local_short") or new_commit[:12])
+        new_label = str(after.get("local_label") or after.get("local_short") or new_commit[:12])
         diff = self._run_git("diff", "--name-only", f"{old_commit}..{new_commit}", timeout=20.0)
         changed_files = [line.strip() for line in diff.stdout.splitlines() if line.strip()]
         self._last_update_message = (
