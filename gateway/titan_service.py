@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from collections import deque
 import contextlib
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -26,6 +28,7 @@ from .product_profile import (
 
 globals().update({name: getattr(_protocol, name) for name in dir(_protocol) if name.startswith('_')})
 LOGGER = logging.getLogger(__name__)
+LEAVE_FOR_GAME_WINDOW_SECONDS = 3.0
 
 class BinaryGatewayServer:
     def __init__(self, backend_host: str, backend_port: int,
@@ -48,6 +51,7 @@ class BinaryGatewayServer:
         self.backend_shared_secret = backend_shared_secret.strip()
         self.backend_timeout_s = max(1.0, float(backend_timeout_s))
         self.event_bus = event_bus or GatewayEventBus()
+        self.live_feed_bus = GatewayLiveFeedBus()
         self.product_profile = product_profile
         self.public_host = public_host
         self.public_port = public_port
@@ -85,6 +89,8 @@ class BinaryGatewayServer:
         self._banned_ips: Dict[str, str] = {}
         self.routing_manager: Optional[RoutingServerManager] = None
         self._maintenance_task: Optional[asyncio.Task] = None
+        self._live_feed_event_id = 0
+        self._live_matches: Dict[int, Dict[str, object]] = {}
         self.started_at = time.time()
         if keys_dir:
             self._load_keys(keys_dir)
@@ -235,14 +241,79 @@ class BinaryGatewayServer:
             if count_key in stats:
                 stats[count_key] = int(stats[count_key]) + 1
 
-    def _activity_snapshot(self, limit: int = 150) -> list[Dict[str, object]]:
+    @staticmethod
+    def _mark_activity_left_for_game(event: Dict[str, object]) -> None:
+        details = event.get("details")
+        if isinstance(details, dict):
+            copied = dict(details)
+        else:
+            copied = {}
+        copied["left_for_game"] = True
+        event["details"] = copied
+
+    def _activity_base_ports(self) -> Dict[str, int]:
+        return {self.product_profile.key: int(self.routing_port)}
+
+    def _annotate_activity_transitions(
+        self,
+        events: list[Dict[str, object]],
+        *,
+        base_ports_by_product: Dict[str, int],
+    ) -> None:
+        leave_events_by_player: Dict[tuple[str, str, str], list[Dict[str, object]]] = {}
+        for event in events:
+            if str(event.get("kind") or "") != "leave":
+                continue
+            product = str(event.get("product") or self.product_profile.key)
+            base_port = int(base_ports_by_product.get(product) or 0)
+            port = int(event.get("room_port") or 0)
+            if not base_port or not port:
+                continue
+            player_name = str(event.get("player_name") or "")
+            player_ip = str(event.get("player_ip") or "")
+            if not player_name and not player_ip:
+                continue
+            key = (product, player_name, player_ip)
+            event_ts = float(event.get("ts") or 0.0)
+            bucket = leave_events_by_player.setdefault(key, [])
+            bucket[:] = [
+                previous
+                for previous in bucket
+                if abs(event_ts - float(previous.get("ts") or 0.0)) <= LEAVE_FOR_GAME_WINDOW_SECONDS
+            ]
+            for previous in bucket:
+                previous_port = int(previous.get("room_port") or 0)
+                if previous_port == port:
+                    continue
+                if (previous_port == base_port) == (port == base_port):
+                    continue
+                self._mark_activity_left_for_game(previous)
+                self._mark_activity_left_for_game(event)
+            bucket.append(event)
+
+    def _activity_snapshot(
+        self,
+        limit: int = 150,
+        *,
+        base_ports_by_product: Optional[Dict[str, int]] = None,
+    ) -> list[Dict[str, object]]:
         if limit <= 0:
             return []
         join_leave_chat = [
             entry for entry in self._activity
             if entry.get("kind") in {"join", "rejoin", "leave", "chat", "broadcast"}
         ]
-        return list(join_leave_chat)[-limit:][::-1]
+        events: list[Dict[str, object]] = []
+        for entry in list(join_leave_chat)[-limit:]:
+            copied = dict(entry)
+            if isinstance(copied.get("details"), dict):
+                copied["details"] = dict(copied["details"])
+            events.append(copied)
+        self._annotate_activity_transitions(
+            events,
+            base_ports_by_product=base_ports_by_product or self._activity_base_ports(),
+        )
+        return events[::-1]
 
     def _ip_activity_snapshot(self, limit: int = 50) -> list[Dict[str, object]]:
         rows = []
@@ -275,6 +346,258 @@ class BinaryGatewayServer:
         self._activity.clear()
         self._activity_counts.clear()
         self._ip_activity.clear()
+
+    def subscribe_live_feed(self, maxsize: int = 1024) -> asyncio.Queue:
+        return self.live_feed_bus.subscribe(maxsize=maxsize)
+
+    def unsubscribe_live_feed(self, queue: asyncio.Queue) -> None:
+        self.live_feed_bus.unsubscribe(queue)
+
+    def _next_live_feed_event_id(self) -> str:
+        self._live_feed_event_id += 1
+        return str(self._live_feed_event_id)
+
+    @staticmethod
+    def _live_payload_preview_hex(payload: bytes, limit: int = 32) -> str:
+        return bytes(payload or b"")[:limit].hex()
+
+    @staticmethod
+    def _live_payload_fingerprint(payload: bytes) -> str:
+        raw = bytes(payload or b"")
+        if not raw:
+            return "empty"
+        digest = hashlib.blake2s(raw, digest_size=6).hexdigest()
+        return f"{len(raw)}b:{digest}:{raw[:8].hex()}"
+
+    def _publish_live_feed_event(
+        self,
+        event_name: str,
+        payload: Dict[str, object],
+    ) -> Dict[str, object]:
+        event = {
+            "id": self._next_live_feed_event_id(),
+            "event": event_name,
+            "ts": time.time(),
+            "product": self.product_profile.key,
+        }
+        event.update(payload)
+        self.live_feed_bus.publish(event)
+        return event
+
+    def _routing_room_snapshot(self, room_port: int) -> Dict[str, object]:
+        if self.routing_manager is None:
+            return {}
+        get_server = getattr(self.routing_manager, "get_server", None)
+        if callable(get_server):
+            room_server = get_server(int(room_port))
+            snapshot_fn = getattr(room_server, "dashboard_snapshot", None)
+            if callable(snapshot_fn):
+                snapshot = snapshot_fn()
+                if isinstance(snapshot, dict):
+                    return dict(snapshot)
+        routing_snapshot = self._routing_dashboard_snapshot()
+        for room in routing_snapshot.get("rooms", []) or []:
+            if not isinstance(room, dict):
+                continue
+            port = int(room.get("listen_port") or room.get("port") or 0)
+            if port == int(room_port):
+                return dict(room)
+        return {}
+
+    @staticmethod
+    def _room_participant_count(snapshot: Dict[str, object]) -> int:
+        clients = snapshot.get("clients", []) or []
+        pending = snapshot.get("pending_reconnects", []) or []
+        return len(clients) + len(pending)
+
+    @staticmethod
+    def _room_is_live_match(snapshot: Dict[str, object]) -> bool:
+        if not bool(snapshot.get("is_game_room", False)):
+            return False
+        if BinaryGatewayServer._room_participant_count(snapshot) < 2:
+            return False
+        return any(
+            int(snapshot.get(key) or 0) > 0
+            for key in ("peer_data_messages", "peer_data_bytes", "data_object_count", "game_count", "active_game_count")
+        )
+
+    def _live_match_payload(
+        self,
+        room_port: int,
+        snapshot: Dict[str, object],
+        state: Dict[str, object],
+        *,
+        now: Optional[float] = None,
+    ) -> Dict[str, object]:
+        current = float(now if now is not None else time.time())
+        games = snapshot.get("games", []) or []
+        first_game = games[0] if games and isinstance(games[0], dict) else {}
+        return {
+            "match_id": state["match_id"],
+            "room_port": int(room_port),
+            "room_name": str(snapshot.get("room_display_name") or snapshot.get("room_name") or state.get("room_name") or ""),
+            "room_path": str(snapshot.get("room_path") or state.get("room_path") or ""),
+            "participant_count": self._room_participant_count(snapshot),
+            "started_at": float(state["started_at"]),
+            "duration_seconds": int(max(0.0, current - float(state["started_at"]))),
+            "peer_data_messages": int(snapshot.get("peer_data_messages") or 0),
+            "peer_data_bytes": int(snapshot.get("peer_data_bytes") or 0),
+            "data_object_count": int(snapshot.get("data_object_count") or 0),
+            "game_count": int(snapshot.get("game_count") or len(games)),
+            "game_name": str(first_game.get("name") or ""),
+            "owner_name": str(first_game.get("owner_name") or ""),
+        }
+
+    def _sync_live_match_state(
+        self,
+        room_port: int,
+        *,
+        snapshot: Optional[Dict[str, object]] = None,
+        emit_update: bool = False,
+    ) -> Optional[str]:
+        room_port = int(room_port)
+        room_snapshot = dict(snapshot or self._routing_room_snapshot(room_port))
+        now = time.time()
+        state = self._live_matches.get(room_port)
+        is_live = self._room_is_live_match(room_snapshot)
+
+        if is_live and state is None:
+            state = {
+                "match_id": f"{self.product_profile.key}:{room_port}:{int(now * 1000)}",
+                "started_at": now,
+                "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
+                "room_path": str(room_snapshot.get("room_path") or ""),
+            }
+            self._live_matches[room_port] = state
+            self._publish_live_feed_event(
+                "match_started",
+                self._live_match_payload(room_port, room_snapshot, state, now=now),
+            )
+            return str(state["match_id"])
+
+        if is_live and state is not None:
+            state["room_name"] = str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or state.get("room_name") or "")
+            state["room_path"] = str(room_snapshot.get("room_path") or state.get("room_path") or "")
+            if emit_update:
+                self._publish_live_feed_event(
+                    "match_updated",
+                    self._live_match_payload(room_port, room_snapshot, state, now=now),
+                )
+            return str(state["match_id"])
+
+        if state is not None:
+            participants = self._room_participant_count(room_snapshot)
+            if participants <= 0:
+                self._publish_live_feed_event(
+                    "match_finished",
+                    self._live_match_payload(room_port, room_snapshot, state, now=now),
+                )
+                self._live_matches.pop(room_port, None)
+                return None
+            if emit_update:
+                self._publish_live_feed_event(
+                    "match_updated",
+                    self._live_match_payload(room_port, room_snapshot, state, now=now),
+                )
+            return str(state["match_id"])
+
+        return None
+
+    def record_live_player_event(
+        self,
+        event_name: str,
+        *,
+        room_port: int,
+        player_id: int,
+        player_name: str,
+        player_ip: str = "",
+        details: Optional[Dict[str, object]] = None,
+    ) -> None:
+        room_snapshot = self._routing_room_snapshot(room_port)
+        existing = self._live_matches.get(int(room_port))
+        payload: Dict[str, object] = {
+            "room_port": int(room_port),
+            "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
+            "room_path": str(room_snapshot.get("room_path") or ""),
+            "player_id": int(player_id),
+            "player_name": str(player_name),
+            "player_ip": str(player_ip or ""),
+            "participant_count": self._room_participant_count(room_snapshot),
+        }
+        if existing is not None:
+            payload["match_id"] = str(existing["match_id"])
+        if details:
+            payload["details"] = dict(details)
+        self._publish_live_feed_event(event_name, payload)
+        self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+
+    def record_live_routing_object_event(
+        self,
+        event_name: str,
+        *,
+        room_port: int,
+        link_id: int,
+        owner_id: int,
+        owner_name: str,
+        data_type_text: str,
+        payload: bytes,
+        lifespan: int = 0,
+    ) -> None:
+        room_snapshot = self._routing_room_snapshot(room_port)
+        match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=False)
+        raw_payload = bytes(payload or b"")
+        event_payload: Dict[str, object] = {
+            "room_port": int(room_port),
+            "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
+            "room_path": str(room_snapshot.get("room_path") or ""),
+            "link_id": int(link_id),
+            "owner_id": int(owner_id),
+            "owner_name": str(owner_name or ""),
+            "data_type_text": str(data_type_text or ""),
+            "lifespan": int(lifespan),
+            "payload_len": len(raw_payload),
+            "payload_preview_hex": self._live_payload_preview_hex(raw_payload),
+            "payload_base64": base64.b64encode(raw_payload).decode("ascii"),
+            "fingerprint": self._live_payload_fingerprint(raw_payload),
+        }
+        if match_id:
+            event_payload["match_id"] = match_id
+        self._publish_live_feed_event(event_name, event_payload)
+        self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+
+    def record_live_peer_packet(
+        self,
+        event_name: str,
+        *,
+        room_port: int,
+        sender_client_id: int,
+        sender_name: str,
+        recipient_client_ids: list[int],
+        recipient_count: int,
+        payload: bytes,
+        packet_kind: str,
+    ) -> None:
+        room_snapshot = self._routing_room_snapshot(room_port)
+        match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=False)
+        raw_payload = bytes(payload or b"")
+        event_payload: Dict[str, object] = {
+            "room_port": int(room_port),
+            "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
+            "room_path": str(room_snapshot.get("room_path") or ""),
+            "sender_client_id": int(sender_client_id),
+            "sender_name": str(sender_name or ""),
+            "recipient_client_ids": [int(client_id) for client_id in recipient_client_ids],
+            "recipient_count": int(recipient_count),
+            "packet_kind": str(packet_kind or ""),
+            "payload_len": len(raw_payload),
+            "payload_preview_hex": self._live_payload_preview_hex(raw_payload),
+            "payload_base64": base64.b64encode(raw_payload).decode("ascii"),
+            "fingerprint": self._live_payload_fingerprint(raw_payload),
+        }
+        if match_id:
+            event_payload["match_id"] = match_id
+        self._publish_live_feed_event(event_name, event_payload)
+        self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
 
     def _routing_dashboard_snapshot(self) -> Dict[str, object]:
         raw_snapshot = (
@@ -1930,6 +2253,10 @@ class SharedBinaryGatewayServer:
         )
         self.default_runtime = self.runtimes[self.default_product_key]
         self.event_bus = self.default_runtime.event_bus
+        shared_live_feed_bus = GatewayLiveFeedBus()
+        for runtime in self.runtimes.values():
+            runtime.live_feed_bus = shared_live_feed_bus
+        self.live_feed_bus = shared_live_feed_bus
         self.public_host = self.default_runtime.public_host
         self.public_port = self.default_runtime.public_port
         self.backend_shared_secret = self.default_runtime.backend_shared_secret
@@ -2030,6 +2357,12 @@ class SharedBinaryGatewayServer:
 
     def clear_activity(self) -> None:
         self.default_runtime.clear_activity()
+
+    def subscribe_live_feed(self, maxsize: int = 1024) -> asyncio.Queue:
+        return self.live_feed_bus.subscribe(maxsize=maxsize)
+
+    def unsubscribe_live_feed(self, queue: asyncio.Queue) -> None:
+        self.live_feed_bus.unsubscribe(queue)
 
     async def _handle_auth1_connection(
         self,
@@ -2553,7 +2886,13 @@ class SharedBinaryGatewayServer:
                 "room_open_count": self._activity_counts.get("room_open", 0),
                 "unique_ip_count": len(self._ip_activity),
             },
-            "activity": self.default_runtime._activity_snapshot(limit=activity_limit),
+            "activity": self.default_runtime._activity_snapshot(
+                limit=activity_limit,
+                base_ports_by_product={
+                    product: int(runtime.routing_port)
+                    for product, runtime in self.runtimes.items()
+                },
+            ),
             "ip_metrics": self.default_runtime._ip_activity_snapshot(limit=50),
             "peer_sessions": peer_sessions,
             "routing_manager": routing_snapshot,

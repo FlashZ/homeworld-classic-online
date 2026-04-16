@@ -85,7 +85,10 @@ OP_SERVER_EVENT = 0x40
 
 TITAN_MAX_FRAME = 65536
 ROUTING_MAX_CHAT_CHARS = 220
-ROUTING_IDLE_TIMEOUT_SECONDS = 1800.0
+# Disabled on purpose: routing clients should stay connected until the
+# transport actually closes or server keepalives fail, not after a fixed idle
+# window.
+ROUTING_IDLE_TIMEOUT_SECONDS = None
 ROUTING_RECONNECT_GRACE_SECONDS = 90.0
 ROOM_ALLOCATION_GRACE_SECONDS = 120.0
 ROUTING_HEARTBEAT_INTERVAL_SECONDS = 15.0
@@ -1544,6 +1547,32 @@ class GatewayEventBus:
     @property
     def subscriber_count(self) -> int:
         return sum(len(qs) for qs in self._subs.values())
+
+
+class GatewayLiveFeedBus:
+    """Broadcast pub/sub for server-side live match and packet observers."""
+
+    def __init__(self) -> None:
+        self._subs: list[asyncio.Queue] = []
+
+    def subscribe(self, maxsize: int = 1024) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subs = [existing for existing in self._subs if existing is not q]
+
+    def publish(self, event: Dict[str, object]) -> None:
+        for q in list(self._subs):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass
+
+    @property
+    def subscriber_count(self) -> int:
+        return len(self._subs)
 
 
 def _to_wire_map(payload: Dict[str, object]) -> Dict[str, str]:

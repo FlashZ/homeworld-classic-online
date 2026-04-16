@@ -142,7 +142,7 @@ class AdminDashboardServer:
         query: Dict[str, list[str]],
         headers: Dict[str, str],
     ) -> bool:
-        if path == "/api/stats":
+        if path in {"/api/stats", "/api/live-feed"}:
             if self.stats_token and self._matches_token(
                 self.stats_token,
                 query,
@@ -420,6 +420,36 @@ class AdminDashboardServer:
             headers.extend(extra_headers)
         headers.extend(["", ""])
         return "\r\n".join(headers).encode("ascii") + body
+
+    @staticmethod
+    def _http_event_stream_headers() -> bytes:
+        headers = [
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/event-stream; charset=utf-8",
+            "Cache-Control: no-store",
+            "Connection: keep-alive",
+            "X-Accel-Buffering: no",
+            "",
+            "",
+        ]
+        return "\r\n".join(headers).encode("ascii")
+
+    @staticmethod
+    def _sse_frame(
+        event_name: str,
+        payload: Dict[str, object],
+        *,
+        event_id: str = "",
+    ) -> bytes:
+        lines: list[str] = []
+        if event_id:
+            lines.append(f"id: {event_id}")
+        lines.append(f"event: {event_name}")
+        body = json.dumps(payload, sort_keys=True)
+        for line in body.splitlines() or ["{}"]:
+            lines.append(f"data: {line}")
+        lines.extend(["", ""])
+        return "\n".join(lines).encode("utf-8")
 
     def _html(self, embedded_token: str = "") -> str:
         return """<!doctype html>
@@ -838,6 +868,7 @@ class AdminDashboardServer:
       const text=String(event.text||"").trim();
       if(text)return text;
       const details=event.details||{};
+      if(details.left_for_game)return "left for a game";
       const port=Number(event.room_port||0);
       const basePort=Number(((snapshot.gateway||{}).routing_port)||0);
       if((event.kind==="join"||event.kind==="rejoin")&&port&&basePort&&port!==basePort){
@@ -1792,6 +1823,51 @@ class AdminDashboardServer:
         elif parsed.path == "/api/stats":
             body = json.dumps(self.gateway.stats_snapshot(), indent=2).encode("utf-8")
             writer.write(self._http_response(body, "application/json; charset=utf-8"))
+        elif parsed.path == "/api/live-feed":
+            subscribe = getattr(self.gateway, "subscribe_live_feed", None)
+            unsubscribe = getattr(self.gateway, "unsubscribe_live_feed", None)
+            if not callable(subscribe) or not callable(unsubscribe):
+                writer.write(
+                    self._http_response(
+                        b"live feed unavailable",
+                        "text/plain; charset=utf-8",
+                        "501 Not Implemented",
+                    )
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+
+            queue = subscribe()
+            writer.write(self._http_event_stream_headers())
+            await writer.drain()
+            try:
+                hello = {
+                    "event": "ready",
+                    "ts": time.time(),
+                    "service": "admin-live-feed",
+                }
+                writer.write(self._sse_frame("ready", hello))
+                await writer.drain()
+                while True:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        writer.write(b": heartbeat\n\n")
+                        await writer.drain()
+                        continue
+                    event_name = str(event.get("event") or "message")
+                    event_id = str(event.get("id") or "")
+                    writer.write(self._sse_frame(event_name, dict(event), event_id=event_id))
+                    await writer.drain()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, asyncio.CancelledError):
+                pass
+            finally:
+                unsubscribe(queue)
+                writer.close()
+                await writer.wait_closed()
+            return
         elif parsed.path == "/":
             writer.write(
                 self._http_response(

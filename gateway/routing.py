@@ -23,6 +23,16 @@ LOGGER = logging.getLogger(__name__)
 
 PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS = 15.0
 
+
+async def _routing_recv_with_idle_timeout(reader: asyncio.StreamReader) -> bytes:
+    timeout = ROUTING_IDLE_TIMEOUT_SECONDS
+    if timeout is None:
+        return await _routing_recv(reader)
+    timeout_value = float(timeout)
+    if timeout_value <= 0.0:
+        return await _routing_recv(reader)
+    return await asyncio.wait_for(_routing_recv(reader), timeout=timeout_value)
+
 @dataclass
 class NativeRouteSubscription:
     link_id: int
@@ -349,6 +359,14 @@ class SilencerRoutingServer:
                 player_id=client_id,
                 player_name=client_name,
                 player_ip=client_ip,
+                details={"reason": disconnect_reason},
+            )
+            self.gateway.record_live_player_event(
+                "player_left",
+                room_port=int(self.listen_port or 0),
+                player_id=int(client_id),
+                player_name=str(client_name),
+                player_ip=str(client_ip),
                 details={"reason": disconnect_reason},
             )
         LOGGER.info(
@@ -1076,6 +1094,17 @@ class SilencerRoutingServer:
                 "Routing(native): AutoDeleteDataObject broadcast sent to %d subscribed clients",
                 delivered,
             )
+            if self.gateway is not None:
+                self.gateway.record_live_routing_object_event(
+                    "routing_object_delete",
+                    room_port=int(self.listen_port or 0),
+                    link_id=int(data_object.link_id),
+                    owner_id=int(data_object.owner_id),
+                    owner_name="",
+                    data_type_text=_decode_routing_data_type(data_object.data_type),
+                    payload=bytes(data_object.data),
+                    lifespan=int(data_object.lifespan),
+                )
         return removed
 
     async def _handle_native_client(
@@ -1199,10 +1228,7 @@ class SilencerRoutingServer:
 
             while True:
                 try:
-                    payload = await asyncio.wait_for(
-                        _routing_recv(reader),
-                        timeout=ROUTING_IDLE_TIMEOUT_SECONDS,
-                    )
+                    payload = await _routing_recv_with_idle_timeout(reader)
                 except asyncio.TimeoutError:
                     disconnect_reason = "idle_timeout"
                     if registered_client_id and registered_client_id in self._native_clients:
@@ -1422,6 +1448,14 @@ class SilencerRoutingServer:
                                 player_name=str(req["client_name"]),
                                 player_ip=client_ip,
                             )
+                            self.gateway.record_live_player_event(
+                                "player_joined",
+                                room_port=int(self.listen_port or 0),
+                                player_id=int(registered_client_id),
+                                player_name=str(req["client_name"]),
+                                player_ip=str(client_ip),
+                                details={"mode": "reconnect" if reconnect is not None else "register"},
+                            )
                         if reconnect is None:
                             delivered = await self._broadcast_native_route_group_change(
                                 _build_mini_routing_group_change_ex(
@@ -1548,6 +1582,21 @@ class SilencerRoutingServer:
                                 "Routing(native): CreateDataObject broadcast sent to %d subscribed clients",
                                 delivered,
                             )
+                        if self.gateway is not None:
+                            self.gateway.record_live_routing_object_event(
+                                "routing_object_upsert",
+                                room_port=int(self.listen_port or 0),
+                                link_id=int(data_object.link_id),
+                                owner_id=int(data_object.owner_id),
+                                owner_name=(
+                                    self._native_clients[data_object.owner_id].client_name
+                                    if data_object.owner_id in self._native_clients
+                                    else ""
+                                ),
+                                data_type_text=_decode_routing_data_type(data_object.data_type),
+                                payload=bytes(data_object.data),
+                                lifespan=int(data_object.lifespan),
+                            )
                         continue
 
                     if service_type == MINI_ROUTING_SERVICE and message_type == ROUTING_REPLACE_DATA_OBJECT:
@@ -1593,6 +1642,21 @@ class SilencerRoutingServer:
                             "Routing(native): ReplaceDataObject broadcast sent to %d subscribed clients",
                             delivered,
                         )
+                        if self.gateway is not None:
+                            self.gateway.record_live_routing_object_event(
+                                "routing_object_upsert",
+                                room_port=int(self.listen_port or 0),
+                                link_id=int(data_object.link_id),
+                                owner_id=int(data_object.owner_id),
+                                owner_name=(
+                                    self._native_clients[data_object.owner_id].client_name
+                                    if data_object.owner_id in self._native_clients
+                                    else ""
+                                ),
+                                data_type_text=_decode_routing_data_type(data_object.data_type),
+                                payload=bytes(data_object.data),
+                                lifespan=int(data_object.lifespan),
+                            )
                         continue
 
                     if service_type == MINI_ROUTING_SERVICE and message_type == ROUTING_DELETE_DATA_OBJECT:
@@ -1627,6 +1691,21 @@ class SilencerRoutingServer:
                                 "Routing(native): DeleteDataObject broadcast sent to %d subscribed clients",
                                 delivered,
                             )
+                            if self.gateway is not None:
+                                self.gateway.record_live_routing_object_event(
+                                    "routing_object_delete",
+                                    room_port=int(self.listen_port or 0),
+                                    link_id=int(existing.link_id),
+                                    owner_id=int(existing.owner_id),
+                                    owner_name=(
+                                        self._native_clients[existing.owner_id].client_name
+                                        if existing.owner_id in self._native_clients
+                                        else ""
+                                    ),
+                                    data_type_text=_decode_routing_data_type(existing.data_type),
+                                    payload=bytes(existing.data),
+                                    lifespan=int(existing.lifespan),
+                                )
                         continue
 
                     if service_type == MINI_ROUTING_SERVICE and message_type == ROUTING_RENEW_DATA_OBJECT:
@@ -1720,6 +1799,22 @@ class SilencerRoutingServer:
                             delivered,
                             bool(req["should_send_reply"]),
                         )
+                        if self.gateway is not None:
+                            sender_name = (
+                                self._native_clients[registered_client_id].client_name
+                                if registered_client_id in self._native_clients
+                                else ""
+                            )
+                            self.gateway.record_live_peer_packet(
+                                "peer_packet",
+                                room_port=int(self.listen_port or 0),
+                                sender_client_id=int(registered_client_id or 0),
+                                sender_name=sender_name,
+                                recipient_client_ids=[int(client_id) for client_id in req["addressees"]],
+                                recipient_count=int(delivered),
+                                payload=bytes(req["data"]),
+                                packet_kind="SendData",
+                            )
                         if req["should_send_reply"]:
                             out_seq = await self._send_native_route_reply(
                                 writer,
@@ -1750,6 +1845,27 @@ class SilencerRoutingServer:
                             delivered,
                             bool(req["should_send_reply"]),
                         )
+                        if self.gateway is not None:
+                            sender_name = (
+                                self._native_clients[registered_client_id].client_name
+                                if registered_client_id in self._native_clients
+                                else ""
+                            )
+                            recipient_ids = [
+                                int(client_id)
+                                for client_id in self._native_clients
+                                if int(client_id) != int(registered_client_id or 0)
+                            ]
+                            self.gateway.record_live_peer_packet(
+                                "peer_packet",
+                                room_port=int(self.listen_port or 0),
+                                sender_client_id=int(registered_client_id or 0),
+                                sender_name=sender_name,
+                                recipient_client_ids=recipient_ids,
+                                recipient_count=int(delivered),
+                                payload=bytes(req["data"]),
+                                packet_kind="SendDataBroadcast",
+                            )
                         if req["should_send_reply"]:
                             out_seq = await self._send_native_route_reply(
                                 writer,
@@ -1829,6 +1945,14 @@ class SilencerRoutingServer:
                                 player_id=registered_client_id,
                                 player_name=reconnect.client_name,
                                 player_ip=client_ip,
+                                details={"mode": "routing_reconnect"},
+                            )
+                            self.gateway.record_live_player_event(
+                                "player_joined",
+                                room_port=int(self.listen_port or 0),
+                                player_id=int(registered_client_id),
+                                player_name=str(reconnect.client_name),
+                                player_ip=str(client_ip),
                                 details={"mode": "routing_reconnect"},
                             )
                         out_seq = await self._send_native_route_reply(

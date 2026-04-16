@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import time
 
 from product_profile import CATACLYSM_PRODUCT_PROFILE, HOMEWORLD_PRODUCT_PROFILE
@@ -408,6 +409,42 @@ def test_gateway_dashboard_snapshot_tags_single_product_rows() -> None:
     assert snapshot["routing_manager"]["rooms"][0]["product"] == "homeworld"
 
 
+def test_gateway_dashboard_activity_marks_paired_lobby_and_game_leaves_as_left_for_game() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+
+    gateway.record_activity(
+        "leave",
+        room_port=15100,
+        room_name="Homeworld Chat",
+        player_name="Alpha",
+        player_ip="1.2.3.4",
+        details={"reason": "eof"},
+    )
+    gateway.record_activity(
+        "leave",
+        room_port=15102,
+        room_name="Fleet Battle",
+        player_name="Alpha",
+        player_ip="1.2.3.4",
+        details={"reason": "eof"},
+    )
+
+    activity = gateway.dashboard_snapshot()["activity"]
+
+    assert len(activity) == 2
+    assert activity[0]["details"]["left_for_game"] is True
+    assert activity[1]["details"]["left_for_game"] is True
+    assert activity[0]["details"]["reason"] == "eof"
+    assert activity[1]["details"]["reason"] == "eof"
+
+
 def test_gateway_probe_snapshots_report_readiness_state() -> None:
     gateway = titan_binary_gateway.BinaryGatewayServer(
         "127.0.0.1",
@@ -699,6 +736,193 @@ def test_stats_token_is_scoped_to_stats_endpoint() -> None:
     )
 
     assert dashboard._is_authorized("/api/stats", {"token": ["stats-secret"]}, {})
+    assert dashboard._is_authorized("/api/live-feed", {"token": ["stats-secret"]}, {})
     assert not dashboard._is_authorized("/api/snapshot", {"token": ["stats-secret"]}, {})
     assert dashboard._is_authorized("/api/stats", {"token": ["admin-secret"]}, {})
+    assert dashboard._is_authorized("/api/live-feed", {"token": ["admin-secret"]}, {})
     assert dashboard._is_authorized("/api/snapshot", {"token": ["admin-secret"]}, {})
+
+
+def test_admin_live_feed_sse_frame_uses_event_stream_format() -> None:
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=object(),
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+    )
+
+    frame = dashboard._sse_frame(
+        "peer_packet",
+        {"event": "peer_packet", "room_port": 15102, "payload_preview_hex": "aabb"},
+        event_id="7",
+    )
+
+    assert frame.startswith(b"id: 7\n")
+    assert b"event: peer_packet\n" in frame
+    assert b'data: {"event": "peer_packet", "payload_preview_hex": "aabb", "room_port": 15102}\n\n' in frame
+
+
+class _LiveFeedRoutingServer:
+    def __init__(self) -> None:
+        self.snapshot = {
+            "listen_port": 15102,
+            "room_display_name": "Fleet Battle",
+            "room_description": "1v1",
+            "room_path": "/Homeworld",
+            "published": False,
+            "room_password_set": False,
+            "is_game_room": True,
+            "active_game_count": 1,
+            "native_client_count": 2,
+            "pending_reconnect_count": 0,
+            "pending_reconnects": [],
+            "clients": [
+                {
+                    "client_id": 1,
+                    "client_name": "Alpha",
+                    "client_ip": "1.1.1.1",
+                    "connected_seconds": 30,
+                    "idle_seconds": 0,
+                    "last_activity_kind": "peer_data",
+                    "peer_data_messages": 4,
+                    "peer_data_bytes": 128,
+                },
+                {
+                    "client_id": 2,
+                    "client_name": "Bravo",
+                    "client_ip": "2.2.2.2",
+                    "connected_seconds": 28,
+                    "idle_seconds": 0,
+                    "last_activity_kind": "peer_data",
+                    "peer_data_messages": 4,
+                    "peer_data_bytes": 128,
+                },
+            ],
+            "games": [
+                {
+                    "link_id": 44,
+                    "owner_id": 2,
+                    "owner_name": "Bravo",
+                    "name": "hw_game",
+                    "lifespan": 90,
+                    "data_len": 64,
+                    "data_preview_hex": "01020304",
+                }
+            ],
+            "peer_data_messages": 8,
+            "peer_data_bytes": 256,
+            "data_object_count": 1,
+            "data_objects": [],
+        }
+
+    def dashboard_snapshot(self) -> dict[str, object]:
+        return dict(self.snapshot)
+
+
+class _LiveFeedRoutingManager:
+    def __init__(self, server: _LiveFeedRoutingServer) -> None:
+        self.server = server
+
+    def get_server(self, port: int) -> _LiveFeedRoutingServer | None:
+        if port == 15102:
+            return self.server
+        return None
+
+
+def test_gateway_live_feed_emits_match_lifecycle_and_packet_events() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="Alpha",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=2,
+        player_name="Bravo",
+        player_ip="2.2.2.2",
+    )
+    gateway.record_live_peer_packet(
+        "peer_packet",
+        room_port=15102,
+        sender_client_id=2,
+        sender_name="Bravo",
+        recipient_client_ids=[1],
+        recipient_count=1,
+        payload=b"\xaa\xbb",
+        packet_kind="SendData",
+    )
+    gateway.record_live_routing_object_event(
+        "routing_object_upsert",
+        room_port=15102,
+        link_id=44,
+        owner_id=2,
+        owner_name="Bravo",
+        data_type_text="hw_game",
+        payload=b"\x01\x02\x03\x04",
+        lifespan=90,
+    )
+    routing_server.snapshot.update(
+        {
+            "is_game_room": False,
+            "active_game_count": 0,
+            "native_client_count": 0,
+            "clients": [],
+            "peer_data_messages": 0,
+            "peer_data_bytes": 0,
+            "game_count": 0,
+            "games": [],
+            "data_object_count": 0,
+        }
+    )
+    gateway.record_live_player_event(
+        "player_left",
+        room_port=15102,
+        player_id=1,
+        player_name="Alpha",
+        player_ip="1.1.1.1",
+    )
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    event_names = [str(event["event"]) for event in events]
+    assert event_names[0] == "player_joined"
+    assert event_names.count("player_joined") == 2
+    assert "match_started" in event_names
+    assert "peer_packet" in event_names
+    assert "routing_object_upsert" in event_names
+    assert "match_finished" in event_names
+
+    match_started = next(event for event in events if event["event"] == "match_started")
+    assert match_started["room_port"] == 15102
+    assert match_started["participant_count"] == 2
+    assert str(match_started["match_id"]).startswith("homeworld:15102:")
+
+    peer_packet = next(event for event in events if event["event"] == "peer_packet")
+    assert peer_packet["room_port"] == 15102
+    assert peer_packet["sender_name"] == "Bravo"
+    assert peer_packet["payload_preview_hex"] == "aabb"
+    assert peer_packet["payload_base64"] == "qrs="
+    assert peer_packet["recipient_count"] == 1
+
+    match_finished = next(event for event in events if event["event"] == "match_finished")
+    assert match_finished["room_port"] == 15102
+    assert match_finished["duration_seconds"] >= 0
