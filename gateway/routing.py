@@ -6,6 +6,7 @@ import contextlib
 from dataclasses import dataclass, field
 import hashlib
 import logging
+import re
 import struct
 import time
 from typing import Dict, Optional, Tuple
@@ -22,6 +23,9 @@ globals().update({name: getattr(_protocol, name) for name in dir(_protocol) if n
 LOGGER = logging.getLogger(__name__)
 
 PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS = 15.0
+_MULTIPLAYER_LEVEL_PATH_RE = re.compile(
+    rb"(?i)multiplayer\\(?P<folder>[^\\\x00\r\n]+)\\(?P<file>[^\\\x00\r\n]+)\.level"
+)
 
 
 async def _routing_recv_with_idle_timeout(reader: asyncio.StreamReader) -> bytes:
@@ -138,6 +142,8 @@ class SilencerRoutingServer:
         self._room_password = ""
         self._room_flags = 0
         self._room_path = self.product_profile.directory_root
+        self._inferred_game_name = ""
+        self._inferred_level_path = ""
         self._pending_reconnects: Dict[int, PendingNativeReconnect] = {}
         self._maintenance_task: Optional[asyncio.Task] = None
         self._solo_peer_data_log_state: Dict[Tuple[str, int], Dict[str, object]] = {}
@@ -170,6 +176,8 @@ class SilencerRoutingServer:
                 self._room_path != self.product_profile.directory_root,
                 self._room_display_name != self.product_profile.lobby_room_name,
                 self._room_description != self.product_profile.lobby_room_description,
+                self._inferred_game_name,
+                self._inferred_level_path,
                 self._conflict_data != _SILENCER_EMPTY_CONFLICT,
             )
         )
@@ -209,8 +217,42 @@ class SilencerRoutingServer:
         self._room_password = ""
         self._room_flags = 0
         self._room_path = self.product_profile.directory_root
+        self._inferred_game_name = ""
+        self._inferred_level_path = ""
         self._solo_peer_data_log_state.clear()
         self._last_peer_data_at = 0.0
+
+    def _effective_room_display_name(self) -> str:
+        if (
+            self._inferred_game_name
+            and not self._publish_in_directory
+            and self._room_display_name == self.product_profile.lobby_room_name
+        ):
+            return self._inferred_game_name
+        return self._room_display_name
+
+    def _maybe_infer_game_metadata(self, payload: bytes) -> None:
+        if not payload or self._publish_in_directory:
+            return
+        if self._data_objects:
+            return
+        match = _MULTIPLAYER_LEVEL_PATH_RE.search(bytes(payload))
+        if match is None:
+            return
+        level_name = match.group("file").decode("latin-1", errors="ignore").strip()
+        level_path = match.group(0).decode("latin-1", errors="ignore").strip()
+        if not level_name or not level_path:
+            return
+        changed = level_name != self._inferred_game_name or level_path != self._inferred_level_path
+        self._inferred_game_name = level_name
+        self._inferred_level_path = level_path
+        if changed:
+            LOGGER.info(
+                "Routing(native): inferred game metadata port=%s name=%r level_path=%r",
+                self.listen_port,
+                self._inferred_game_name,
+                self._inferred_level_path,
+            )
 
     def mark_room_allocated(self) -> None:
         self._room_allocated = True
@@ -708,12 +750,12 @@ class SilencerRoutingServer:
         return {
             "type": "S",
             "name": self.product_profile.routing_service_name,
-            "display_name": self._room_display_name or self.product_profile.routing_service_name,
+            "display_name": self._effective_room_display_name() or self.product_profile.routing_service_name,
             "net_addr": struct.pack(">H", int(self.listen_port)) + ip_raw,
             "data_objects": [
                 _pack_directory_data_object(
                     "Description",
-                    self._room_description or self._room_display_name,
+                    self._room_description or self._effective_room_display_name(),
                 ),
                 _pack_directory_data_object("RoomFlags", self._room_flags),
                 _pack_directory_data_object("__RSClientCount", len(self._native_clients)),
@@ -793,6 +835,20 @@ class SilencerRoutingServer:
                     "data_preview_hex": data_object.data[:32].hex(),
                 }
             )
+        if not games and self._inferred_game_name and not self._publish_in_directory:
+            games.append(
+                {
+                    "link_id": 0,
+                    "owner_id": 0,
+                    "owner_name": "",
+                    "name": self._inferred_game_name,
+                    "data_len": 0,
+                    "lifespan": 0,
+                    "data_preview_hex": "",
+                    "synthetic": True,
+                    "level_path": self._inferred_level_path,
+                }
+            )
         games.sort(key=lambda item: (item["owner_name"], item["name"], item["link_id"]))
 
         pending_reconnects = []
@@ -836,7 +892,7 @@ class SilencerRoutingServer:
             "publish_in_directory": self._publish_in_directory,
             "published": self._published,
             "room_allocated": self._room_allocated,
-            "room_display_name": self._room_display_name,
+            "room_display_name": self._effective_room_display_name(),
             "room_description": self._room_description,
             "room_password_set": bool(self._room_password),
             "room_flags": self._room_flags,
@@ -854,6 +910,8 @@ class SilencerRoutingServer:
             "peer_data_bytes": room_peer_data_bytes,
             "data_object_count": len(data_objects),
             "data_objects": data_objects,
+            "inferred_game_name": self._inferred_game_name,
+            "inferred_level_path": self._inferred_level_path,
             "conflict_data_len": len(self._conflict_data),
         }
 
@@ -1799,6 +1857,7 @@ class SilencerRoutingServer:
                             delivered,
                             bool(req["should_send_reply"]),
                         )
+                        self._maybe_infer_game_metadata(bytes(req["data"]))
                         if self.gateway is not None:
                             sender_name = (
                                 self._native_clients[registered_client_id].client_name
@@ -1845,6 +1904,7 @@ class SilencerRoutingServer:
                             delivered,
                             bool(req["should_send_reply"]),
                         )
+                        self._maybe_infer_game_metadata(bytes(req["data"]))
                         if self.gateway is not None:
                             sender_name = (
                                 self._native_clients[registered_client_id].client_name

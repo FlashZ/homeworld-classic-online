@@ -926,3 +926,157 @@ def test_gateway_live_feed_emits_match_lifecycle_and_packet_events() -> None:
     match_finished = next(event for event in events if event["event"] == "match_finished")
     assert match_finished["room_port"] == 15102
     assert match_finished["duration_seconds"] >= 0
+
+
+def test_gateway_infers_homeworld_match_metadata_from_peer_packet_payload() -> None:
+    class _InferMetadataRoutingServer:
+        def __init__(self) -> None:
+            self.snapshot = {
+                "listen_port": 15102,
+                "room_display_name": "Homeworld Chat",
+                "room_description": "Homeworld Chat",
+                "room_path": "/Homeworld",
+                "published": False,
+                "room_password_set": False,
+                "is_game_room": True,
+                "active_game_count": 1,
+                "native_client_count": 2,
+                "pending_reconnect_count": 0,
+                "pending_reconnects": [],
+                "clients": [
+                    {
+                        "client_id": 1,
+                        "client_name": "Alpha",
+                        "client_ip": "1.1.1.1",
+                        "connected_seconds": 30,
+                        "idle_seconds": 0,
+                        "last_activity_kind": "peer_data",
+                        "peer_data_messages": 4,
+                        "peer_data_bytes": 128,
+                    },
+                    {
+                        "client_id": 2,
+                        "client_name": "Bravo",
+                        "client_ip": "2.2.2.2",
+                        "connected_seconds": 28,
+                        "idle_seconds": 0,
+                        "last_activity_kind": "peer_data",
+                        "peer_data_messages": 4,
+                        "peer_data_bytes": 128,
+                    },
+                ],
+                "games": [],
+                "peer_data_messages": 8,
+                "peer_data_bytes": 256,
+                "data_object_count": 0,
+                "data_objects": [],
+            }
+
+        def dashboard_snapshot(self) -> dict[str, object]:
+            return dict(self.snapshot)
+
+    class _InferMetadataRoutingManager:
+        def __init__(self, server: _InferMetadataRoutingServer) -> None:
+            self.server = server
+
+        def get_server(self, port: int) -> _InferMetadataRoutingServer | None:
+            if port == 15102:
+                return self.server
+            return None
+
+        def dashboard_snapshot(self) -> dict[str, object]:
+            room = dict(self.server.snapshot)
+            players = [
+                {
+                    "client_id": client["client_id"],
+                    "client_name": client["client_name"],
+                    "client_ip": client["client_ip"],
+                    "connected_seconds": client["connected_seconds"],
+                    "idle_seconds": client["idle_seconds"],
+                    "last_activity_kind": client["last_activity_kind"],
+                    "peer_data_messages": client["peer_data_messages"],
+                    "peer_data_bytes": client["peer_data_bytes"],
+                    "room_name": room["room_display_name"],
+                    "room_port": room["listen_port"],
+                }
+                for client in room["clients"]
+            ]
+            servers = [
+                {
+                    "listen_port": room["listen_port"],
+                    "room_name": room["room_display_name"],
+                    "room_description": room["room_description"],
+                    "room_path": room["room_path"],
+                    "published": room["published"],
+                    "room_password_set": room["room_password_set"],
+                    "player_count": len(players),
+                    "game_count": len(room["games"]),
+                    "active_game_count": room["active_game_count"],
+                    "is_game_room": room["is_game_room"],
+                }
+            ]
+            return {
+                "current_unique_ip_count": len(players),
+                "current_game_room_count": 1,
+                "players": players,
+                "servers": servers,
+                "games": [],
+                "rooms": [room],
+            }
+
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _InferMetadataRoutingServer()
+    gateway.routing_manager = _InferMetadataRoutingManager(routing_server)
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="Alpha",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=2,
+        player_name="Bravo",
+        player_ip="2.2.2.2",
+    )
+    gateway.record_live_peer_packet(
+        "peer_packet",
+        room_port=15102,
+        sender_client_id=1,
+        sender_name="Alpha",
+        recipient_client_ids=[2],
+        recipient_count=1,
+        payload=b"Multiplayer\\pkwar4\\pkwar4.level\x00Mothership_0.missphere\x00",
+        packet_kind="SendDataBroadcast",
+    )
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    peer_packet = next(event for event in events if event["event"] == "peer_packet")
+    assert peer_packet["room_name"] == "pkwar4"
+
+    match_updates = [event for event in events if event["event"] == "match_updated"]
+    assert match_updates
+    assert match_updates[-1]["room_name"] == "pkwar4"
+    assert match_updates[-1]["game_name"] == "pkwar4"
+    assert match_updates[-1]["game_count"] == 1
+
+    snapshot = gateway.stats_snapshot()
+    assert snapshot["rooms"][0]["name"] == "pkwar4"
+    assert snapshot["rooms"][0]["game_count"] == 1

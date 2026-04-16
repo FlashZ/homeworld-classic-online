@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
+import re
 import struct
 import time
 from typing import Any, Deque, Dict, Optional, Tuple
@@ -29,6 +30,9 @@ from .product_profile import (
 globals().update({name: getattr(_protocol, name) for name in dir(_protocol) if name.startswith('_')})
 LOGGER = logging.getLogger(__name__)
 LEAVE_FOR_GAME_WINDOW_SECONDS = 3.0
+_MULTIPLAYER_LEVEL_PATH_RE = re.compile(
+    rb"(?i)multiplayer\\(?P<folder>[^\\\x00\r\n]+)\\(?P<file>[^\\\x00\r\n]+)\.level"
+)
 
 class BinaryGatewayServer:
     def __init__(self, backend_host: str, backend_port: int,
@@ -91,6 +95,7 @@ class BinaryGatewayServer:
         self._maintenance_task: Optional[asyncio.Task] = None
         self._live_feed_event_id = 0
         self._live_matches: Dict[int, Dict[str, object]] = {}
+        self._inferred_room_metadata: Dict[int, Dict[str, object]] = {}
         self.started_at = time.time()
         if keys_dir:
             self._load_keys(keys_dir)
@@ -384,6 +389,165 @@ class BinaryGatewayServer:
         self.live_feed_bus.publish(event)
         return event
 
+    @staticmethod
+    def _infer_room_metadata_from_payload(payload: bytes) -> Dict[str, object] | None:
+        if not payload:
+            return None
+        match = _MULTIPLAYER_LEVEL_PATH_RE.search(bytes(payload))
+        if match is None:
+            return None
+        display_name = match.group("file").decode("latin-1", errors="ignore").strip()
+        level_path = match.group(0).decode("latin-1", errors="ignore").strip()
+        if not display_name or not level_path:
+            return None
+        return {
+            "display_name": display_name,
+            "game_name": display_name,
+            "map_name": display_name,
+            "level_path": level_path,
+            "metadata_source": "peer_packet",
+        }
+
+    def _remember_inferred_room_metadata(self, room_port: int, payload: bytes) -> None:
+        inferred = self._infer_room_metadata_from_payload(payload)
+        if inferred is None:
+            return
+        self._inferred_room_metadata[int(room_port)] = inferred
+
+    def _apply_inferred_room_snapshot(
+        self,
+        room_port: int,
+        snapshot: Dict[str, object],
+    ) -> Dict[str, object]:
+        inferred = self._inferred_room_metadata.get(int(room_port))
+        if not inferred:
+            return snapshot
+        hydrated = dict(snapshot)
+        display_name = str(inferred.get("display_name") or "")
+        if display_name:
+            current_name = str(
+                hydrated.get("room_display_name")
+                or hydrated.get("room_name")
+                or ""
+            )
+            if (
+                not current_name
+                or current_name == self.product_profile.lobby_room_name
+                or not bool(hydrated.get("published", False))
+            ):
+                hydrated["room_display_name"] = display_name
+                hydrated["room_name"] = display_name
+        games = [
+            dict(game)
+            for game in (hydrated.get("games", []) or [])
+            if isinstance(game, dict)
+        ]
+        if not games and str(inferred.get("game_name") or ""):
+            games = [
+                {
+                    "link_id": 0,
+                    "owner_id": 0,
+                    "owner_name": "",
+                    "name": str(inferred["game_name"]),
+                    "data_len": 0,
+                    "lifespan": 0,
+                    "data_preview_hex": "",
+                    "synthetic": True,
+                    "level_path": str(inferred.get("level_path") or ""),
+                }
+            ]
+        hydrated["games"] = games
+        if games:
+            hydrated["game_count"] = max(int(hydrated.get("game_count") or 0), len(games))
+        hydrated["map_name"] = str(inferred.get("map_name") or hydrated.get("map_name") or "")
+        hydrated["level_path"] = str(inferred.get("level_path") or hydrated.get("level_path") or "")
+        hydrated["metadata_source"] = str(inferred.get("metadata_source") or hydrated.get("metadata_source") or "")
+        return hydrated
+
+    def _apply_inferred_dashboard_snapshot(
+        self,
+        raw_snapshot: Dict[str, object],
+    ) -> Dict[str, object]:
+        if not self._inferred_room_metadata:
+            return dict(raw_snapshot)
+
+        snapshot = dict(raw_snapshot)
+        rooms = []
+        room_lookup: Dict[int, Dict[str, object]] = {}
+        for room in snapshot.get("rooms", []) or []:
+            if not isinstance(room, dict):
+                continue
+            port = int(room.get("listen_port") or room.get("port") or 0)
+            hydrated = self._apply_inferred_room_snapshot(port, dict(room))
+            rooms.append(hydrated)
+            if port > 0:
+                room_lookup[port] = hydrated
+        snapshot["rooms"] = rooms
+
+        players = []
+        for player in snapshot.get("players", []) or []:
+            if not isinstance(player, dict):
+                continue
+            hydrated = dict(player)
+            port = int(hydrated.get("room_port") or 0)
+            inferred = self._inferred_room_metadata.get(port)
+            if inferred and str(inferred.get("display_name") or ""):
+                hydrated["room_name"] = str(inferred["display_name"])
+            players.append(hydrated)
+        snapshot["players"] = players
+
+        servers = []
+        for server in snapshot.get("servers", []) or []:
+            if not isinstance(server, dict):
+                continue
+            hydrated = dict(server)
+            port = int(hydrated.get("listen_port") or hydrated.get("port") or 0)
+            inferred = self._inferred_room_metadata.get(port)
+            if inferred and str(inferred.get("display_name") or ""):
+                hydrated["room_name"] = str(inferred["display_name"])
+                hydrated["game_count"] = max(int(hydrated.get("game_count") or 0), 1)
+            servers.append(hydrated)
+        snapshot["servers"] = servers
+
+        games = []
+        game_ports: set[int] = set()
+        for game in snapshot.get("games", []) or []:
+            if not isinstance(game, dict):
+                continue
+            hydrated = dict(game)
+            room_port = int(hydrated.get("room_port") or 0)
+            inferred = self._inferred_room_metadata.get(room_port)
+            if inferred and str(inferred.get("display_name") or ""):
+                hydrated["room_name"] = str(inferred["display_name"])
+                if not hydrated.get("name"):
+                    hydrated["name"] = str(inferred.get("game_name") or "")
+            games.append(hydrated)
+            if room_port > 0:
+                game_ports.add(room_port)
+        for port, inferred in self._inferred_room_metadata.items():
+            room = room_lookup.get(int(port))
+            if room is None or int(port) in game_ports:
+                continue
+            if not bool(room.get("is_game_room", False)):
+                continue
+            games.append(
+                {
+                    "room_port": int(port),
+                    "room_name": str(inferred.get("display_name") or ""),
+                    "name": str(inferred.get("game_name") or ""),
+                    "owner_name": "",
+                    "link_id": 0,
+                    "lifespan": 0,
+                    "data_len": 0,
+                    "data_preview_hex": "",
+                    "synthetic": True,
+                    "level_path": str(inferred.get("level_path") or ""),
+                }
+            )
+        snapshot["games"] = games
+        snapshot["current_game_count"] = len(games)
+        return snapshot
+
     def _routing_room_snapshot(self, room_port: int) -> Dict[str, object]:
         if self.routing_manager is None:
             return {}
@@ -394,7 +558,7 @@ class BinaryGatewayServer:
             if callable(snapshot_fn):
                 snapshot = snapshot_fn()
                 if isinstance(snapshot, dict):
-                    return dict(snapshot)
+                    return self._apply_inferred_room_snapshot(int(room_port), dict(snapshot))
         routing_snapshot = self._routing_dashboard_snapshot()
         for room in routing_snapshot.get("rooms", []) or []:
             if not isinstance(room, dict):
@@ -437,6 +601,9 @@ class BinaryGatewayServer:
             "room_port": int(room_port),
             "room_name": str(snapshot.get("room_display_name") or snapshot.get("room_name") or state.get("room_name") or ""),
             "room_path": str(snapshot.get("room_path") or state.get("room_path") or ""),
+            "display_name": str(snapshot.get("room_display_name") or snapshot.get("room_name") or state.get("room_name") or ""),
+            "map_name": str(first_game.get("name") or snapshot.get("map_name") or snapshot.get("room_display_name") or ""),
+            "level_path": str(snapshot.get("level_path") or ""),
             "participant_count": self._room_participant_count(snapshot),
             "started_at": float(state["started_at"]),
             "duration_seconds": int(max(0.0, current - float(state["started_at"]))),
@@ -488,6 +655,7 @@ class BinaryGatewayServer:
         if state is not None:
             participants = self._room_participant_count(room_snapshot)
             if participants <= 0:
+                self._inferred_room_metadata.pop(room_port, None)
                 self._publish_live_feed_event(
                     "match_finished",
                     self._live_match_payload(room_port, room_snapshot, state, now=now),
@@ -577,13 +745,18 @@ class BinaryGatewayServer:
         payload: bytes,
         packet_kind: str,
     ) -> None:
+        self._remember_inferred_room_metadata(int(room_port), bytes(payload or b""))
         room_snapshot = self._routing_room_snapshot(room_port)
         match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=False)
         raw_payload = bytes(payload or b"")
+        games = room_snapshot.get("games", []) or []
+        first_game = games[0] if games and isinstance(games[0], dict) else {}
         event_payload: Dict[str, object] = {
             "room_port": int(room_port),
             "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
             "room_path": str(room_snapshot.get("room_path") or ""),
+            "game_name": str(first_game.get("name") or room_snapshot.get("map_name") or ""),
+            "map_name": str(first_game.get("name") or room_snapshot.get("map_name") or ""),
             "sender_client_id": int(sender_client_id),
             "sender_name": str(sender_name or ""),
             "recipient_client_ids": [int(client_id) for client_id in recipient_client_ids],
@@ -594,6 +767,8 @@ class BinaryGatewayServer:
             "payload_base64": base64.b64encode(raw_payload).decode("ascii"),
             "fingerprint": self._live_payload_fingerprint(raw_payload),
         }
+        if room_snapshot.get("level_path"):
+            event_payload["level_path"] = str(room_snapshot.get("level_path") or "")
         if match_id:
             event_payload["match_id"] = match_id
         self._publish_live_feed_event(event_name, event_payload)
@@ -607,6 +782,7 @@ class BinaryGatewayServer:
         )
         if not isinstance(raw_snapshot, dict):
             return {}
+        raw_snapshot = self._apply_inferred_dashboard_snapshot(raw_snapshot)
 
         product_key = self.product_profile.key
         snapshot = dict(raw_snapshot)
