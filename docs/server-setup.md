@@ -24,6 +24,13 @@ For a normal single-product stack, also set:
 - `PRODUCT=homeworld` or `PRODUCT=cataclysm`
 - `SHARED_EDGE=0`
 
+If you want to enable the browser-based WON auth bridge for Homeworld Stats, also set:
+
+- `WEB_AUTH_SHARED_SECRET`
+- `WEB_AUTH_PUBLIC_BASE_URL`
+
+The `WEB_AUTH_PUBLIC_BASE_URL` value should be the public Homeworld Stats base URL, because the gateway validates browser return targets against it.
+
 Then start it:
 
 ```bash
