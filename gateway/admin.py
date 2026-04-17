@@ -12,7 +12,7 @@ import secrets
 import sqlite3
 import time
 from typing import TYPE_CHECKING, Any, Deque, Dict, Optional, Tuple
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .repo_monitor import GitRepoMonitor
 
@@ -68,6 +68,8 @@ class AdminDashboardServer:
         default_db_product: str = "",
         admin_token: str = "",
         stats_token: str = "",
+        web_auth_shared_secret: str = "",
+        web_auth_public_base_url: str = "",
         repo_monitor: Optional[GitRepoMonitor] = None,
     ) -> None:
         self.gateway = gateway
@@ -93,6 +95,9 @@ class AdminDashboardServer:
         self.log_handler = log_handler
         self.admin_token = admin_token.strip()
         self.stats_token = stats_token.strip()
+        self.web_auth_shared_secret = web_auth_shared_secret.strip()
+        self.web_auth_public_base_url = web_auth_public_base_url.strip()
+        self.web_auth_bridge = getattr(gateway, "web_auth_bridge", None)
         repo_root = Path(__file__).resolve().parents[1]
         self.repo_monitor = repo_monitor or GitRepoMonitor(str(repo_root))
         self.started_at = time.time()
@@ -142,6 +147,8 @@ class AdminDashboardServer:
         query: Dict[str, list[str]],
         headers: Dict[str, str],
     ) -> bool:
+        if path in {"/web-auth/login", "/api/web-auth/exchange"}:
+            return True
         if path in {"/api/stats", "/api/live-feed"}:
             if self.stats_token and self._matches_token(
                 self.stats_token,
@@ -165,6 +172,192 @@ class AdminDashboardServer:
             headers,
             header_names=("x-admin-token",),
         )
+
+    def _get_web_auth_bridge(self) -> Any:
+        bridge = getattr(self, "web_auth_bridge", None)
+        if bridge is None:
+            bridge = getattr(self.gateway, "web_auth_bridge", None)
+            if bridge is not None:
+                self.web_auth_bridge = bridge
+        return bridge
+
+    @staticmethod
+    def _append_query_params(url: str, params: Dict[str, str]) -> str:
+        parsed = urlsplit(url)
+        query_map: Dict[str, str] = {}
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            query_map[key] = value
+        for key, value in params.items():
+            if value is None:
+                continue
+            value_str = str(value)
+            if value_str:
+                query_map[key] = value_str
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urlencode(list(query_map.items())), parsed.fragment)
+        )
+
+    def _normalize_return_to(self, return_to: str) -> str:
+        candidate = str(return_to or "").strip()
+        if not candidate:
+            candidate = self.web_auth_public_base_url or "/"
+        if not candidate:
+            return "/"
+
+        parsed = urlsplit(candidate)
+        if not parsed.scheme and not parsed.netloc:
+            return candidate
+
+        allowed_base = self.web_auth_public_base_url.strip()
+        if not allowed_base:
+            raise ValueError("invalid_return_to")
+
+        allowed = urlsplit(allowed_base)
+        if parsed.scheme != allowed.scheme or parsed.netloc != allowed.netloc:
+            raise ValueError("invalid_return_to")
+        return candidate
+
+    @staticmethod
+    def _status_line(status_code: int) -> str:
+        return {
+            200: "200 OK",
+            302: "302 Found",
+            400: "400 Bad Request",
+            401: "401 Unauthorized",
+            403: "403 Forbidden",
+            404: "404 Not Found",
+            501: "501 Not Implemented",
+        }.get(int(status_code), f"{int(status_code)} OK")
+
+    def _web_auth_login_page(self, *, product: str, return_to: str, error: str = "") -> bytes:
+        bridge = self._get_web_auth_bridge()
+        if bridge is None or not hasattr(bridge, "render_login_page"):
+            return b"web auth unavailable"
+        return bridge.render_login_page(product=product, return_to=return_to, error=error)
+
+    async def _dispatch_web_auth_request(
+        self,
+        method: str,
+        target: str,
+        headers: Dict[str, str],
+        body_raw: bytes,
+    ) -> Optional[Tuple[int, Dict[str, str], bytes]]:
+        parsed = urlsplit(target)
+        if parsed.path not in {"/web-auth/login", "/api/web-auth/exchange"}:
+            return None
+
+        bridge = self._get_web_auth_bridge()
+        if bridge is None:
+            return (
+                501,
+                {"content-type": "text/plain; charset=utf-8"},
+                b"web auth bridge unavailable",
+            )
+
+        query = parse_qs(parsed.query)
+        product = str(query.get("product", [self.default_db_product])[0] or self.default_db_product or "homeworld")
+
+        if method == "GET" and parsed.path == "/web-auth/login":
+            try:
+                return_to = self._normalize_return_to(
+                    str(query.get("return_to", [self.web_auth_public_base_url or "/"])[0] or "")
+                )
+            except ValueError as exc:
+                return (
+                    400,
+                    {"content-type": "text/html; charset=utf-8"},
+                    self._web_auth_login_page(
+                        product=product,
+                        return_to=self.web_auth_public_base_url or "/",
+                        error=str(exc),
+                    ),
+                )
+            error = str(query.get("error", [""])[0] or "")
+            return (
+                200,
+                {"content-type": "text/html; charset=utf-8"},
+                self._web_auth_login_page(product=product, return_to=return_to, error=error),
+            )
+
+        if method == "POST" and parsed.path == "/web-auth/login":
+            form = parse_qs(body_raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+            username = str(form.get("username", [""])[0] or "").strip()
+            password = str(form.get("password", [""])[0] or "")
+            if not username or not password:
+                return (
+                    400,
+                    {"content-type": "text/html; charset=utf-8"},
+                    self._web_auth_login_page(
+                        product=product,
+                        return_to=self.web_auth_public_base_url or "/",
+                        error="missing_username_or_password",
+                    ),
+                )
+            return_to = self._normalize_return_to(
+                str(form.get("return_to", [query.get("return_to", [self.web_auth_public_base_url or "/"])[0]])[0] or "")
+            )
+            login_product = str(
+                form.get("product", [query.get("product", [product])[0]])[0] or query.get("product", [product])[0] or product
+            )
+            try:
+                result = bridge.start_login(
+                    product=login_product,
+                    username=username,
+                    password=password,
+                    return_to=return_to,
+                )
+            except ValueError as exc:
+                error = str(exc) or "invalid_credentials"
+                return (
+                    401,
+                    {"content-type": "text/html; charset=utf-8"},
+                    self._web_auth_login_page(product=login_product, return_to=return_to, error=error),
+                )
+            location = self._append_query_params(
+                return_to,
+                {
+                    "code": str(result.get("code", "")),
+                    "product": str(result.get("product", login_product)),
+                },
+            )
+            return 302, {"location": location, "content-length": "0"}, b""
+
+        if method == "POST" and parsed.path == "/api/web-auth/exchange":
+            try:
+                body_json = json.loads(body_raw) if body_raw else {}
+            except json.JSONDecodeError:
+                return (
+                    400,
+                    {"content-type": "application/json; charset=utf-8"},
+                    json.dumps({"ok": False, "error": "invalid json"}).encode("utf-8"),
+                )
+            shared_secret = str(body_json.get("shared_secret") or "").strip()
+            configured_secret = self.web_auth_shared_secret or str(getattr(bridge, "shared_secret", "") or "").strip()
+            if not configured_secret or not secrets.compare_digest(shared_secret, configured_secret):
+                return (
+                    403,
+                    {"content-type": "application/json; charset=utf-8"},
+                    json.dumps({"ok": False, "error": "invalid_shared_secret"}).encode("utf-8"),
+                )
+            try:
+                payload = bridge.exchange_code(
+                    code=str(body_json.get("code") or ""),
+                    product=str(body_json.get("product") or product),
+                    shared_secret=shared_secret,
+                )
+            except ValueError as exc:
+                return (
+                    400,
+                    {"content-type": "application/json; charset=utf-8"},
+                    json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"),
+                )
+            return (
+                200,
+                {"content-type": "application/json; charset=utf-8"},
+                json.dumps(payload).encode("utf-8"),
+            )
+
+        return None
 
     @staticmethod
     def _is_public_probe_path(path: str) -> bool:
@@ -1764,6 +1957,23 @@ class AdminDashboardServer:
             await writer.wait_closed()
             return
 
+        if method == "GET":
+            web_auth_response = await self._dispatch_web_auth_request(method, target, headers, b"")
+            if web_auth_response is not None:
+                status_code, response_headers, response_body = web_auth_response
+                writer.write(
+                    self._http_response(
+                        response_body,
+                        response_headers.get("content-type", "text/plain; charset=utf-8"),
+                        self._status_line(status_code),
+                        extra_headers=[f"{key}: {value}" for key, value in response_headers.items() if key.lower() != "content-type"],
+                    )
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
+
         if method == "POST":
             content_length = 0
             with contextlib.suppress(TypeError, ValueError):
@@ -1784,6 +1994,23 @@ class AdminDashboardServer:
                     writer.close()
                     await writer.wait_closed()
                     return
+            web_auth_response = await self._dispatch_web_auth_request(method, target, headers, body_raw)
+            if web_auth_response is not None:
+                status_code, response_headers, response_body = web_auth_response
+                writer.write(
+                    self._http_response(
+                        response_body,
+                        response_headers.get("content-type", "text/plain; charset=utf-8"),
+                        self._status_line(status_code),
+                        extra_headers=[
+                            f"{key}: {value}" for key, value in response_headers.items() if key.lower() != "content-type"
+                        ],
+                    )
+                )
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+                return
             try:
                 body_json = json.loads(body_raw) if body_raw else {}
             except json.JSONDecodeError:
