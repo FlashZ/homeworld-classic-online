@@ -479,7 +479,7 @@ def test_gateway_probe_snapshots_report_readiness_state() -> None:
     }
 
 
-def test_peer_session_ttl_allows_post_game_return_window() -> None:
+def test_peer_session_ttl_allows_long_post_game_return_window() -> None:
     gateway = titan_binary_gateway.BinaryGatewayServer(
         "127.0.0.1",
         9100,
@@ -495,14 +495,14 @@ def test_peer_session_ttl_allows_post_game_return_window() -> None:
         role=titan_binary_gateway.PEER_ROLE_DIRECTORY,
         sequenced=True,
     )
-    freshish.last_used_at = time.time() - 600.0
+    freshish.last_used_at = time.time() - 3600.0
     stale = titan_binary_gateway.PeerSession(
         session_key=b"12345678",
         session_id=8,
         role=titan_binary_gateway.PEER_ROLE_FACTORY,
         sequenced=True,
     )
-    stale.last_used_at = time.time() - 1900.0
+    stale.last_used_at = time.time() - 15000.0
     gateway._peer_sessions = {
         freshish.session_id: freshish,
         stale.session_id: stale,

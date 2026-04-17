@@ -94,9 +94,10 @@ ROOM_ALLOCATION_GRACE_SECONDS = 120.0
 ROUTING_HEARTBEAT_INTERVAL_SECONDS = 15.0
 ROUTING_HEARTBEAT_IDLE_SECONDS = 20.0
 ROUTING_MAINTENANCE_INTERVAL_SECONDS = 5.0
-# Directory/factory peer sessions need to outlive a normal match so clients can
-# return to lobby without re-auth/session churn after several minutes in-game.
-PEER_SESSION_TTL_SECONDS = 1800.0
+# Directory/factory peer sessions need to outlive lobby wait time plus a full
+# Homeworld match so clients can return to the main lobby without re-auth or
+# losing their resumable peer session.
+PEER_SESSION_TTL_SECONDS = 14400.0
 PEER_SESSION_SWEEP_INTERVAL_SECONDS = 60.0
 BACKEND_RPC_TIMEOUT_SECONDS = 5.0
 IP_ACTIVITY_TTL_SECONDS = 24 * 60 * 60.0
