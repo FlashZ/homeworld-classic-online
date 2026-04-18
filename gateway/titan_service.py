@@ -414,27 +414,73 @@ class BinaryGatewayServer:
             return
         self._inferred_room_metadata[int(room_port)] = inferred
 
+    def _is_generic_room_label(self, value: object) -> bool:
+        normalized = str(value or "").strip().lower()
+        generic_labels = {
+            "",
+            "unknown",
+            str(self.product_profile.lobby_room_name or "").strip().lower(),
+            str(self.product_profile.lobby_room_description or "").strip().lower(),
+        }
+        return normalized in generic_labels
+
+    def _preferred_room_title(
+        self,
+        snapshot: Dict[str, object],
+        *,
+        fallback: object = "",
+    ) -> str:
+        room_name = str(
+            snapshot.get("room_display_name")
+            or snapshot.get("room_name")
+            or fallback
+            or ""
+        ).strip()
+        if not self._is_generic_room_label(room_name):
+            return room_name
+
+        room_description = str(snapshot.get("room_description") or "").strip()
+        if not self._is_generic_room_label(room_description):
+            return room_description
+
+        fallback_label = str(fallback or "").strip()
+        if not self._is_generic_room_label(fallback_label):
+            return fallback_label
+
+        return room_name or room_description or fallback_label
+
+    def _apply_room_title_fallback(
+        self,
+        snapshot: Dict[str, object],
+        *,
+        fallback: object = "",
+    ) -> Dict[str, object]:
+        hydrated = dict(snapshot)
+        preferred_title = self._preferred_room_title(hydrated, fallback=fallback)
+        if not preferred_title:
+            return hydrated
+
+        current_display = str(hydrated.get("room_display_name") or "").strip()
+        current_name = str(hydrated.get("room_name") or "").strip()
+        if not current_display or self._is_generic_room_label(current_display):
+            hydrated["room_display_name"] = preferred_title
+        if not current_name or self._is_generic_room_label(current_name):
+            hydrated["room_name"] = preferred_title
+        return hydrated
+
     def _apply_inferred_room_snapshot(
         self,
         room_port: int,
         snapshot: Dict[str, object],
     ) -> Dict[str, object]:
+        hydrated = self._apply_room_title_fallback(snapshot)
         inferred = self._inferred_room_metadata.get(int(room_port))
         if not inferred:
-            return snapshot
-        hydrated = dict(snapshot)
+            return hydrated
         display_name = str(inferred.get("display_name") or "")
         if display_name:
-            current_name = str(
-                hydrated.get("room_display_name")
-                or hydrated.get("room_name")
-                or ""
-            )
-            if (
-                not current_name
-                or current_name == self.product_profile.lobby_room_name
-                or not bool(hydrated.get("published", False))
-            ):
+            current_name = self._preferred_room_title(hydrated)
+            if self._is_generic_room_label(current_name):
                 hydrated["room_display_name"] = display_name
                 hydrated["room_name"] = display_name
         games = [
@@ -468,9 +514,6 @@ class BinaryGatewayServer:
         self,
         raw_snapshot: Dict[str, object],
     ) -> Dict[str, object]:
-        if not self._inferred_room_metadata:
-            return dict(raw_snapshot)
-
         snapshot = dict(raw_snapshot)
         rooms = []
         room_lookup: Dict[int, Dict[str, object]] = {}
@@ -490,9 +533,18 @@ class BinaryGatewayServer:
                 continue
             hydrated = dict(player)
             port = int(hydrated.get("room_port") or 0)
-            inferred = self._inferred_room_metadata.get(port)
-            if inferred and str(inferred.get("display_name") or ""):
-                hydrated["room_name"] = str(inferred["display_name"])
+            room = room_lookup.get(port)
+            if room is not None:
+                hydrated["room_name"] = str(
+                    room.get("room_display_name")
+                    or room.get("room_name")
+                    or hydrated.get("room_name")
+                    or ""
+                )
+            else:
+                preferred_title = self._preferred_room_title({"room_name": hydrated.get("room_name")})
+                if preferred_title:
+                    hydrated["room_name"] = preferred_title
             players.append(hydrated)
         snapshot["players"] = players
 
@@ -502,10 +554,27 @@ class BinaryGatewayServer:
                 continue
             hydrated = dict(server)
             port = int(hydrated.get("listen_port") or hydrated.get("port") or 0)
-            inferred = self._inferred_room_metadata.get(port)
-            if inferred and str(inferred.get("display_name") or ""):
-                hydrated["room_name"] = str(inferred["display_name"])
-                hydrated["game_count"] = max(int(hydrated.get("game_count") or 0), 1)
+            room = room_lookup.get(port)
+            if room is not None:
+                hydrated["room_name"] = str(
+                    room.get("room_display_name")
+                    or room.get("room_name")
+                    or hydrated.get("room_name")
+                    or ""
+                )
+                hydrated["room_description"] = str(
+                    room.get("room_description")
+                    or hydrated.get("room_description")
+                    or ""
+                )
+                hydrated["game_count"] = max(
+                    int(hydrated.get("game_count") or 0),
+                    int(room.get("game_count") or 0),
+                )
+            else:
+                preferred_title = self._preferred_room_title(hydrated)
+                if preferred_title:
+                    hydrated["room_name"] = preferred_title
             servers.append(hydrated)
         snapshot["servers"] = servers
 
@@ -596,13 +665,14 @@ class BinaryGatewayServer:
         current = float(now if now is not None else time.time())
         games = snapshot.get("games", []) or []
         first_game = games[0] if games and isinstance(games[0], dict) else {}
+        room_title = self._preferred_room_title(snapshot, fallback=state.get("room_name"))
         return {
             "match_id": state["match_id"],
             "room_port": int(room_port),
-            "room_name": str(snapshot.get("room_display_name") or snapshot.get("room_name") or state.get("room_name") or ""),
+            "room_name": room_title,
             "room_path": str(snapshot.get("room_path") or state.get("room_path") or ""),
-            "display_name": str(snapshot.get("room_display_name") or snapshot.get("room_name") or state.get("room_name") or ""),
-            "map_name": str(first_game.get("name") or snapshot.get("map_name") or snapshot.get("room_display_name") or ""),
+            "display_name": room_title,
+            "map_name": str(first_game.get("name") or snapshot.get("map_name") or room_title or ""),
             "level_path": str(snapshot.get("level_path") or ""),
             "participant_count": self._room_participant_count(snapshot),
             "started_at": float(state["started_at"]),
@@ -632,7 +702,7 @@ class BinaryGatewayServer:
             state = {
                 "match_id": f"{self.product_profile.key}:{room_port}:{int(now * 1000)}",
                 "started_at": now,
-                "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
+                "room_name": self._preferred_room_title(room_snapshot),
                 "room_path": str(room_snapshot.get("room_path") or ""),
             }
             self._live_matches[room_port] = state
@@ -643,7 +713,7 @@ class BinaryGatewayServer:
             return str(state["match_id"])
 
         if is_live and state is not None:
-            state["room_name"] = str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or state.get("room_name") or "")
+            state["room_name"] = self._preferred_room_title(room_snapshot, fallback=state.get("room_name"))
             state["room_path"] = str(room_snapshot.get("room_path") or state.get("room_path") or "")
             if emit_update:
                 self._publish_live_feed_event(
@@ -683,9 +753,10 @@ class BinaryGatewayServer:
     ) -> None:
         room_snapshot = self._routing_room_snapshot(room_port)
         existing = self._live_matches.get(int(room_port))
+        room_title = self._preferred_room_title(room_snapshot)
         payload: Dict[str, object] = {
             "room_port": int(room_port),
-            "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
+            "room_name": room_title,
             "room_path": str(room_snapshot.get("room_path") or ""),
             "player_id": int(player_id),
             "player_name": str(player_name),
@@ -714,9 +785,10 @@ class BinaryGatewayServer:
         room_snapshot = self._routing_room_snapshot(room_port)
         match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=False)
         raw_payload = bytes(payload or b"")
+        room_title = self._preferred_room_title(room_snapshot)
         event_payload: Dict[str, object] = {
             "room_port": int(room_port),
-            "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
+            "room_name": room_title,
             "room_path": str(room_snapshot.get("room_path") or ""),
             "link_id": int(link_id),
             "owner_id": int(owner_id),
@@ -751,12 +823,13 @@ class BinaryGatewayServer:
         raw_payload = bytes(payload or b"")
         games = room_snapshot.get("games", []) or []
         first_game = games[0] if games and isinstance(games[0], dict) else {}
+        room_title = self._preferred_room_title(room_snapshot)
         event_payload: Dict[str, object] = {
             "room_port": int(room_port),
-            "room_name": str(room_snapshot.get("room_display_name") or room_snapshot.get("room_name") or ""),
+            "room_name": room_title,
             "room_path": str(room_snapshot.get("room_path") or ""),
             "game_name": str(first_game.get("name") or room_snapshot.get("map_name") or ""),
-            "map_name": str(first_game.get("name") or room_snapshot.get("map_name") or ""),
+            "map_name": str(first_game.get("name") or room_snapshot.get("map_name") or room_title or ""),
             "sender_client_id": int(sender_client_id),
             "sender_name": str(sender_name or ""),
             "recipient_client_ids": [int(client_id) for client_id in recipient_client_ids],
