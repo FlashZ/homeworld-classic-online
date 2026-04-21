@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 
+import gateway.routing as routing_module
 import titan_binary_gateway
 
 
@@ -268,3 +269,19 @@ def test_published_lobby_peer_data_logs_omit_packet_fingerprint(caplog) -> None:
         )
 
     assert "fingerprint=" not in caplog.text
+
+
+def test_routing_recv_skips_wait_for_when_idle_timeout_is_disabled(monkeypatch) -> None:
+    async def fake_recv(_reader: object) -> bytes:
+        return b"payload"
+
+    def fail_wait_for(*args: object, **kwargs: object) -> object:
+        raise AssertionError("wait_for should not be used when idle timeout is disabled")
+
+    monkeypatch.setattr(routing_module, "ROUTING_IDLE_TIMEOUT_SECONDS", None)
+    monkeypatch.setattr(routing_module, "_routing_recv", fake_recv)
+    monkeypatch.setattr(routing_module.asyncio, "wait_for", fail_wait_for)
+
+    payload = asyncio.run(routing_module._routing_recv_with_idle_timeout(object()))
+
+    assert payload == b"payload"

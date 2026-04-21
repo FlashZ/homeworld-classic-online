@@ -7,6 +7,7 @@ import sqlite3
 import struct
 
 import titan_binary_gateway
+from gateway import admin as admin_module
 
 
 class _FakeGateway:
@@ -156,9 +157,11 @@ class _FakeRepoMonitor:
             "upstream": "origin/main",
             "local_commit": "111111111111",
             "local_short": "111111111111",
+            "local_label": "111111111111",
             "local_version": "installer-v1",
             "remote_commit": "222222222222",
             "remote_short": "222222222222",
+            "remote_label": "222222222222",
             "remote_version": "installer-v2",
             "ahead": 0,
             "behind": 1,
@@ -192,6 +195,7 @@ class _FakeRepoMonitor:
         self.updated += 1
         self._snapshot["local_commit"] = "222222222222"
         self._snapshot["local_short"] = "222222222222"
+        self._snapshot["local_label"] = "222222222222"
         self._snapshot["local_version"] = "installer-v2"
         self._snapshot["behind"] = 0
         self._snapshot["can_update"] = False
@@ -254,9 +258,22 @@ def test_admin_snapshot_includes_repo_metadata() -> None:
 
     snapshot = dashboard.snapshot(rows_per_table=1, log_limit=1, activity_limit=1)
 
+    assert snapshot["repo"]["local_label"] == "111111111111"
+    assert snapshot["repo"]["remote_label"] == "222222222222"
     assert snapshot["repo"]["local_version"] == "installer-v1"
     assert snapshot["repo"]["remote_version"] == "installer-v2"
     assert snapshot["repo"]["update_available"] is True
+
+
+def test_git_repo_monitor_snapshot_exposes_commit_first_labels(tmp_path: Path) -> None:
+    monitor = titan_binary_gateway.GitRepoMonitor(str(tmp_path))
+
+    snapshot = monitor.snapshot()
+
+    assert "local_label" in snapshot
+    assert "remote_label" in snapshot
+    assert snapshot["local_label"] == ""
+    assert snapshot["remote_label"] == ""
 
 
 def test_admin_snapshot_includes_product_scoped_databases(tmp_path: Path) -> None:
@@ -575,6 +592,70 @@ def test_admin_html_contains_clear_cd_key_action() -> None:
 
     assert 'data-action="clear-cd-key"' in html
     assert "Clear CD Key" in html
+
+
+def test_admin_live_feed_disconnect_suppresses_broken_pipe_on_wait_closed(monkeypatch) -> None:
+    class _LiveFeedGateway(_FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.unsubscribed = 0
+
+        def subscribe_live_feed(self) -> asyncio.Queue[dict[str, object]]:
+            return asyncio.Queue()
+
+        def unsubscribe_live_feed(self, queue: asyncio.Queue[dict[str, object]]) -> None:
+            self.unsubscribed += 1
+
+    class _DisconnectingWriter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.drain_calls = 0
+
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            self.drain_calls += 1
+            if self.drain_calls >= 3:
+                raise BrokenPipeError(32, "Broken pipe")
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def get_extra_info(self, name: str, default: object = None) -> object:
+            return default
+
+    async def _fake_wait_for(awaitable: object, timeout: float) -> object:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        raise asyncio.TimeoutError
+
+    async def _run() -> tuple[_LiveFeedGateway, _DisconnectingWriter]:
+        gateway = _LiveFeedGateway()
+        dashboard = titan_binary_gateway.AdminDashboardServer(
+            gateway=gateway,
+            db_path="won_server.db",
+            log_handler=titan_binary_gateway.DashboardLogHandler(),
+            stats_token="stats-secret",
+            repo_monitor=_FakeRepoMonitor(),
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"GET /api/live-feed?token=stats-secret HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        reader.feed_eof()
+        writer = _DisconnectingWriter()
+        await dashboard.handle_client(reader, writer)
+        return gateway, writer
+
+    monkeypatch.setattr(admin_module.asyncio, "wait_for", _fake_wait_for)
+
+    gateway, writer = asyncio.run(_run())
+
+    assert writer.closed is True
+    assert gateway.unsubscribed == 1
 
 
 def test_admin_broadcast_chat_uses_visible_room_chat_sender() -> None:

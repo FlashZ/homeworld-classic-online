@@ -12,7 +12,7 @@ import secrets
 import sqlite3
 import time
 from typing import TYPE_CHECKING, Any, Deque, Dict, Optional, Tuple
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .repo_monitor import GitRepoMonitor
 
@@ -68,6 +68,8 @@ class AdminDashboardServer:
         default_db_product: str = "",
         admin_token: str = "",
         stats_token: str = "",
+        web_auth_shared_secret: str = "",
+        web_auth_public_base_url: str = "",
         repo_monitor: Optional[GitRepoMonitor] = None,
     ) -> None:
         self.gateway = gateway
@@ -93,6 +95,9 @@ class AdminDashboardServer:
         self.log_handler = log_handler
         self.admin_token = admin_token.strip()
         self.stats_token = stats_token.strip()
+        self.web_auth_shared_secret = web_auth_shared_secret.strip()
+        self.web_auth_public_base_url = web_auth_public_base_url.strip()
+        self.web_auth_bridge = getattr(gateway, "web_auth_bridge", None)
         repo_root = Path(__file__).resolve().parents[1]
         self.repo_monitor = repo_monitor or GitRepoMonitor(str(repo_root))
         self.started_at = time.time()
@@ -142,7 +147,9 @@ class AdminDashboardServer:
         query: Dict[str, list[str]],
         headers: Dict[str, str],
     ) -> bool:
-        if path == "/api/stats":
+        if path in {"/web-auth/login", "/api/web-auth/exchange"}:
+            return True
+        if path in {"/api/stats", "/api/live-feed"}:
             if self.stats_token and self._matches_token(
                 self.stats_token,
                 query,
@@ -165,6 +172,198 @@ class AdminDashboardServer:
             headers,
             header_names=("x-admin-token",),
         )
+
+    def _get_web_auth_bridge(self) -> Any:
+        bridge = getattr(self, "web_auth_bridge", None)
+        if bridge is None:
+            bridge = getattr(self.gateway, "web_auth_bridge", None)
+            if bridge is not None:
+                self.web_auth_bridge = bridge
+        return bridge
+
+    @staticmethod
+    def _append_query_params(url: str, params: Dict[str, str]) -> str:
+        parsed = urlsplit(url)
+        query_map: Dict[str, str] = {}
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            query_map[key] = value
+        for key, value in params.items():
+            if value is None:
+                continue
+            value_str = str(value)
+            if value_str:
+                query_map[key] = value_str
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urlencode(list(query_map.items())), parsed.fragment)
+        )
+
+    def _normalize_return_to(self, return_to: str) -> str:
+        candidate = str(return_to or "").strip()
+        if not candidate:
+            candidate = self.web_auth_public_base_url or "/"
+        if not candidate:
+            return "/"
+
+        parsed = urlsplit(candidate)
+        if not parsed.scheme and not parsed.netloc:
+            return candidate
+
+        allowed_base = self.web_auth_public_base_url.strip()
+        if not allowed_base:
+            raise ValueError("invalid_return_to")
+
+        allowed = urlsplit(allowed_base)
+        if parsed.scheme != allowed.scheme or parsed.netloc != allowed.netloc:
+            raise ValueError("invalid_return_to")
+        return candidate
+
+    @staticmethod
+    def _status_line(status_code: int) -> str:
+        return {
+            200: "200 OK",
+            302: "302 Found",
+            400: "400 Bad Request",
+            401: "401 Unauthorized",
+            403: "403 Forbidden",
+            404: "404 Not Found",
+            501: "501 Not Implemented",
+        }.get(int(status_code), f"{int(status_code)} OK")
+
+    @staticmethod
+    async def _close_writer(writer: asyncio.StreamWriter) -> None:
+        writer.close()
+        with contextlib.suppress(ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+            await writer.wait_closed()
+
+    def _web_auth_login_page(self, *, product: str, return_to: str, error: str = "") -> bytes:
+        bridge = self._get_web_auth_bridge()
+        if bridge is None or not hasattr(bridge, "render_login_page"):
+            return b"web auth unavailable"
+        return bridge.render_login_page(product=product, return_to=return_to, error=error)
+
+    async def _dispatch_web_auth_request(
+        self,
+        method: str,
+        target: str,
+        headers: Dict[str, str],
+        body_raw: bytes,
+    ) -> Optional[Tuple[int, Dict[str, str], bytes]]:
+        parsed = urlsplit(target)
+        if parsed.path not in {"/web-auth/login", "/api/web-auth/exchange"}:
+            return None
+
+        bridge = self._get_web_auth_bridge()
+        if bridge is None:
+            return (
+                501,
+                {"content-type": "text/plain; charset=utf-8"},
+                b"web auth bridge unavailable",
+            )
+
+        query = parse_qs(parsed.query)
+        product = str(query.get("product", [self.default_db_product])[0] or self.default_db_product or "homeworld")
+
+        if method == "GET" and parsed.path == "/web-auth/login":
+            try:
+                return_to = self._normalize_return_to(
+                    str(query.get("return_to", [self.web_auth_public_base_url or "/"])[0] or "")
+                )
+            except ValueError as exc:
+                return (
+                    400,
+                    {"content-type": "text/html; charset=utf-8"},
+                    self._web_auth_login_page(
+                        product=product,
+                        return_to=self.web_auth_public_base_url or "/",
+                        error=str(exc),
+                    ),
+                )
+            error = str(query.get("error", [""])[0] or "")
+            return (
+                200,
+                {"content-type": "text/html; charset=utf-8"},
+                self._web_auth_login_page(product=product, return_to=return_to, error=error),
+            )
+
+        if method == "POST" and parsed.path == "/web-auth/login":
+            form = parse_qs(body_raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+            username = str(form.get("username", [""])[0] or "").strip()
+            password = str(form.get("password", [""])[0] or "")
+            if not username or not password:
+                return (
+                    400,
+                    {"content-type": "text/html; charset=utf-8"},
+                    self._web_auth_login_page(
+                        product=product,
+                        return_to=self.web_auth_public_base_url or "/",
+                        error="missing_username_or_password",
+                    ),
+                )
+            return_to = self._normalize_return_to(
+                str(form.get("return_to", [query.get("return_to", [self.web_auth_public_base_url or "/"])[0]])[0] or "")
+            )
+            login_product = str(
+                form.get("product", [query.get("product", [product])[0]])[0] or query.get("product", [product])[0] or product
+            )
+            try:
+                result = bridge.start_login(
+                    product=login_product,
+                    username=username,
+                    password=password,
+                    return_to=return_to,
+                )
+            except ValueError as exc:
+                error = str(exc) or "invalid_credentials"
+                return (
+                    401,
+                    {"content-type": "text/html; charset=utf-8"},
+                    self._web_auth_login_page(product=login_product, return_to=return_to, error=error),
+                )
+            location = self._append_query_params(
+                return_to,
+                {
+                    "code": str(result.get("code", "")),
+                    "product": str(result.get("product", login_product)),
+                },
+            )
+            return 302, {"location": location, "content-length": "0"}, b""
+
+        if method == "POST" and parsed.path == "/api/web-auth/exchange":
+            try:
+                body_json = json.loads(body_raw) if body_raw else {}
+            except json.JSONDecodeError:
+                return (
+                    400,
+                    {"content-type": "application/json; charset=utf-8"},
+                    json.dumps({"ok": False, "error": "invalid json"}).encode("utf-8"),
+                )
+            shared_secret = str(body_json.get("shared_secret") or "").strip()
+            configured_secret = self.web_auth_shared_secret or str(getattr(bridge, "shared_secret", "") or "").strip()
+            if not configured_secret or not secrets.compare_digest(shared_secret, configured_secret):
+                return (
+                    403,
+                    {"content-type": "application/json; charset=utf-8"},
+                    json.dumps({"ok": False, "error": "invalid_shared_secret"}).encode("utf-8"),
+                )
+            try:
+                payload = bridge.exchange_code(
+                    code=str(body_json.get("code") or ""),
+                    product=str(body_json.get("product") or product),
+                    shared_secret=shared_secret,
+                )
+            except ValueError as exc:
+                return (
+                    400,
+                    {"content-type": "application/json; charset=utf-8"},
+                    json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"),
+                )
+            return (
+                200,
+                {"content-type": "application/json; charset=utf-8"},
+                json.dumps(payload).encode("utf-8"),
+            )
+
+        return None
 
     @staticmethod
     def _is_public_probe_path(path: str) -> bool:
@@ -420,6 +619,36 @@ class AdminDashboardServer:
             headers.extend(extra_headers)
         headers.extend(["", ""])
         return "\r\n".join(headers).encode("ascii") + body
+
+    @staticmethod
+    def _http_event_stream_headers() -> bytes:
+        headers = [
+            "HTTP/1.1 200 OK",
+            "Content-Type: text/event-stream; charset=utf-8",
+            "Cache-Control: no-store",
+            "Connection: keep-alive",
+            "X-Accel-Buffering: no",
+            "",
+            "",
+        ]
+        return "\r\n".join(headers).encode("ascii")
+
+    @staticmethod
+    def _sse_frame(
+        event_name: str,
+        payload: Dict[str, object],
+        *,
+        event_id: str = "",
+    ) -> bytes:
+        lines: list[str] = []
+        if event_id:
+            lines.append(f"id: {event_id}")
+        lines.append(f"event: {event_name}")
+        body = json.dumps(payload, sort_keys=True)
+        for line in body.splitlines() or ["{}"]:
+            lines.append(f"data: {line}")
+        lines.extend(["", ""])
+        return "\n".join(lines).encode("utf-8")
 
     def _html(self, embedded_token: str = "") -> str:
         return """<!doctype html>
@@ -838,6 +1067,7 @@ class AdminDashboardServer:
       const text=String(event.text||"").trim();
       if(text)return text;
       const details=event.details||{};
+      if(details.left_for_game)return "left for a game";
       const port=Number(event.room_port||0);
       const basePort=Number(((snapshot.gateway||{}).routing_port)||0);
       if((event.kind==="join"||event.kind==="rejoin")&&port&&basePort&&port!==basePort){
@@ -906,7 +1136,7 @@ class AdminDashboardServer:
       let label="Up to date",color="var(--success)";
       if(repo.last_error){label="Check failed";color="var(--danger)";}
       else if(repo.status==="diverged"){label="Diverged";color="var(--danger)";}
-      else if(repo.status==="ahead"){label="Local ahead";color="var(--warning)";}
+      else if(repo.status==="ahead"){label="Ahead of upstream";color="var(--warning)";}
       else if(repo.status==="no_upstream"){label="No upstream";color="var(--warning)";}
       else if(repo.update_available){label="Update available";color="var(--warning)";}
       const dirty=repo.dirty?` <span class="pill">dirty</span>`:"";
@@ -927,7 +1157,7 @@ class AdminDashboardServer:
       const up=snapshot.uptime_seconds||0;
       const gw=snapshot.gateway||{};
       const repo=snapshot.repo||{};
-      const extra=repo.local_version?`<br>${esc(repo.local_version)}${repo.update_available?' &middot; update available':''}`:"";
+      const extra=repo.local_label?`<br>${esc(repo.local_label)}${repo.update_available?' &middot; update available':''}`:"";
       sidebarFooter.innerHTML=`<span class="status-dot ok"></span> Online ${age(up)}<br>${esc(gw.product||"")} &middot; ${esc(gw.version_str||"")} &middot; ${esc(gw.public_host||"")}${extra}`;
     }
 
@@ -1036,8 +1266,10 @@ class AdminDashboardServer:
               <div class="k">Status</div><div class="v">${repoSummary(repo)}</div>
               <div class="k">Branch</div><div class="v">${esc(repo.branch||"")}</div>
               <div class="k">Upstream</div><div class="v">${esc(repo.upstream||"")}</div>
-              <div class="k">Local Version</div><div class="v">${esc(repo.local_version||repo.local_short||"")}</div>
-              <div class="k">GitHub Version</div><div class="v">${esc(repo.remote_version||repo.remote_short||"")}</div>
+              <div class="k">Local Commit</div><div class="v">${esc(repo.local_label||repo.local_short||"")}</div>
+              <div class="k">GitHub Commit</div><div class="v">${esc(repo.remote_label||repo.remote_short||"")}</div>
+              <div class="k">Local Describe</div><div class="v">${esc(repo.local_version||"")}</div>
+              <div class="k">GitHub Describe</div><div class="v">${esc(repo.remote_version||"")}</div>
               <div class="k">Ahead / Behind</div><div class="v">${esc(repo.ahead||0)} / ${esc(repo.behind||0)}</div>
               <div class="k">Last Checked</div><div class="v">${repo.last_checked_at?esc(new Date(repo.last_checked_at*1000).toLocaleString()):"Never"}</div>
               <div class="k">Last Updated</div><div class="v">${repo.last_update_at?esc(new Date(repo.last_update_at*1000).toLocaleString()):"Never"}</div>
@@ -1673,14 +1905,12 @@ class AdminDashboardServer:
         try:
             raw = await reader.readuntil(b"\r\n\r\n")
         except asyncio.IncompleteReadError:
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
         except asyncio.LimitOverrunError:
             writer.write(self._http_response(b"request header too large", "text/plain; charset=utf-8", "413 Payload Too Large"))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         request_text = raw.decode("iso-8859-1", errors="replace")
@@ -1690,16 +1920,14 @@ class AdminDashboardServer:
         if len(parts) < 2:
             writer.write(self._http_response(b"bad request", "text/plain; charset=utf-8", "400 Bad Request"))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         method, target = parts[0], parts[1]
         if method not in ("GET", "POST"):
             writer.write(self._http_response(b"method not allowed", "text/plain; charset=utf-8", "405 Method Not Allowed"))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         parsed = urlsplit(target)
@@ -1714,8 +1942,7 @@ class AdminDashboardServer:
             status = "200 OK" if payload.get("ready", payload.get("ok", False)) or parsed.path.endswith("health") else "503 Service Unavailable"
             writer.write(self._http_response(body, "application/json; charset=utf-8", status))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
         if not self._is_authorized(parsed.path, query, headers):
             writer.write(
@@ -1727,9 +1954,24 @@ class AdminDashboardServer:
                 )
             )
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
+
+        if method == "GET":
+            web_auth_response = await self._dispatch_web_auth_request(method, target, headers, b"")
+            if web_auth_response is not None:
+                status_code, response_headers, response_body = web_auth_response
+                writer.write(
+                    self._http_response(
+                        response_body,
+                        response_headers.get("content-type", "text/plain; charset=utf-8"),
+                        self._status_line(status_code),
+                        extra_headers=[f"{key}: {value}" for key, value in response_headers.items() if key.lower() != "content-type"],
+                    )
+                )
+                await writer.drain()
+                await self._close_writer(writer)
+                return
 
         if method == "POST":
             content_length = 0
@@ -1738,8 +1980,7 @@ class AdminDashboardServer:
             if content_length < 0 or content_length > 65536:
                 writer.write(self._http_response(b"bad content length", "text/plain; charset=utf-8", "400 Bad Request"))
                 await writer.drain()
-                writer.close()
-                await writer.wait_closed()
+                await self._close_writer(writer)
                 return
             body_raw = b""
             if content_length > 0:
@@ -1748,24 +1989,37 @@ class AdminDashboardServer:
                 except Exception:
                     writer.write(self._http_response(b"failed to read body", "text/plain; charset=utf-8", "400 Bad Request"))
                     await writer.drain()
-                    writer.close()
-                    await writer.wait_closed()
+                    await self._close_writer(writer)
                     return
+            web_auth_response = await self._dispatch_web_auth_request(method, target, headers, body_raw)
+            if web_auth_response is not None:
+                status_code, response_headers, response_body = web_auth_response
+                writer.write(
+                    self._http_response(
+                        response_body,
+                        response_headers.get("content-type", "text/plain; charset=utf-8"),
+                        self._status_line(status_code),
+                        extra_headers=[
+                            f"{key}: {value}" for key, value in response_headers.items() if key.lower() != "content-type"
+                        ],
+                    )
+                )
+                await writer.drain()
+                await self._close_writer(writer)
+                return
             try:
                 body_json = json.loads(body_raw) if body_raw else {}
             except json.JSONDecodeError:
                 writer.write(self._http_response(b"invalid json", "text/plain; charset=utf-8", "400 Bad Request"))
                 await writer.drain()
-                writer.close()
-                await writer.wait_closed()
+                await self._close_writer(writer)
                 return
             resp = await self._handle_admin_post(parsed.path, body_json)
             resp_body = json.dumps(resp).encode("utf-8")
             status_code = "200 OK" if resp.get("ok") else "400 Bad Request"
             writer.write(self._http_response(resp_body, "application/json; charset=utf-8", status_code))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         # GET requests
@@ -1792,6 +2046,49 @@ class AdminDashboardServer:
         elif parsed.path == "/api/stats":
             body = json.dumps(self.gateway.stats_snapshot(), indent=2).encode("utf-8")
             writer.write(self._http_response(body, "application/json; charset=utf-8"))
+        elif parsed.path == "/api/live-feed":
+            subscribe = getattr(self.gateway, "subscribe_live_feed", None)
+            unsubscribe = getattr(self.gateway, "unsubscribe_live_feed", None)
+            if not callable(subscribe) or not callable(unsubscribe):
+                writer.write(
+                    self._http_response(
+                        b"live feed unavailable",
+                        "text/plain; charset=utf-8",
+                        "501 Not Implemented",
+                    )
+                )
+                await writer.drain()
+                await self._close_writer(writer)
+                return
+
+            queue = subscribe()
+            writer.write(self._http_event_stream_headers())
+            await writer.drain()
+            try:
+                hello = {
+                    "event": "ready",
+                    "ts": time.time(),
+                    "service": "admin-live-feed",
+                }
+                writer.write(self._sse_frame("ready", hello))
+                await writer.drain()
+                while True:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        writer.write(b": heartbeat\n\n")
+                        await writer.drain()
+                        continue
+                    event_name = str(event.get("event") or "message")
+                    event_id = str(event.get("id") or "")
+                    writer.write(self._sse_frame(event_name, dict(event), event_id=event_id))
+                    await writer.drain()
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, asyncio.CancelledError):
+                pass
+            finally:
+                unsubscribe(queue)
+                await self._close_writer(writer)
+            return
         elif parsed.path == "/":
             writer.write(
                 self._http_response(
@@ -1803,7 +2100,6 @@ class AdminDashboardServer:
             writer.write(self._http_response(b"not found", "text/plain; charset=utf-8", "404 Not Found"))
 
         await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        await self._close_writer(writer)
 
 

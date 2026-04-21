@@ -173,6 +173,9 @@ services:
             --admin-port "${ADMIN_PORT:-8080}" \
             --admin-token "${ADMIN_TOKEN:?set ADMIN_TOKEN in .env for the Docker-published dashboard}" \
             --stats-token "${STATS_TOKEN:-}" \
+            --web-auth-shared-secret "${WEB_AUTH_SHARED_SECRET:-}" \
+            --web-auth-public-base-url "${WEB_AUTH_PUBLIC_BASE_URL:-}" \
+            --web-auth-code-ttl-seconds "${WEB_AUTH_CODE_TTL_SECONDS:-300}" \
             --db-path "$$HOMEWORLD_DB" \
             --cataclysm-db-path "$$CATACLYSM_DB" \
             --keys-dir "$$HOMEWORLD_KEYS" \
@@ -201,6 +204,9 @@ services:
           --admin-port "${ADMIN_PORT:-8080}" \
           --admin-token "${ADMIN_TOKEN:?set ADMIN_TOKEN in .env for the Docker-published dashboard}" \
           --stats-token "${STATS_TOKEN:-}" \
+          --web-auth-shared-secret "${WEB_AUTH_SHARED_SECRET:-}" \
+          --web-auth-public-base-url "${WEB_AUTH_PUBLIC_BASE_URL:-}" \
+          --web-auth-code-ttl-seconds "${WEB_AUTH_CODE_TTL_SECONDS:-300}" \
           --db-path "$$DB_PATH" \
           --keys-dir "$$KEYS_DIR" \
           --log "${LOG_LEVEL:-INFO}"
