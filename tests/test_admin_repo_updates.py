@@ -7,6 +7,7 @@ import sqlite3
 import struct
 
 import titan_binary_gateway
+from gateway import admin as admin_module
 
 
 class _FakeGateway:
@@ -591,6 +592,70 @@ def test_admin_html_contains_clear_cd_key_action() -> None:
 
     assert 'data-action="clear-cd-key"' in html
     assert "Clear CD Key" in html
+
+
+def test_admin_live_feed_disconnect_suppresses_broken_pipe_on_wait_closed(monkeypatch) -> None:
+    class _LiveFeedGateway(_FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.unsubscribed = 0
+
+        def subscribe_live_feed(self) -> asyncio.Queue[dict[str, object]]:
+            return asyncio.Queue()
+
+        def unsubscribe_live_feed(self, queue: asyncio.Queue[dict[str, object]]) -> None:
+            self.unsubscribed += 1
+
+    class _DisconnectingWriter:
+        def __init__(self) -> None:
+            self.closed = False
+            self.drain_calls = 0
+
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            self.drain_calls += 1
+            if self.drain_calls >= 3:
+                raise BrokenPipeError(32, "Broken pipe")
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def wait_closed(self) -> None:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def get_extra_info(self, name: str, default: object = None) -> object:
+            return default
+
+    async def _fake_wait_for(awaitable: object, timeout: float) -> object:
+        close = getattr(awaitable, "close", None)
+        if callable(close):
+            close()
+        raise asyncio.TimeoutError
+
+    async def _run() -> tuple[_LiveFeedGateway, _DisconnectingWriter]:
+        gateway = _LiveFeedGateway()
+        dashboard = titan_binary_gateway.AdminDashboardServer(
+            gateway=gateway,
+            db_path="won_server.db",
+            log_handler=titan_binary_gateway.DashboardLogHandler(),
+            stats_token="stats-secret",
+            repo_monitor=_FakeRepoMonitor(),
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"GET /api/live-feed?token=stats-secret HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        reader.feed_eof()
+        writer = _DisconnectingWriter()
+        await dashboard.handle_client(reader, writer)
+        return gateway, writer
+
+    monkeypatch.setattr(admin_module.asyncio, "wait_for", _fake_wait_for)
+
+    gateway, writer = asyncio.run(_run())
+
+    assert writer.closed is True
+    assert gateway.unsubscribed == 1
 
 
 def test_admin_broadcast_chat_uses_visible_room_chat_sender() -> None:

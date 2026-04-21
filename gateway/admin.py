@@ -229,6 +229,12 @@ class AdminDashboardServer:
             501: "501 Not Implemented",
         }.get(int(status_code), f"{int(status_code)} OK")
 
+    @staticmethod
+    async def _close_writer(writer: asyncio.StreamWriter) -> None:
+        writer.close()
+        with contextlib.suppress(ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+            await writer.wait_closed()
+
     def _web_auth_login_page(self, *, product: str, return_to: str, error: str = "") -> bytes:
         bridge = self._get_web_auth_bridge()
         if bridge is None or not hasattr(bridge, "render_login_page"):
@@ -1899,14 +1905,12 @@ class AdminDashboardServer:
         try:
             raw = await reader.readuntil(b"\r\n\r\n")
         except asyncio.IncompleteReadError:
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
         except asyncio.LimitOverrunError:
             writer.write(self._http_response(b"request header too large", "text/plain; charset=utf-8", "413 Payload Too Large"))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         request_text = raw.decode("iso-8859-1", errors="replace")
@@ -1916,16 +1920,14 @@ class AdminDashboardServer:
         if len(parts) < 2:
             writer.write(self._http_response(b"bad request", "text/plain; charset=utf-8", "400 Bad Request"))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         method, target = parts[0], parts[1]
         if method not in ("GET", "POST"):
             writer.write(self._http_response(b"method not allowed", "text/plain; charset=utf-8", "405 Method Not Allowed"))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         parsed = urlsplit(target)
@@ -1940,8 +1942,7 @@ class AdminDashboardServer:
             status = "200 OK" if payload.get("ready", payload.get("ok", False)) or parsed.path.endswith("health") else "503 Service Unavailable"
             writer.write(self._http_response(body, "application/json; charset=utf-8", status))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
         if not self._is_authorized(parsed.path, query, headers):
             writer.write(
@@ -1953,8 +1954,7 @@ class AdminDashboardServer:
                 )
             )
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         if method == "GET":
@@ -1970,8 +1970,7 @@ class AdminDashboardServer:
                     )
                 )
                 await writer.drain()
-                writer.close()
-                await writer.wait_closed()
+                await self._close_writer(writer)
                 return
 
         if method == "POST":
@@ -1981,8 +1980,7 @@ class AdminDashboardServer:
             if content_length < 0 or content_length > 65536:
                 writer.write(self._http_response(b"bad content length", "text/plain; charset=utf-8", "400 Bad Request"))
                 await writer.drain()
-                writer.close()
-                await writer.wait_closed()
+                await self._close_writer(writer)
                 return
             body_raw = b""
             if content_length > 0:
@@ -1991,8 +1989,7 @@ class AdminDashboardServer:
                 except Exception:
                     writer.write(self._http_response(b"failed to read body", "text/plain; charset=utf-8", "400 Bad Request"))
                     await writer.drain()
-                    writer.close()
-                    await writer.wait_closed()
+                    await self._close_writer(writer)
                     return
             web_auth_response = await self._dispatch_web_auth_request(method, target, headers, body_raw)
             if web_auth_response is not None:
@@ -2008,24 +2005,21 @@ class AdminDashboardServer:
                     )
                 )
                 await writer.drain()
-                writer.close()
-                await writer.wait_closed()
+                await self._close_writer(writer)
                 return
             try:
                 body_json = json.loads(body_raw) if body_raw else {}
             except json.JSONDecodeError:
                 writer.write(self._http_response(b"invalid json", "text/plain; charset=utf-8", "400 Bad Request"))
                 await writer.drain()
-                writer.close()
-                await writer.wait_closed()
+                await self._close_writer(writer)
                 return
             resp = await self._handle_admin_post(parsed.path, body_json)
             resp_body = json.dumps(resp).encode("utf-8")
             status_code = "200 OK" if resp.get("ok") else "400 Bad Request"
             writer.write(self._http_response(resp_body, "application/json; charset=utf-8", status_code))
             await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+            await self._close_writer(writer)
             return
 
         # GET requests
@@ -2064,8 +2058,7 @@ class AdminDashboardServer:
                     )
                 )
                 await writer.drain()
-                writer.close()
-                await writer.wait_closed()
+                await self._close_writer(writer)
                 return
 
             queue = subscribe()
@@ -2094,8 +2087,7 @@ class AdminDashboardServer:
                 pass
             finally:
                 unsubscribe(queue)
-                writer.close()
-                await writer.wait_closed()
+                await self._close_writer(writer)
             return
         elif parsed.path == "/":
             writer.write(
@@ -2108,7 +2100,6 @@ class AdminDashboardServer:
             writer.write(self._http_response(b"not found", "text/plain; charset=utf-8", "404 Not Found"))
 
         await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        await self._close_writer(writer)
 
 
