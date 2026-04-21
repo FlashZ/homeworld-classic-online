@@ -96,6 +96,7 @@ class BinaryGatewayServer:
         self._live_feed_event_id = 0
         self._live_matches: Dict[int, Dict[str, object]] = {}
         self._inferred_room_metadata: Dict[int, Dict[str, object]] = {}
+        self._pending_match_slot_manifests: Dict[int, Dict[str, object]] = {}
         self.started_at = time.time()
         if keys_dir:
             self._load_keys(keys_dir)
@@ -685,6 +686,70 @@ class BinaryGatewayServer:
             "owner_name": str(first_game.get("owner_name") or ""),
         }
 
+    @staticmethod
+    def _normalize_match_slot_manifest_players(players: Any) -> list[Dict[str, object]]:
+        normalized: list[Dict[str, object]] = []
+        if not isinstance(players, list):
+            return normalized
+        for fallback_index, player in enumerate(players):
+            if not isinstance(player, dict):
+                continue
+            player_id = str(player.get("player_id") or "").strip()
+            player_name = str(
+                player.get("player_name")
+                or player.get("nickname")
+                or player.get("username")
+                or player_id
+            ).strip()
+            gameplay_index = player.get("gameplay_index", player.get("slot_index", fallback_index))
+            try:
+                gameplay_index = int(gameplay_index)
+            except (TypeError, ValueError):
+                gameplay_index = int(fallback_index)
+            if not player_name:
+                continue
+            normalized.append(
+                {
+                    "player_id": player_id,
+                    "player_name": player_name,
+                    "gameplay_index": gameplay_index,
+                }
+            )
+        normalized.sort(key=lambda item: (int(item.get("gameplay_index") or 0), str(item.get("player_name") or "")))
+        return normalized
+
+    def queue_match_slot_manifest(self, *, room_port: int, players: list[dict[str, object]]) -> None:
+        normalized_players = self._normalize_match_slot_manifest_players(players)
+        if not normalized_players:
+            return
+        port = int(room_port)
+        self._pending_match_slot_manifests[port] = {"players": normalized_players}
+        if port in self._live_matches:
+            self._emit_pending_match_slot_manifest(port)
+
+    def _emit_pending_match_slot_manifest(
+        self,
+        room_port: int,
+        *,
+        snapshot: Optional[Dict[str, object]] = None,
+    ) -> None:
+        port = int(room_port)
+        pending = self._pending_match_slot_manifests.get(port)
+        state = self._live_matches.get(port)
+        if pending is None or state is None:
+            return
+        room_snapshot = dict(snapshot or self._routing_room_snapshot(port))
+        room_title = self._preferred_room_title(room_snapshot, fallback=state.get("room_name"))
+        payload: Dict[str, object] = {
+            "match_id": str(state["match_id"]),
+            "room_port": port,
+            "room_name": room_title,
+            "room_path": str(room_snapshot.get("room_path") or state.get("room_path") or ""),
+            "players": list(pending.get("players") or []),
+        }
+        self._publish_live_feed_event("match_slot_manifest", payload)
+        self._pending_match_slot_manifests.pop(port, None)
+
     def _sync_live_match_state(
         self,
         room_port: int,
@@ -710,6 +775,7 @@ class BinaryGatewayServer:
                 "match_started",
                 self._live_match_payload(room_port, room_snapshot, state, now=now),
             )
+            self._emit_pending_match_slot_manifest(room_port, snapshot=room_snapshot)
             return str(state["match_id"])
 
         if is_live and state is not None:
@@ -726,6 +792,7 @@ class BinaryGatewayServer:
             participants = self._room_participant_count(room_snapshot)
             if participants <= 0:
                 self._inferred_room_metadata.pop(room_port, None)
+                self._pending_match_slot_manifests.pop(room_port, None)
                 self._publish_live_feed_event(
                     "match_finished",
                     self._live_match_payload(room_port, room_snapshot, state, now=now),
@@ -1842,6 +1909,18 @@ class BinaryGatewayServer:
                     "players": launch.get("players", []),
                     "map_name": launch.get("map_name", ""),
                 }
+                server = launch.get("server", {})
+                if isinstance(server, dict):
+                    room_port = server.get("port")
+                    try:
+                        room_port = int(room_port)
+                    except (TypeError, ValueError):
+                        room_port = 0
+                    if room_port > 0:
+                        self.queue_match_slot_manifest(
+                            room_port=room_port,
+                            players=list(launch.get("players", []) or []),
+                        )
 
         if event is None:
             return

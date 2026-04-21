@@ -928,6 +928,63 @@ def test_gateway_live_feed_emits_match_lifecycle_and_packet_events() -> None:
     assert match_finished["duration_seconds"] >= 0
 
 
+def test_gateway_emits_pending_match_slot_manifest_when_room_goes_live() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+    gateway.queue_match_slot_manifest(
+        room_port=15102,
+        players=[
+            {"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "gameplay_index": 0},
+            {"player_id": "volans", "player_name": "Volans|SF", "gameplay_index": 1},
+            {"player_id": "chainster", "player_name": "&Chainster", "gameplay_index": 2},
+            {"player_id": "gravity", "player_name": "gravi&ty&P&S&A", "gameplay_index": 3},
+        ],
+    )
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="&Z&e&r&o|&S&F",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=2,
+        player_name="Volans|SF",
+        player_ip="2.2.2.2",
+    )
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    match_started = next(event for event in events if event["event"] == "match_started")
+    slot_manifest = next(event for event in events if event["event"] == "match_slot_manifest")
+
+    assert slot_manifest["room_port"] == 15102
+    assert slot_manifest["match_id"] == match_started["match_id"]
+    assert slot_manifest["players"] == [
+        {"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "gameplay_index": 0},
+        {"player_id": "volans", "player_name": "Volans|SF", "gameplay_index": 1},
+        {"player_id": "chainster", "player_name": "&Chainster", "gameplay_index": 2},
+        {"player_id": "gravity", "player_name": "gravi&ty&P&S&A", "gameplay_index": 3},
+    ]
+
+
 def test_gateway_infers_homeworld_match_metadata_from_peer_packet_payload() -> None:
     class _InferMetadataRoutingServer:
         def __init__(self) -> None:
