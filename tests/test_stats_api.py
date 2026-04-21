@@ -985,6 +985,76 @@ def test_gateway_emits_pending_match_slot_manifest_when_room_goes_live() -> None
     ]
 
 
+def test_gateway_emits_pending_match_launch_config_when_room_goes_live() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+    gateway.queue_match_launch_config(
+        room_port=15102,
+        lobby_title="2v2 no rush",
+        map_name="Clan Wars (2-6)",
+        map_code="pkwar6",
+        settings={"room_flags": 7, "allied_victory": True},
+        captain_identity={"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "role": "lobby_owner"},
+        players=[
+            {"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "gameplay_index": 0},
+            {"player_id": "volans", "player_name": "Volans|SF", "gameplay_index": 1},
+        ],
+        transport_mode="routed",
+    )
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="&Z&e&r&o|&S&F",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=2,
+        player_name="Volans|SF",
+        player_ip="2.2.2.2",
+    )
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    match_started = next(event for event in events if event["event"] == "match_started")
+    launch_config = next(event for event in events if event["event"] == "match_launch_config")
+
+    assert launch_config["match_id"] == match_started["match_id"]
+    assert launch_config["room_port"] == 15102
+    assert launch_config["transport_mode"] == "routed"
+    assert launch_config["capture_source"] == "routed_live_feed"
+    assert launch_config["lobby_title"] == "2v2 no rush"
+    assert launch_config["map_name"] == "Clan Wars (2-6)"
+    assert launch_config["map_code"] == "pkwar6"
+    assert launch_config["settings"] == {"room_flags": 7, "allied_victory": True}
+    assert launch_config["captain_identity"] == {
+        "player_id": "zero",
+        "player_name": "&Z&e&r&o|&S&F",
+        "role": "lobby_owner",
+    }
+    assert launch_config["players"] == [
+        {"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "gameplay_index": 0},
+        {"player_id": "volans", "player_name": "Volans|SF", "gameplay_index": 1},
+    ]
+
+
 def test_gateway_infers_homeworld_match_metadata_from_peer_packet_payload() -> None:
     class _InferMetadataRoutingServer:
         def __init__(self) -> None:

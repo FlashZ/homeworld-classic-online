@@ -97,6 +97,7 @@ class BinaryGatewayServer:
         self._live_matches: Dict[int, Dict[str, object]] = {}
         self._inferred_room_metadata: Dict[int, Dict[str, object]] = {}
         self._pending_match_slot_manifests: Dict[int, Dict[str, object]] = {}
+        self._pending_match_launch_configs: Dict[int, Dict[str, object]] = {}
         self.started_at = time.time()
         if keys_dir:
             self._load_keys(keys_dir)
@@ -727,6 +728,31 @@ class BinaryGatewayServer:
         if port in self._live_matches:
             self._emit_pending_match_slot_manifest(port)
 
+    def queue_match_launch_config(
+        self,
+        *,
+        room_port: int,
+        lobby_title: str,
+        map_name: str,
+        map_code: str,
+        settings: dict[str, object] | None,
+        captain_identity: dict[str, object] | None,
+        players: list[dict[str, object]],
+        transport_mode: str = "routed",
+    ) -> None:
+        port = int(room_port)
+        self._pending_match_launch_configs[port] = {
+            "transport_mode": str(transport_mode or "routed"),
+            "lobby_title": str(lobby_title or "").strip(),
+            "map_name": str(map_name or "").strip(),
+            "map_code": str(map_code or "").strip(),
+            "settings": dict(settings or {}),
+            "captain_identity": dict(captain_identity or {}),
+            "players": self._normalize_match_slot_manifest_players(players),
+        }
+        if port in self._live_matches:
+            self._emit_pending_match_launch_config(port)
+
     def _emit_pending_match_slot_manifest(
         self,
         room_port: int,
@@ -749,6 +775,36 @@ class BinaryGatewayServer:
         }
         self._publish_live_feed_event("match_slot_manifest", payload)
         self._pending_match_slot_manifests.pop(port, None)
+
+    def _emit_pending_match_launch_config(
+        self,
+        room_port: int,
+        *,
+        snapshot: Optional[Dict[str, object]] = None,
+    ) -> None:
+        port = int(room_port)
+        pending = self._pending_match_launch_configs.get(port)
+        state = self._live_matches.get(port)
+        if pending is None or state is None:
+            return
+        room_snapshot = dict(snapshot or self._routing_room_snapshot(port))
+        room_title = self._preferred_room_title(room_snapshot, fallback=state.get("room_name"))
+        payload: Dict[str, object] = {
+            "match_id": str(state["match_id"]),
+            "room_port": port,
+            "room_name": room_title,
+            "room_path": str(room_snapshot.get("room_path") or state.get("room_path") or ""),
+            "transport_mode": str(pending.get("transport_mode") or "routed"),
+            "capture_source": "routed_live_feed",
+            "lobby_title": str(pending.get("lobby_title") or room_title or ""),
+            "map_name": str(pending.get("map_name") or ""),
+            "map_code": str(pending.get("map_code") or ""),
+            "settings": dict(pending.get("settings") or {}),
+            "captain_identity": dict(pending.get("captain_identity") or {}),
+            "players": list(pending.get("players") or []),
+        }
+        self._publish_live_feed_event("match_launch_config", payload)
+        self._pending_match_launch_configs.pop(port, None)
 
     def _sync_live_match_state(
         self,
@@ -775,6 +831,7 @@ class BinaryGatewayServer:
                 "match_started",
                 self._live_match_payload(room_port, room_snapshot, state, now=now),
             )
+            self._emit_pending_match_launch_config(room_port, snapshot=room_snapshot)
             self._emit_pending_match_slot_manifest(room_port, snapshot=room_snapshot)
             return str(state["match_id"])
 
@@ -782,6 +839,7 @@ class BinaryGatewayServer:
             state["room_name"] = self._preferred_room_title(room_snapshot, fallback=state.get("room_name"))
             state["room_path"] = str(room_snapshot.get("room_path") or state.get("room_path") or "")
             if emit_update:
+                self._emit_pending_match_launch_config(room_port, snapshot=room_snapshot)
                 self._publish_live_feed_event(
                     "match_updated",
                     self._live_match_payload(room_port, room_snapshot, state, now=now),
@@ -793,6 +851,7 @@ class BinaryGatewayServer:
             if participants <= 0:
                 self._inferred_room_metadata.pop(room_port, None)
                 self._pending_match_slot_manifests.pop(room_port, None)
+                self._pending_match_launch_configs.pop(room_port, None)
                 self._publish_live_feed_event(
                     "match_finished",
                     self._live_match_payload(room_port, room_snapshot, state, now=now),
@@ -1917,6 +1976,18 @@ class BinaryGatewayServer:
                     except (TypeError, ValueError):
                         room_port = 0
                     if room_port > 0:
+                        launch_config = launch.get("launch_config", {})
+                        if isinstance(launch_config, dict):
+                            self.queue_match_launch_config(
+                                room_port=room_port,
+                                lobby_title=str(launch_config.get("lobby_title") or ""),
+                                map_name=str(launch_config.get("map_name") or launch.get("map_name") or ""),
+                                map_code=str(launch_config.get("map_code") or launch.get("map_name") or ""),
+                                settings=dict(launch_config.get("settings") or {}),
+                                captain_identity=dict(launch_config.get("captain_identity") or {}),
+                                players=list(launch_config.get("players") or launch.get("players", [])),
+                                transport_mode=str(launch_config.get("transport_mode") or "routed"),
+                            )
                         self.queue_match_slot_manifest(
                             room_port=room_port,
                             players=list(launch.get("players", []) or []),
