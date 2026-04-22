@@ -19,6 +19,7 @@ from . import protocol as _protocol
 from .routing import RoutingServerManager
 from .admin import AdminDashboardServer, DASHBOARD_LOG_HANDLER
 from .firewall import _handle_firewall_probe
+from .web_auth import GatewayWebAuthBridge
 from .product_profile import (
     CATACLYSM_PRODUCT_PROFILE,
     HOMEWORLD_PRODUCT_PROFILE,
@@ -3646,6 +3647,16 @@ async def main_async(args: argparse.Namespace) -> None:
         db_paths = {product_profile.key: str(db_path)}
         default_db_product = product_profile.key
 
+    web_auth_bridge = None
+    if db_paths and str(args.web_auth_shared_secret or "").strip():
+        web_auth_bridge = GatewayWebAuthBridge(
+            db_paths=db_paths,
+            default_product=default_db_product,
+            shared_secret=str(args.web_auth_shared_secret or "").strip(),
+            code_ttl_seconds=float(args.web_auth_code_ttl_seconds),
+        )
+        setattr(srv, "web_auth_bridge", web_auth_bridge)
+
     server = await asyncio.start_server(srv.handle_client, args.host, args.port)
     firewall_server = await asyncio.start_server(
         _handle_firewall_probe, args.host, args.firewall_port
@@ -3658,6 +3669,8 @@ async def main_async(args: argparse.Namespace) -> None:
         default_db_product=default_db_product,
         admin_token=args.admin_token,
         stats_token=args.stats_token,
+        web_auth_shared_secret=str(args.web_auth_shared_secret or ""),
+        web_auth_public_base_url=str(args.web_auth_public_base_url or ""),
     )
     admin_server = None
     if args.admin_port > 0:
@@ -3791,6 +3804,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--stats-token",
         default=os.environ.get("STATS_TOKEN", ""),
         help="Optional token for the bot-friendly /api/stats endpoint. Falls back to --admin-token when unset.",
+    )
+    p.add_argument(
+        "--web-auth-shared-secret",
+        default=os.environ.get("WEB_AUTH_SHARED_SECRET", ""),
+        help="Shared secret required for the browser auth code exchange endpoint.",
+    )
+    p.add_argument(
+        "--web-auth-public-base-url",
+        default=os.environ.get("WEB_AUTH_PUBLIC_BASE_URL", ""),
+        help="Public browser base URL for the stats site used to validate auth return targets.",
+    )
+    p.add_argument(
+        "--web-auth-code-ttl-seconds",
+        type=float,
+        default=float(os.environ.get("WEB_AUTH_CODE_TTL_SECONDS", "300") or "300"),
+        help="Lifetime in seconds for issued browser auth exchange codes.",
     )
     p.add_argument("--db-path", default="",
                    help="Path to the SQLite backend DB shown in the admin dashboard. Defaults to data/<product>/won_server.db when omitted.")

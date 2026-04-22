@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from gateway.web_auth import GatewayWebAuthBridge
 from gateway.admin import AdminDashboardServer, DASHBOARD_LOG_HANDLER
+from gateway import titan_service
 
 
 def _seed_user(db_path: Path, username: str, password_hash: str) -> None:
@@ -297,3 +298,122 @@ def test_hash_password_uses_sha256() -> None:
     assert GatewayWebAuthBridge.hash_password("swordfish") == hashlib.sha256(
         b"swordfish"
     ).hexdigest()
+
+
+def test_gateway_parser_accepts_web_auth_cli_flags() -> None:
+    parser = titan_service.build_parser()
+
+    args = parser.parse_args(
+        [
+            "--web-auth-shared-secret",
+            "bridge-secret",
+            "--web-auth-public-base-url",
+            "https://stats.example.test",
+            "--web-auth-code-ttl-seconds",
+            "300",
+        ]
+    )
+
+    assert args.web_auth_shared_secret == "bridge-secret"
+    assert args.web_auth_public_base_url == "https://stats.example.test"
+    assert args.web_auth_code_ttl_seconds == 300.0
+
+
+def test_main_async_attaches_web_auth_bridge_and_dashboard_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeSocket:
+        def getsockname(self) -> tuple[str, int]:
+            return ("127.0.0.1", 8080)
+
+    class _FakeServer:
+        sockets = [_FakeSocket()]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def serve_forever(self) -> None:
+            return None
+
+    class _FakeRoutingManager:
+        def __init__(self, *args, **kwargs) -> None:
+            self.gateway = kwargs.get("gateway")
+            self.product_profile = kwargs.get("product_profile")
+
+        async def start_listener(self, *args, **kwargs):
+            return None, _FakeServer()
+
+        async def close_all(self) -> None:
+            return None
+
+    class _FakeAdminDashboard:
+        def __init__(self, gateway, db_path, log_handler, **kwargs) -> None:
+            captured["gateway"] = gateway
+            captured["db_path"] = db_path
+            captured["kwargs"] = kwargs
+
+        async def handle_client(self, reader, writer) -> None:
+            return None
+
+        def start_background_tasks(self) -> None:
+            return None
+
+        async def stop_background_tasks(self) -> None:
+            return None
+
+    async def _fake_start_server(*args, **kwargs):
+        return _FakeServer()
+
+    async def _fake_gather(*args, **kwargs):
+        for coro in args:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(titan_service, "RoutingServerManager", _FakeRoutingManager)
+    monkeypatch.setattr(titan_service, "AdminDashboardServer", _FakeAdminDashboard)
+    monkeypatch.setattr(titan_service.asyncio, "start_server", _fake_start_server)
+    monkeypatch.setattr(titan_service.asyncio, "gather", _fake_gather)
+    monkeypatch.setattr(titan_service.BinaryGatewayServer, "start_background_tasks", lambda self: None)
+    monkeypatch.setattr(titan_service.BinaryGatewayServer, "stop_background_tasks", lambda self: asyncio.sleep(0))
+    monkeypatch.setattr(
+        titan_service,
+        "_resolve_gateway_runtime_config",
+        lambda args: (
+            titan_service.HOMEWORLD_PRODUCT_PROFILE,
+            "0110",
+            ["0110"],
+            str(tmp_path / "won_server.db"),
+            None,
+        ),
+    )
+
+    args = parser = titan_service.build_parser().parse_args(
+        [
+            "--admin-port",
+            "8080",
+            "--web-auth-shared-secret",
+            "bridge-secret",
+            "--web-auth-public-base-url",
+            "https://stats.example.test",
+            "--web-auth-code-ttl-seconds",
+            "120",
+            "--db-path",
+            str(tmp_path / "won_server.db"),
+        ]
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(titan_service.main_async(args))
+
+    gateway = captured["gateway"]
+    kwargs = captured["kwargs"]
+    assert getattr(gateway, "web_auth_bridge", None) is not None
+    assert gateway.web_auth_bridge.shared_secret == "bridge-secret"
+    assert gateway.web_auth_bridge.code_ttl_seconds == 120.0
+    assert kwargs["web_auth_shared_secret"] == "bridge-secret"
+    assert kwargs["web_auth_public_base_url"] == "https://stats.example.test"
