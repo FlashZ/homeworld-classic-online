@@ -34,6 +34,88 @@ LEAVE_FOR_GAME_WINDOW_SECONDS = 3.0
 _MULTIPLAYER_LEVEL_PATH_RE = re.compile(
     rb"(?i)multiplayer\\(?P<folder>[^\\\x00\r\n]+)\\(?P<file>[^\\\x00\r\n]+)\.level"
 )
+_PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{4,}")
+_PRINTABLE_UTF16LE_RE = re.compile(rb"(?:(?:[ -~]\x00)){4,}")
+_MAP_CODE_TEXT_RE = re.compile(r"^pkwar[0-9a-z%._-]+$", re.IGNORECASE)
+_HUMAN_TITLE_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 &'(),_.:+!-]{2,63}$")
+
+
+def _extract_payload_strings(payload: bytes) -> list[str]:
+    candidates: list[tuple[int, str]] = []
+    for match in _PRINTABLE_TEXT_RE.finditer(payload):
+        text = match.group().decode("ascii", errors="ignore").strip()
+        if len(text) >= 4:
+            candidates.append((match.start(), text))
+    for match in _PRINTABLE_UTF16LE_RE.finditer(payload):
+        raw = match.group()
+        if match.start() > 0 and payload[match.start() - 1] != 0 and len(raw) >= 4:
+            raw = raw[2:]
+        text = raw.decode("utf-16le", errors="ignore").strip()
+        if len(text) >= 4:
+            candidates.append((match.start(), text))
+
+    strings: list[str] = []
+    for _, text in sorted(candidates, key=lambda item: item[0]):
+        if text in strings:
+            continue
+        strings.append(text)
+        if len(strings) >= 32:
+            break
+    return strings
+
+
+def _looks_like_map_code_text(text: str) -> bool:
+    return bool(_MAP_CODE_TEXT_RE.match(str(text or "").strip()))
+
+
+def _looks_like_human_title_text(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    if (
+        "\\" in normalized
+        or "/" in normalized
+        or "." in normalized
+        or lowered.startswith("description")
+        or _looks_like_map_code_text(normalized)
+    ):
+        return False
+    return bool(_HUMAN_TITLE_TEXT_RE.fullmatch(normalized))
+
+
+def _infer_setup_titles_from_payload(payload: bytes, *, fallback_map_code: str) -> Dict[str, str]:
+    strings = _extract_payload_strings(payload)
+    map_code = next((text.strip() for text in strings if _looks_like_map_code_text(text)), "")
+    if not map_code:
+        map_code = str(fallback_map_code or "").strip()
+    normalized_map_code = map_code.lower()
+    map_code_index = next(
+        (index for index, text in enumerate(strings) if text.strip().lower() == normalized_map_code),
+        -1,
+    )
+
+    map_title = ""
+    if map_code_index != -1:
+        for text in strings[map_code_index + 1 :]:
+            candidate = text.strip()
+            if _looks_like_human_title_text(candidate):
+                map_title = candidate
+                break
+
+    lobby_title = ""
+    if map_code_index != -1:
+        for text in strings[:map_code_index]:
+            candidate = text.strip()
+            if _looks_like_human_title_text(candidate):
+                lobby_title = candidate
+                break
+
+    return {
+        "lobby_title": lobby_title,
+        "map_title": map_title,
+        "map_code": map_code,
+    }
 
 class BinaryGatewayServer:
     def __init__(self, backend_host: str, backend_port: int,
@@ -403,10 +485,16 @@ class BinaryGatewayServer:
         level_path = match.group(0).decode("latin-1", errors="ignore").strip()
         if not display_name or not level_path:
             return None
+        setup_titles = _infer_setup_titles_from_payload(payload, fallback_map_code=display_name)
+        lobby_title = str(setup_titles.get("lobby_title") or "").strip()
+        map_title = str(setup_titles.get("map_title") or "").strip()
+        map_code = str(setup_titles.get("map_code") or display_name).strip()
         return {
-            "display_name": display_name,
-            "game_name": display_name,
-            "map_name": display_name,
+            "display_name": lobby_title or map_title or display_name,
+            "game_name": map_code or display_name,
+            "map_name": map_title or display_name,
+            "map_code": map_code,
+            "lobby_title": lobby_title,
             "level_path": level_path,
             "metadata_source": "peer_packet",
         }
@@ -675,7 +763,7 @@ class BinaryGatewayServer:
             "room_name": room_title,
             "room_path": str(snapshot.get("room_path") or state.get("room_path") or ""),
             "display_name": room_title,
-            "map_name": str(first_game.get("name") or snapshot.get("map_name") or room_title or ""),
+            "map_name": str(snapshot.get("map_name") or first_game.get("name") or room_title or ""),
             "level_path": str(snapshot.get("level_path") or ""),
             "participant_count": self._room_participant_count(snapshot),
             "started_at": float(state["started_at"]),
@@ -956,7 +1044,7 @@ class BinaryGatewayServer:
             "room_name": room_title,
             "room_path": str(room_snapshot.get("room_path") or ""),
             "game_name": str(first_game.get("name") or room_snapshot.get("map_name") or ""),
-            "map_name": str(first_game.get("name") or room_snapshot.get("map_name") or room_title or ""),
+            "map_name": str(room_snapshot.get("map_name") or first_game.get("name") or room_title or ""),
             "sender_client_id": int(sender_client_id),
             "sender_name": str(sender_name or ""),
             "recipient_client_ids": [int(client_id) for client_id in recipient_client_ids],
