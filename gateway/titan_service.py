@@ -210,6 +210,48 @@ class BinaryGatewayServer:
     def _touch_peer_session(self, session: PeerSession) -> None:
         session.last_used_at = time.time()
 
+    async def _select_local_routing_process_port(
+        self,
+        process_name: str,
+        *,
+        room_password: str,
+    ) -> tuple[int, bool]:
+        manager = self.routing_manager
+        if manager is None:
+            return int(self.routing_port), False
+        if process_name not in {
+            self.product_profile.routing_chat_process_name,
+            self.product_profile.routing_game_process_name,
+        }:
+            return int(self.routing_port), False
+
+        chat_process = process_name == self.product_profile.routing_chat_process_name
+        selected_port = int(self.routing_port)
+        routing_server = None
+
+        # Native Homeworld clients expect the post-game chat/default lobby to live
+        # on the base routing port. Reallocating a fresh published-capable listener
+        # splits the population into multiple "default" rooms (15102, 15103, ...).
+        if (
+            chat_process
+            and self.product_profile.key == HOMEWORLD_PRODUCT_PROFILE.key
+            and not str(room_password or "").strip()
+        ):
+            selected_port = int(getattr(manager, "base_port", self.routing_port) or self.routing_port)
+            routing_server = manager.get_server(selected_port)
+            if routing_server is None:
+                routing_server, _listener = await manager.start_listener(
+                    selected_port,
+                    publish_in_directory=True,
+                )
+            return selected_port, True
+
+        selected_port = await manager.allocate_server(publish_in_directory=chat_process)
+        routing_server = manager.get_server(selected_port)
+        if routing_server is not None and chat_process:
+            routing_server._room_password = str(room_password or "")
+        return selected_port, True
+
     def _alloc_user_id(self) -> int:
         user_id = int(self._next_user_id)
         self._next_user_id = user_id + 1
@@ -1860,19 +1902,16 @@ class BinaryGatewayServer:
         room_password = _extract_factory_password(str(req["cmd_line"]))
         managed_locally = False
 
-        if self.routing_manager is not None and process_name in {
-            self.product_profile.routing_chat_process_name,
-            self.product_profile.routing_game_process_name,
-        }:
-            try:
-                selected_port = await self.routing_manager.allocate_server(
-                    publish_in_directory=(process_name == self.product_profile.routing_chat_process_name)
-                )
-                managed_locally = True
-                routing_server = self.routing_manager._servers.get(selected_port)
-                if routing_server is not None and process_name == self.product_profile.routing_chat_process_name:
-                    routing_server._room_password = room_password
-            except Exception as exc:
+        try:
+            selected_port, managed_locally = await self._select_local_routing_process_port(
+                process_name,
+                room_password=room_password,
+            )
+        except Exception as exc:
+            if self.routing_manager is not None and process_name in {
+                self.product_profile.routing_chat_process_name,
+                self.product_profile.routing_game_process_name,
+            }:
                 LOGGER.warning("Factory(session): routing allocation failed: %s", exc)
 
         if room_password:

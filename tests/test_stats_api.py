@@ -700,6 +700,83 @@ def test_shared_gateway_tracks_product_from_user_and_peer_session_identity() -> 
     assert shared._runtime_for_peer_session(40000) is cat
 
 
+def test_gateway_routes_chat_process_back_to_base_lobby_port() -> None:
+    class _RoutingServer:
+        def __init__(self) -> None:
+            self._room_password = ""
+
+    class _RoutingManager:
+        def __init__(self) -> None:
+            self.base_port = 15100
+            self._servers = {15100: _RoutingServer()}
+            self.allocate_calls: list[bool] = []
+
+        async def allocate_server(self, *, publish_in_directory: bool = True) -> int:
+            self.allocate_calls.append(bool(publish_in_directory))
+            return 15102
+
+        async def start_listener(self, port: int, publish_in_directory: bool = True):
+            server = self._servers.setdefault(int(port), _RoutingServer())
+            return server, object()
+
+        def get_server(self, port: int):
+            return self._servers.get(int(port))
+
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        routing_port=15100,
+        product_profile=HOMEWORLD_PRODUCT_PROFILE,
+    )
+    manager = _RoutingManager()
+    gateway.routing_manager = manager
+
+    selected_port, managed_locally = asyncio.run(
+        gateway._select_local_routing_process_port(  # type: ignore[attr-defined]
+            HOMEWORLD_PRODUCT_PROFILE.routing_chat_process_name,
+            room_password="",
+        )
+    )
+
+    assert managed_locally is True
+    assert selected_port == 15100
+    assert manager.allocate_calls == []
+
+
+def test_gateway_keeps_game_process_on_side_listener() -> None:
+    class _RoutingManager:
+        def __init__(self) -> None:
+            self.base_port = 15100
+            self.allocate_calls: list[bool] = []
+
+        async def allocate_server(self, *, publish_in_directory: bool = True) -> int:
+            self.allocate_calls.append(bool(publish_in_directory))
+            return 15102
+
+        def get_server(self, _port: int):
+            return None
+
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        routing_port=15100,
+        product_profile=HOMEWORLD_PRODUCT_PROFILE,
+    )
+    manager = _RoutingManager()
+    gateway.routing_manager = manager
+
+    selected_port, managed_locally = asyncio.run(
+        gateway._select_local_routing_process_port(  # type: ignore[attr-defined]
+            HOMEWORLD_PRODUCT_PROFILE.routing_game_process_name,
+            room_password="",
+        )
+    )
+
+    assert managed_locally is True
+    assert selected_port == 15102
+    assert manager.allocate_calls == [False]
+
+
 def test_shared_gateway_dir_request_prefers_exact_valid_versions_service() -> None:
     home = titan_binary_gateway.BinaryGatewayServer(
         "127.0.0.1",
