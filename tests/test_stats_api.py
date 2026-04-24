@@ -1005,6 +1005,69 @@ def test_gateway_live_feed_emits_match_lifecycle_and_packet_events() -> None:
     assert match_finished["duration_seconds"] >= 0
 
 
+def test_gateway_live_feed_finishes_match_when_room_refresh_shows_pending_reconnects_only() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="Alpha",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=2,
+        player_name="Bravo",
+        player_ip="2.2.2.2",
+    )
+    routing_server.snapshot.update(
+        {
+            "is_game_room": False,
+            "active_game_count": 0,
+            "native_client_count": 0,
+            "pending_reconnect_count": 2,
+            "pending_reconnects": [
+                {"client_id": 1, "client_name": "Alpha", "client_ip": "1.1.1.1"},
+                {"client_id": 2, "client_name": "Bravo", "client_ip": "2.2.2.2"},
+            ],
+            "clients": [],
+            "peer_data_messages": 0,
+            "peer_data_bytes": 0,
+            "game_count": 0,
+            "games": [],
+            "data_object_count": 0,
+        }
+    )
+
+    gateway.record_live_room_refresh(15102)
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    event_names = [str(event["event"]) for event in events]
+    assert "match_started" in event_names
+    assert "match_finished" in event_names
+    match_finished = next(event for event in events if event["event"] == "match_finished")
+    assert match_finished["room_port"] == 15102
+    assert match_finished["participant_count"] == 2
+
+
 def test_gateway_emits_pending_match_slot_manifest_when_room_goes_live() -> None:
     gateway = titan_binary_gateway.BinaryGatewayServer(
         "127.0.0.1",

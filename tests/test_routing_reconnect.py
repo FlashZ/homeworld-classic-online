@@ -100,6 +100,64 @@ def test_dashboard_snapshot_marks_unpublished_active_room_as_game_room() -> None
     assert snapshot["rooms"][0]["active_game_count"] == 1
 
 
+def test_dashboard_snapshot_keeps_unpublished_pending_reconnect_room_live_when_activity_is_recent() -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    for client_id, name in ((1, "Alpha"), (2, "Bravo")):
+        server._pending_reconnects[client_id] = titan_binary_gateway.PendingNativeReconnect(
+            client_id=client_id,
+            client_name_raw=name.encode("ascii"),
+            client_name=name,
+            client_ip=f"1.2.3.{client_id}",
+            client_ip_u32=0,
+            connected_at=100.0,
+            last_activity_at=101.0,
+            last_activity_kind="peer_data",
+            chat_count=0,
+            peer_data_messages=12,
+            peer_data_bytes=4096,
+        )
+    server._last_peer_data_at = time.time()
+
+    snapshot = server.dashboard_snapshot()
+
+    assert snapshot["pending_reconnect_count"] == 2
+    assert snapshot["is_game_room"] is True
+    assert snapshot["active_game_count"] == 1
+
+
+def test_dashboard_snapshot_does_not_leave_unpublished_pending_reconnect_room_stuck_as_game() -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    for client_id, name in ((1, "Alpha"), (2, "Bravo")):
+        server._pending_reconnects[client_id] = titan_binary_gateway.PendingNativeReconnect(
+            client_id=client_id,
+            client_name_raw=name.encode("ascii"),
+            client_name=name,
+            client_ip=f"1.2.3.{client_id}",
+            client_ip_u32=0,
+            connected_at=100.0,
+            last_activity_at=101.0,
+            last_activity_kind="peer_data",
+            chat_count=0,
+            peer_data_messages=12,
+            peer_data_bytes=4096,
+        )
+    server._last_peer_data_at = (
+        time.time() - titan_binary_gateway.PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS - 1.0
+    )
+
+    snapshot = server.dashboard_snapshot()
+
+    assert snapshot["pending_reconnect_count"] == 2
+    assert snapshot["is_game_room"] is False
+    assert snapshot["active_game_count"] == 0
+
+
 def test_dashboard_snapshot_marks_cataclysm_published_room_as_game_when_peer_data_is_recent() -> None:
     manager = titan_binary_gateway.RoutingServerManager(
         host="127.0.0.1",

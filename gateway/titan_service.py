@@ -974,12 +974,11 @@ class BinaryGatewayServer:
                 self._publish_live_feed_event(
                     "match_updated",
                     self._live_match_payload(room_port, room_snapshot, state, now=now),
-                )
+            )
             return str(state["match_id"])
 
         if state is not None:
-            participants = self._room_participant_count(room_snapshot)
-            if participants <= 0:
+            if not bool(room_snapshot.get("is_game_room", False)):
                 self._inferred_room_metadata.pop(room_port, None)
                 self._pending_match_slot_manifests.pop(room_port, None)
                 self._pending_match_launch_configs.pop(room_port, None)
@@ -997,6 +996,10 @@ class BinaryGatewayServer:
             return str(state["match_id"])
 
         return None
+
+    def record_live_room_refresh(self, room_port: int) -> None:
+        room_snapshot = self._routing_room_snapshot(room_port)
+        self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
 
     def record_live_player_event(
         self,
