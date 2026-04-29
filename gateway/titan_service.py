@@ -840,13 +840,48 @@ class BinaryGatewayServer:
                 gameplay_index = int(fallback_index)
             if not player_name:
                 continue
-            normalized.append(
-                {
-                    "player_id": player_id,
-                    "player_name": player_name,
-                    "gameplay_index": gameplay_index,
-                }
-            )
+            record: Dict[str, object] = {
+                "player_id": player_id,
+                "player_name": player_name,
+                "gameplay_index": gameplay_index,
+            }
+            player_type = str(
+                player.get("player_type")
+                or player.get("slot_type")
+                or player.get("kind")
+                or player.get("control")
+                or player.get("type")
+                or ""
+            ).strip()
+            if player_type:
+                record["player_type"] = player_type
+            for key in ("is_ai", "ai", "computer", "is_computer", "is_bot"):
+                if key not in player:
+                    continue
+                value = player.get(key)
+                if isinstance(value, bool):
+                    record["is_ai"] = value
+                    break
+                if isinstance(value, (int, float)):
+                    record["is_ai"] = bool(value)
+                    break
+                label = str(value or "").strip().lower()
+                if label in {"true", "1", "yes", "on"}:
+                    record["is_ai"] = True
+                    break
+                if label in {"false", "0", "no", "off"}:
+                    record["is_ai"] = False
+                    break
+            ai_difficulty = str(
+                player.get("ai_difficulty")
+                or player.get("difficulty")
+                or player.get("cpu_difficulty")
+                or player.get("computer_difficulty")
+                or ""
+            ).strip()
+            if ai_difficulty:
+                record["ai_difficulty"] = ai_difficulty
+            normalized.append(record)
         normalized.sort(key=lambda item: (int(item.get("gameplay_index") or 0), str(item.get("player_name") or "")))
         return normalized
 

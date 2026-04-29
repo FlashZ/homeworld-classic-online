@@ -1195,6 +1195,71 @@ def test_gateway_emits_pending_match_launch_config_when_room_goes_live() -> None
     ]
 
 
+def test_gateway_preserves_ai_slot_metadata_in_launch_config_events() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+    gateway.queue_match_launch_config(
+        room_port=15102,
+        lobby_title="3p vs AI",
+        map_name="Eddy's Ring (2-8)",
+        map_code="pkwar8",
+        settings={"allied_victory": True, "ai_difficulty": "Hard"},
+        captain_identity={"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "role": "lobby_owner"},
+        players=[
+            {"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "gameplay_index": 0, "player_type": "human"},
+            {"player_id": "volans", "player_name": "Volans|SF", "gameplay_index": 1, "player_type": "human"},
+            {"player_id": "cpu-1", "player_name": "CPU Alpha", "gameplay_index": 2, "player_type": "ai", "is_ai": True, "difficulty": "Hard"},
+        ],
+        transport_mode="routed",
+    )
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="&Z&e&r&o|&S&F",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=2,
+        player_name="Volans|SF",
+        player_ip="2.2.2.2",
+    )
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    launch_config = next(event for event in events if event["event"] == "match_launch_config")
+
+    assert launch_config["players"] == [
+        {"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "gameplay_index": 0, "player_type": "human"},
+        {"player_id": "volans", "player_name": "Volans|SF", "gameplay_index": 1, "player_type": "human"},
+        {
+            "player_id": "cpu-1",
+            "player_name": "CPU Alpha",
+            "gameplay_index": 2,
+            "player_type": "ai",
+            "is_ai": True,
+            "ai_difficulty": "Hard",
+        },
+    ]
+
+
 def test_gateway_infers_homeworld_match_metadata_from_peer_packet_payload() -> None:
     class _InferMetadataRoutingServer:
         def __init__(self) -> None:
