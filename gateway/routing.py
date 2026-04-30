@@ -597,6 +597,13 @@ class SilencerRoutingServer:
             return True
         return room_peer_data_messages >= 8 or room_peer_data_bytes >= 1024
 
+    def _recent_unpublished_game_activity(self, now: float) -> bool:
+        if self._publish_in_directory:
+            return False
+        if self._last_peer_data_at <= 0.0:
+            return False
+        return (now - self._last_peer_data_at) <= PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS
+
     def _alloc_native_client_id(self) -> int:
         reserved_ids = set(self._native_clients) | set(self._pending_reconnects)
         for _ in range(MAX_NATIVE_CLIENT_ID):
@@ -873,10 +880,10 @@ class SilencerRoutingServer:
                 not self._publish_in_directory
                 and (
                     clients
-                    or pending_reconnects
                     or data_objects
                     or room_peer_data_messages
                     or room_peer_data_bytes
+                    or (pending_reconnects and self._recent_unpublished_game_activity(now))
                 )
             )
             or self._recent_published_game_activity(
@@ -908,6 +915,11 @@ class SilencerRoutingServer:
             "games": games,
             "peer_data_messages": room_peer_data_messages,
             "peer_data_bytes": room_peer_data_bytes,
+            "seconds_since_last_peer_data": (
+                max(0, int(now - self._last_peer_data_at))
+                if self._last_peer_data_at > 0.0
+                else None
+            ),
             "data_object_count": len(data_objects),
             "data_objects": data_objects,
             "inferred_game_name": self._inferred_game_name,
@@ -2059,6 +2071,8 @@ class SilencerRoutingServer:
                 if client is not None:
                     if self._should_offer_reconnect(client, disconnect_reason):
                         self._park_disconnected_client(client, disconnect_reason)
+                        if self.gateway is not None:
+                            self.gateway.record_live_room_refresh(int(self.listen_port or 0))
                     else:
                         await self._finalize_client_departure(
                             client.client_id,

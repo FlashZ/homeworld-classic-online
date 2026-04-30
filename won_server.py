@@ -799,11 +799,45 @@ class WONLikeState:
 
         selected.current_players = min(selected.max_players, len(lobby.players))
         self._persist_servers()
+        launch_players = []
+        owner = self.players.get(lobby.owner_id)
+        owner_name = (
+            str(owner.nickname)
+            if owner is not None and str(owner.nickname or "").strip()
+            else str(lobby.owner_id)
+        )
+        for slot_index, player_id in enumerate(lobby.players):
+            player = self.players.get(player_id)
+            player_name = (
+                str(player.nickname)
+                if player is not None and str(player.nickname or "").strip()
+                else str(player_id)
+            )
+            launch_players.append(
+                {
+                    "player_id": str(player_id),
+                    "player_name": player_name,
+                    "gameplay_index": slot_index,
+                }
+            )
         launch = {
             "lobby_id": lobby_id,
             "server": serialize_server(selected),
-            "players": list(lobby.players),
+            "players": launch_players,
             "map_name": lobby.map_name,
+            "launch_config": {
+                "transport_mode": "routed",
+                "lobby_title": str(lobby.name or ""),
+                "map_code": str(lobby.map_name or ""),
+                "map_name": str(lobby.map_name or ""),
+                "settings": dict(lobby.metadata or {}),
+                "captain_identity": {
+                    "player_id": str(lobby.owner_id),
+                    "player_name": owner_name,
+                    "role": "lobby_owner",
+                },
+                "players": launch_players,
+            },
         }
         self._emit_event(lobby.players, "game_launch", launch)
         return launch

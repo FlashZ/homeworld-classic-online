@@ -19,6 +19,7 @@ from . import protocol as _protocol
 from .routing import RoutingServerManager
 from .admin import AdminDashboardServer, DASHBOARD_LOG_HANDLER
 from .firewall import _handle_firewall_probe
+from .web_auth import GatewayWebAuthBridge
 from .product_profile import (
     CATACLYSM_PRODUCT_PROFILE,
     HOMEWORLD_PRODUCT_PROFILE,
@@ -33,6 +34,88 @@ LEAVE_FOR_GAME_WINDOW_SECONDS = 3.0
 _MULTIPLAYER_LEVEL_PATH_RE = re.compile(
     rb"(?i)multiplayer\\(?P<folder>[^\\\x00\r\n]+)\\(?P<file>[^\\\x00\r\n]+)\.level"
 )
+_PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{4,}")
+_PRINTABLE_UTF16LE_RE = re.compile(rb"(?:(?:[ -~]\x00)){4,}")
+_MAP_CODE_TEXT_RE = re.compile(r"^pkwar[0-9a-z%._-]+$", re.IGNORECASE)
+_HUMAN_TITLE_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 &'(),_.:+!-]{2,63}$")
+
+
+def _extract_payload_strings(payload: bytes) -> list[str]:
+    candidates: list[tuple[int, str]] = []
+    for match in _PRINTABLE_TEXT_RE.finditer(payload):
+        text = match.group().decode("ascii", errors="ignore").strip()
+        if len(text) >= 4:
+            candidates.append((match.start(), text))
+    for match in _PRINTABLE_UTF16LE_RE.finditer(payload):
+        raw = match.group()
+        if match.start() > 0 and payload[match.start() - 1] != 0 and len(raw) >= 4:
+            raw = raw[2:]
+        text = raw.decode("utf-16le", errors="ignore").strip()
+        if len(text) >= 4:
+            candidates.append((match.start(), text))
+
+    strings: list[str] = []
+    for _, text in sorted(candidates, key=lambda item: item[0]):
+        if text in strings:
+            continue
+        strings.append(text)
+        if len(strings) >= 32:
+            break
+    return strings
+
+
+def _looks_like_map_code_text(text: str) -> bool:
+    return bool(_MAP_CODE_TEXT_RE.match(str(text or "").strip()))
+
+
+def _looks_like_human_title_text(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    if (
+        "\\" in normalized
+        or "/" in normalized
+        or "." in normalized
+        or lowered.startswith("description")
+        or _looks_like_map_code_text(normalized)
+    ):
+        return False
+    return bool(_HUMAN_TITLE_TEXT_RE.fullmatch(normalized))
+
+
+def _infer_setup_titles_from_payload(payload: bytes, *, fallback_map_code: str) -> Dict[str, str]:
+    strings = _extract_payload_strings(payload)
+    map_code = next((text.strip() for text in strings if _looks_like_map_code_text(text)), "")
+    if not map_code:
+        map_code = str(fallback_map_code or "").strip()
+    normalized_map_code = map_code.lower()
+    map_code_index = next(
+        (index for index, text in enumerate(strings) if text.strip().lower() == normalized_map_code),
+        -1,
+    )
+
+    map_title = ""
+    if map_code_index != -1:
+        for text in strings[map_code_index + 1 :]:
+            candidate = text.strip()
+            if _looks_like_human_title_text(candidate):
+                map_title = candidate
+                break
+
+    lobby_title = ""
+    if map_code_index != -1:
+        for text in strings[:map_code_index]:
+            candidate = text.strip()
+            if _looks_like_human_title_text(candidate):
+                lobby_title = candidate
+                break
+
+    return {
+        "lobby_title": lobby_title,
+        "map_title": map_title,
+        "map_code": map_code,
+    }
 
 class BinaryGatewayServer:
     def __init__(self, backend_host: str, backend_port: int,
@@ -96,6 +179,8 @@ class BinaryGatewayServer:
         self._live_feed_event_id = 0
         self._live_matches: Dict[int, Dict[str, object]] = {}
         self._inferred_room_metadata: Dict[int, Dict[str, object]] = {}
+        self._pending_match_slot_manifests: Dict[int, Dict[str, object]] = {}
+        self._pending_match_launch_configs: Dict[int, Dict[str, object]] = {}
         self.started_at = time.time()
         if keys_dir:
             self._load_keys(keys_dir)
@@ -124,6 +209,48 @@ class BinaryGatewayServer:
 
     def _touch_peer_session(self, session: PeerSession) -> None:
         session.last_used_at = time.time()
+
+    async def _select_local_routing_process_port(
+        self,
+        process_name: str,
+        *,
+        room_password: str,
+    ) -> tuple[int, bool]:
+        manager = self.routing_manager
+        if manager is None:
+            return int(self.routing_port), False
+        if process_name not in {
+            self.product_profile.routing_chat_process_name,
+            self.product_profile.routing_game_process_name,
+        }:
+            return int(self.routing_port), False
+
+        chat_process = process_name == self.product_profile.routing_chat_process_name
+        selected_port = int(self.routing_port)
+        routing_server = None
+
+        # Native Homeworld clients expect the post-game chat/default lobby to live
+        # on the base routing port. Reallocating a fresh published-capable listener
+        # splits the population into multiple "default" rooms (15102, 15103, ...).
+        if (
+            chat_process
+            and self.product_profile.key == HOMEWORLD_PRODUCT_PROFILE.key
+            and not str(room_password or "").strip()
+        ):
+            selected_port = int(getattr(manager, "base_port", self.routing_port) or self.routing_port)
+            routing_server = manager.get_server(selected_port)
+            if routing_server is None:
+                routing_server, _listener = await manager.start_listener(
+                    selected_port,
+                    publish_in_directory=True,
+                )
+            return selected_port, True
+
+        selected_port = await manager.allocate_server(publish_in_directory=chat_process)
+        routing_server = manager.get_server(selected_port)
+        if routing_server is not None and chat_process:
+            routing_server._room_password = str(room_password or "")
+        return selected_port, True
 
     def _alloc_user_id(self) -> int:
         user_id = int(self._next_user_id)
@@ -400,10 +527,16 @@ class BinaryGatewayServer:
         level_path = match.group(0).decode("latin-1", errors="ignore").strip()
         if not display_name or not level_path:
             return None
+        setup_titles = _infer_setup_titles_from_payload(payload, fallback_map_code=display_name)
+        lobby_title = str(setup_titles.get("lobby_title") or "").strip()
+        map_title = str(setup_titles.get("map_title") or "").strip()
+        map_code = str(setup_titles.get("map_code") or display_name).strip()
         return {
-            "display_name": display_name,
-            "game_name": display_name,
-            "map_name": display_name,
+            "display_name": lobby_title or map_title or display_name,
+            "game_name": map_code or display_name,
+            "map_name": map_title or display_name,
+            "map_code": map_code,
+            "lobby_title": lobby_title,
             "level_path": level_path,
             "metadata_source": "peer_packet",
         }
@@ -672,7 +805,7 @@ class BinaryGatewayServer:
             "room_name": room_title,
             "room_path": str(snapshot.get("room_path") or state.get("room_path") or ""),
             "display_name": room_title,
-            "map_name": str(first_game.get("name") or snapshot.get("map_name") or room_title or ""),
+            "map_name": str(snapshot.get("map_name") or first_game.get("name") or room_title or ""),
             "level_path": str(snapshot.get("level_path") or ""),
             "participant_count": self._room_participant_count(snapshot),
             "started_at": float(state["started_at"]),
@@ -684,6 +817,160 @@ class BinaryGatewayServer:
             "game_name": str(first_game.get("name") or ""),
             "owner_name": str(first_game.get("owner_name") or ""),
         }
+
+    @staticmethod
+    def _normalize_match_slot_manifest_players(players: Any) -> list[Dict[str, object]]:
+        normalized: list[Dict[str, object]] = []
+        if not isinstance(players, list):
+            return normalized
+        for fallback_index, player in enumerate(players):
+            if not isinstance(player, dict):
+                continue
+            player_id = str(player.get("player_id") or "").strip()
+            player_name = str(
+                player.get("player_name")
+                or player.get("nickname")
+                or player.get("username")
+                or player_id
+            ).strip()
+            gameplay_index = player.get("gameplay_index", player.get("slot_index", fallback_index))
+            try:
+                gameplay_index = int(gameplay_index)
+            except (TypeError, ValueError):
+                gameplay_index = int(fallback_index)
+            if not player_name:
+                continue
+            record: Dict[str, object] = {
+                "player_id": player_id,
+                "player_name": player_name,
+                "gameplay_index": gameplay_index,
+            }
+            player_type = str(
+                player.get("player_type")
+                or player.get("slot_type")
+                or player.get("kind")
+                or player.get("control")
+                or player.get("type")
+                or ""
+            ).strip()
+            if player_type:
+                record["player_type"] = player_type
+            for key in ("is_ai", "ai", "computer", "is_computer", "is_bot"):
+                if key not in player:
+                    continue
+                value = player.get(key)
+                if isinstance(value, bool):
+                    record["is_ai"] = value
+                    break
+                if isinstance(value, (int, float)):
+                    record["is_ai"] = bool(value)
+                    break
+                label = str(value or "").strip().lower()
+                if label in {"true", "1", "yes", "on"}:
+                    record["is_ai"] = True
+                    break
+                if label in {"false", "0", "no", "off"}:
+                    record["is_ai"] = False
+                    break
+            ai_difficulty = str(
+                player.get("ai_difficulty")
+                or player.get("difficulty")
+                or player.get("cpu_difficulty")
+                or player.get("computer_difficulty")
+                or ""
+            ).strip()
+            if ai_difficulty:
+                record["ai_difficulty"] = ai_difficulty
+            normalized.append(record)
+        normalized.sort(key=lambda item: (int(item.get("gameplay_index") or 0), str(item.get("player_name") or "")))
+        return normalized
+
+    def queue_match_slot_manifest(self, *, room_port: int, players: list[dict[str, object]]) -> None:
+        normalized_players = self._normalize_match_slot_manifest_players(players)
+        if not normalized_players:
+            return
+        port = int(room_port)
+        self._pending_match_slot_manifests[port] = {"players": normalized_players}
+        if port in self._live_matches:
+            self._emit_pending_match_slot_manifest(port)
+
+    def queue_match_launch_config(
+        self,
+        *,
+        room_port: int,
+        lobby_title: str,
+        map_name: str,
+        map_code: str,
+        settings: dict[str, object] | None,
+        captain_identity: dict[str, object] | None,
+        players: list[dict[str, object]],
+        transport_mode: str = "routed",
+    ) -> None:
+        port = int(room_port)
+        self._pending_match_launch_configs[port] = {
+            "transport_mode": str(transport_mode or "routed"),
+            "lobby_title": str(lobby_title or "").strip(),
+            "map_name": str(map_name or "").strip(),
+            "map_code": str(map_code or "").strip(),
+            "settings": dict(settings or {}),
+            "captain_identity": dict(captain_identity or {}),
+            "players": self._normalize_match_slot_manifest_players(players),
+        }
+        if port in self._live_matches:
+            self._emit_pending_match_launch_config(port)
+
+    def _emit_pending_match_slot_manifest(
+        self,
+        room_port: int,
+        *,
+        snapshot: Optional[Dict[str, object]] = None,
+    ) -> None:
+        port = int(room_port)
+        pending = self._pending_match_slot_manifests.get(port)
+        state = self._live_matches.get(port)
+        if pending is None or state is None:
+            return
+        room_snapshot = dict(snapshot or self._routing_room_snapshot(port))
+        room_title = self._preferred_room_title(room_snapshot, fallback=state.get("room_name"))
+        payload: Dict[str, object] = {
+            "match_id": str(state["match_id"]),
+            "room_port": port,
+            "room_name": room_title,
+            "room_path": str(room_snapshot.get("room_path") or state.get("room_path") or ""),
+            "players": list(pending.get("players") or []),
+        }
+        self._publish_live_feed_event("match_slot_manifest", payload)
+        self._pending_match_slot_manifests.pop(port, None)
+
+    def _emit_pending_match_launch_config(
+        self,
+        room_port: int,
+        *,
+        snapshot: Optional[Dict[str, object]] = None,
+    ) -> None:
+        port = int(room_port)
+        pending = self._pending_match_launch_configs.get(port)
+        state = self._live_matches.get(port)
+        if pending is None or state is None:
+            return
+        room_snapshot = dict(snapshot or self._routing_room_snapshot(port))
+        room_title = self._preferred_room_title(room_snapshot, fallback=state.get("room_name"))
+        payload: Dict[str, object] = {
+            "match_id": str(state["match_id"]),
+            "room_port": port,
+            "room_name": room_title,
+            "room_path": str(room_snapshot.get("room_path") or state.get("room_path") or ""),
+            "transport_mode": str(pending.get("transport_mode") or "routed"),
+            "capture_source": "routed_live_feed",
+            "lobby_title": str(pending.get("lobby_title") or room_title or ""),
+            "map_name": str(pending.get("map_name") or ""),
+            "map_code": str(pending.get("map_code") or ""),
+            "settings": dict(pending.get("settings") or {}),
+            "captain_identity": dict(pending.get("captain_identity") or {}),
+            "players": list(pending.get("players") or []),
+        }
+        self._publish_live_feed_event("match_launch_config", payload)
+        self._pending_match_launch_configs.pop(port, None)
 
     def _sync_live_match_state(
         self,
@@ -710,22 +997,26 @@ class BinaryGatewayServer:
                 "match_started",
                 self._live_match_payload(room_port, room_snapshot, state, now=now),
             )
+            self._emit_pending_match_launch_config(room_port, snapshot=room_snapshot)
+            self._emit_pending_match_slot_manifest(room_port, snapshot=room_snapshot)
             return str(state["match_id"])
 
         if is_live and state is not None:
             state["room_name"] = self._preferred_room_title(room_snapshot, fallback=state.get("room_name"))
             state["room_path"] = str(room_snapshot.get("room_path") or state.get("room_path") or "")
             if emit_update:
+                self._emit_pending_match_launch_config(room_port, snapshot=room_snapshot)
                 self._publish_live_feed_event(
                     "match_updated",
                     self._live_match_payload(room_port, room_snapshot, state, now=now),
-                )
+            )
             return str(state["match_id"])
 
         if state is not None:
-            participants = self._room_participant_count(room_snapshot)
-            if participants <= 0:
+            if not bool(room_snapshot.get("is_game_room", False)):
                 self._inferred_room_metadata.pop(room_port, None)
+                self._pending_match_slot_manifests.pop(room_port, None)
+                self._pending_match_launch_configs.pop(room_port, None)
                 self._publish_live_feed_event(
                     "match_finished",
                     self._live_match_payload(room_port, room_snapshot, state, now=now),
@@ -740,6 +1031,10 @@ class BinaryGatewayServer:
             return str(state["match_id"])
 
         return None
+
+    def record_live_room_refresh(self, room_port: int) -> None:
+        room_snapshot = self._routing_room_snapshot(room_port)
+        self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
 
     def record_live_player_event(
         self,
@@ -829,7 +1124,7 @@ class BinaryGatewayServer:
             "room_name": room_title,
             "room_path": str(room_snapshot.get("room_path") or ""),
             "game_name": str(first_game.get("name") or room_snapshot.get("map_name") or ""),
-            "map_name": str(first_game.get("name") or room_snapshot.get("map_name") or room_title or ""),
+            "map_name": str(room_snapshot.get("map_name") or first_game.get("name") or room_title or ""),
             "sender_client_id": int(sender_client_id),
             "sender_name": str(sender_name or ""),
             "recipient_client_ids": [int(client_id) for client_id in recipient_client_ids],
@@ -1645,19 +1940,16 @@ class BinaryGatewayServer:
         room_password = _extract_factory_password(str(req["cmd_line"]))
         managed_locally = False
 
-        if self.routing_manager is not None and process_name in {
-            self.product_profile.routing_chat_process_name,
-            self.product_profile.routing_game_process_name,
-        }:
-            try:
-                selected_port = await self.routing_manager.allocate_server(
-                    publish_in_directory=(process_name == self.product_profile.routing_chat_process_name)
-                )
-                managed_locally = True
-                routing_server = self.routing_manager._servers.get(selected_port)
-                if routing_server is not None and process_name == self.product_profile.routing_chat_process_name:
-                    routing_server._room_password = room_password
-            except Exception as exc:
+        try:
+            selected_port, managed_locally = await self._select_local_routing_process_port(
+                process_name,
+                room_password=room_password,
+            )
+        except Exception as exc:
+            if self.routing_manager is not None and process_name in {
+                self.product_profile.routing_chat_process_name,
+                self.product_profile.routing_game_process_name,
+            }:
                 LOGGER.warning("Factory(session): routing allocation failed: %s", exc)
 
         if room_password:
@@ -1842,6 +2134,30 @@ class BinaryGatewayServer:
                     "players": launch.get("players", []),
                     "map_name": launch.get("map_name", ""),
                 }
+                server = launch.get("server", {})
+                if isinstance(server, dict):
+                    room_port = server.get("port")
+                    try:
+                        room_port = int(room_port)
+                    except (TypeError, ValueError):
+                        room_port = 0
+                    if room_port > 0:
+                        launch_config = launch.get("launch_config", {})
+                        if isinstance(launch_config, dict):
+                            self.queue_match_launch_config(
+                                room_port=room_port,
+                                lobby_title=str(launch_config.get("lobby_title") or ""),
+                                map_name=str(launch_config.get("map_name") or launch.get("map_name") or ""),
+                                map_code=str(launch_config.get("map_code") or launch.get("map_name") or ""),
+                                settings=dict(launch_config.get("settings") or {}),
+                                captain_identity=dict(launch_config.get("captain_identity") or {}),
+                                players=list(launch_config.get("players") or launch.get("players", [])),
+                                transport_mode=str(launch_config.get("transport_mode") or "routed"),
+                            )
+                        self.queue_match_slot_manifest(
+                            room_port=room_port,
+                            players=list(launch.get("players", []) or []),
+                        )
 
         if event is None:
             return
@@ -3496,6 +3812,16 @@ async def main_async(args: argparse.Namespace) -> None:
         db_paths = {product_profile.key: str(db_path)}
         default_db_product = product_profile.key
 
+    web_auth_bridge = None
+    if db_paths and str(args.web_auth_shared_secret or "").strip():
+        web_auth_bridge = GatewayWebAuthBridge(
+            db_paths=db_paths,
+            default_product=default_db_product,
+            shared_secret=str(args.web_auth_shared_secret or "").strip(),
+            code_ttl_seconds=float(args.web_auth_code_ttl_seconds),
+        )
+        setattr(srv, "web_auth_bridge", web_auth_bridge)
+
     server = await asyncio.start_server(srv.handle_client, args.host, args.port)
     firewall_server = await asyncio.start_server(
         _handle_firewall_probe, args.host, args.firewall_port
@@ -3508,6 +3834,8 @@ async def main_async(args: argparse.Namespace) -> None:
         default_db_product=default_db_product,
         admin_token=args.admin_token,
         stats_token=args.stats_token,
+        web_auth_shared_secret=str(args.web_auth_shared_secret or ""),
+        web_auth_public_base_url=str(args.web_auth_public_base_url or ""),
     )
     admin_server = None
     if args.admin_port > 0:
@@ -3641,6 +3969,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--stats-token",
         default=os.environ.get("STATS_TOKEN", ""),
         help="Optional token for the bot-friendly /api/stats endpoint. Falls back to --admin-token when unset.",
+    )
+    p.add_argument(
+        "--web-auth-shared-secret",
+        default=os.environ.get("WEB_AUTH_SHARED_SECRET", ""),
+        help="Shared secret required for the browser auth code exchange endpoint.",
+    )
+    p.add_argument(
+        "--web-auth-public-base-url",
+        default=os.environ.get("WEB_AUTH_PUBLIC_BASE_URL", ""),
+        help="Public browser base URL for the stats site used to validate auth return targets.",
+    )
+    p.add_argument(
+        "--web-auth-code-ttl-seconds",
+        type=float,
+        default=float(os.environ.get("WEB_AUTH_CODE_TTL_SECONDS", "300") or "300"),
+        help="Lifetime in seconds for issued browser auth exchange codes.",
     )
     p.add_argument("--db-path", default="",
                    help="Path to the SQLite backend DB shown in the admin dashboard. Defaults to data/<product>/won_server.db when omitted.")
