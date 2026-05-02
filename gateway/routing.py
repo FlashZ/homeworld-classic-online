@@ -64,6 +64,8 @@ class NativeRouteClientState:
     writer: asyncio.StreamWriter
     session_key: bytes
     out_seq: Optional[int]
+    auth_user_id: int = 0
+    account_username: str = ""
     connected_at: float = field(default_factory=time.time)
     last_activity_at: float = field(default_factory=time.time)
     last_activity_kind: str = "register"
@@ -89,6 +91,8 @@ class PendingNativeReconnect:
     chat_count: int
     peer_data_messages: int
     peer_data_bytes: int
+    auth_user_id: int = 0
+    account_username: str = ""
     subscriptions: list[NativeRouteSubscription] = field(default_factory=list)
     reserved_at: float = field(default_factory=time.time)
     expires_at: float = field(
@@ -321,6 +325,8 @@ class SilencerRoutingServer:
             chat_count=int(client.chat_count),
             peer_data_messages=int(client.peer_data_messages),
             peer_data_bytes=int(client.peer_data_bytes),
+            auth_user_id=int(client.auth_user_id),
+            account_username=str(client.account_username),
             subscriptions=[
                 NativeRouteSubscription(
                     link_id=sub.link_id,
@@ -388,6 +394,8 @@ class SilencerRoutingServer:
         client_name: str,
         client_ip: str,
         *,
+        auth_user_id: int = 0,
+        account_username: str = "",
         disconnect_reason: str,
         remove_owned_objects: bool = True,
         broadcast_leave: bool = True,
@@ -410,6 +418,11 @@ class SilencerRoutingServer:
                 player_name=str(client_name),
                 player_ip=str(client_ip),
                 details={"reason": disconnect_reason},
+            )
+            self.gateway._release_native_login_claim(
+                user_id=int(auth_user_id),
+                username=str(account_username),
+                reason=f"routing_{disconnect_reason}",
             )
         LOGGER.info(
             "Routing(native): Client disconnected id=%d name=%r reason=%s",
@@ -516,6 +529,8 @@ class SilencerRoutingServer:
                 reservation.client_id,
                 reservation.client_name,
                 reservation.client_ip,
+                auth_user_id=reservation.auth_user_id,
+                account_username=reservation.account_username,
                 disconnect_reason="reconnect_expired",
             )
 
@@ -1196,6 +1211,8 @@ class SilencerRoutingServer:
         in_seq: Optional[int] = None
         out_seq: Optional[int] = None
         disconnect_reason = "transport_lost"
+        auth_user_id = 0
+        account_username = ""
 
         try:
             svc, msg, req_body = won_crypto.parse_tmessage(first_payload)
@@ -1212,6 +1229,7 @@ class SilencerRoutingServer:
 
             req = _parse_auth1_peer_request(req_body)
             client_cert = _parse_auth1_certificate(bytes(req["certificate"]))
+            auth_user_id = int(client_cert["user_id"])
             if client_cert["sig"] and not won_crypto.nr_md5_verify(
                 bytes(client_cert["unsigned"]),
                 bytes(client_cert["sig"]),
@@ -1227,6 +1245,7 @@ class SilencerRoutingServer:
                 "Routing(native): Auth1Peer request auth_mode=%d encrypt_mode=%d flags=0x%04x user_id=%d",
                 req["auth_mode"], req["encrypt_mode"], req["encrypt_flags"], client_cert["user_id"],
             )
+            account_username = self.gateway._username_for_active_native_login(auth_user_id)
 
             server_user_id = self.gateway._next_user_id
             self.gateway._next_user_id += 1
@@ -1432,6 +1451,16 @@ class SilencerRoutingServer:
                             if reconnect is not None
                             else self._alloc_native_client_id()
                         )
+                        login_auth_user_id = (
+                            int(reconnect.auth_user_id)
+                            if reconnect is not None and int(reconnect.auth_user_id)
+                            else int(auth_user_id)
+                        )
+                        login_account_username = (
+                            str(reconnect.account_username)
+                            if reconnect is not None and str(reconnect.account_username)
+                            else str(account_username)
+                        )
                         self._native_clients[registered_client_id] = NativeRouteClientState(
                             client_id=registered_client_id,
                             client_name_raw=bytes(req["client_name_raw"]),
@@ -1441,6 +1470,8 @@ class SilencerRoutingServer:
                             writer=writer,
                             session_key=session_key,
                             out_seq=out_seq,
+                            auth_user_id=login_auth_user_id,
+                            account_username=login_account_username,
                             connected_at=(
                                 reconnect.connected_at
                                 if reconnect is not None
@@ -1479,6 +1510,16 @@ class SilencerRoutingServer:
                                 else []
                             ),
                         )
+                        if self.gateway is not None and login_auth_user_id:
+                            self.gateway._attach_native_login_claim(
+                                login_auth_user_id,
+                                registered_client_id,
+                            )
+                            attached_username = self.gateway._username_for_active_native_login(
+                                login_auth_user_id
+                            )
+                            if attached_username:
+                                self._native_clients[registered_client_id].account_username = attached_username
                         LOGGER.info(
                             "Routing(native): RegisterClient %s id=%d name=%r setup_chat=%s host=%s spectator=%s",
                             "resume" if reconnect is not None else "new",
@@ -1984,6 +2025,8 @@ class SilencerRoutingServer:
                             writer=writer,
                             session_key=session_key,
                             out_seq=out_seq,
+                            auth_user_id=int(reconnect.auth_user_id),
+                            account_username=str(reconnect.account_username),
                             connected_at=float(reconnect.connected_at),
                             last_activity_at=float(reconnect.last_activity_at),
                             last_activity_kind=str(reconnect.last_activity_kind),
@@ -2000,6 +2043,16 @@ class SilencerRoutingServer:
                                 for sub in reconnect.subscriptions
                             ],
                         )
+                        if self.gateway is not None and int(reconnect.auth_user_id):
+                            self.gateway._attach_native_login_claim(
+                                int(reconnect.auth_user_id),
+                                registered_client_id,
+                            )
+                            attached_username = self.gateway._username_for_active_native_login(
+                                int(reconnect.auth_user_id)
+                            )
+                            if attached_username:
+                                self._native_clients[registered_client_id].account_username = attached_username
                         self._touch_native_client(registered_client_id, "reconnect")
                         LOGGER.info(
                             "Routing(native): ReconnectClient success from %s:%s id=%d name=%r want_missed=%s",
@@ -2078,6 +2131,8 @@ class SilencerRoutingServer:
                             client.client_id,
                             client.client_name,
                             client.client_ip,
+                            auth_user_id=client.auth_user_id,
+                            account_username=client.account_username,
                             disconnect_reason=disconnect_reason,
                         )
 

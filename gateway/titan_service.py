@@ -5,6 +5,7 @@ import asyncio
 import base64
 from collections import deque
 import contextlib
+from dataclasses import dataclass, field
 import hashlib
 import logging
 import os
@@ -42,6 +43,17 @@ _HW_WRAPPED_PREFIX = b"\x03\xe2\x60"
 _CHECKPOINT_HEARTBEAT_SECONDS = 12.0
 _HW_COMMAND_PACKET_TYPES = {0xCCCC, 0x5555, 0xE555}
 _HW_DROPPED_VERIFY = 0xFE389BCA
+_NATIVE_LOGIN_HANDOFF_SECONDS = 120.0
+
+
+@dataclass
+class NativeLoginClaim:
+    username: str
+    user_id: int
+    attached: bool = False
+    client_id: int = 0
+    created_at: float = field(default_factory=time.time)
+    expires_at: float = field(default_factory=lambda: time.time() + _NATIVE_LOGIN_HANDOFF_SECONDS)
 
 
 def _extract_payload_strings(payload: bytes) -> list[str]:
@@ -260,6 +272,9 @@ class BinaryGatewayServer:
         self._ver_p = self._ver_q = self._ver_g = 0
         self._next_user_id = int(user_id_start)
         self._issued_user_ids: set[int] = set()
+        self._native_login_claims: Dict[str, NativeLoginClaim] = {}
+        self._native_login_claims_by_user_id: Dict[int, str] = {}
+        self._native_login_locks: Dict[str, asyncio.Lock] = {}
         self._peer_session_id_min = max(1, int(peer_session_id_min))
         self._peer_session_id_max = max(
             self._peer_session_id_min,
@@ -356,6 +371,119 @@ class BinaryGatewayServer:
         self._issued_user_ids.add(user_id)
         return user_id
 
+    @staticmethod
+    def _normalize_native_login_username(username: str) -> str:
+        return str(username or "").strip()
+
+    def _native_login_lock(self, username: str) -> asyncio.Lock:
+        normalized = self._normalize_native_login_username(username)
+        lock = self._native_login_locks.get(normalized)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._native_login_locks[normalized] = lock
+        return lock
+
+    def _expire_native_login_claims(self) -> int:
+        now = time.time()
+        expired_users = [
+            username
+            for username, claim in list(self._native_login_claims.items())
+            if not claim.attached and claim.expires_at <= now
+        ]
+        for username in expired_users:
+            claim = self._native_login_claims.pop(username, None)
+            if claim is None:
+                continue
+            self._native_login_claims_by_user_id.pop(int(claim.user_id), None)
+            LOGGER.info(
+                "Auth1: native login handoff expired user=%r user_id=%d idle_for=%.1fs",
+                claim.username,
+                claim.user_id,
+                max(0.0, now - claim.created_at),
+            )
+        return len(expired_users)
+
+    def _is_native_login_active(self, username: str) -> bool:
+        self._expire_native_login_claims()
+        normalized = self._normalize_native_login_username(username)
+        return normalized in self._native_login_claims
+
+    def _register_native_login_claim(self, username: str, user_id: int) -> None:
+        normalized = self._normalize_native_login_username(username)
+        if not normalized:
+            return
+        existing = self._native_login_claims.pop(normalized, None)
+        if existing is not None:
+            self._native_login_claims_by_user_id.pop(int(existing.user_id), None)
+        claim = NativeLoginClaim(username=normalized, user_id=int(user_id))
+        self._native_login_claims[normalized] = claim
+        self._native_login_claims_by_user_id[int(user_id)] = normalized
+        LOGGER.info(
+            "Auth1: native login handoff reserved user=%r user_id=%d window=%.1fs",
+            claim.username,
+            claim.user_id,
+            max(0.0, claim.expires_at - claim.created_at),
+        )
+
+    def _username_for_active_native_login(self, user_id: int) -> str:
+        self._expire_native_login_claims()
+        normalized = self._native_login_claims_by_user_id.get(int(user_id))
+        if not normalized:
+            return ""
+        claim = self._native_login_claims.get(normalized)
+        if claim is None:
+            self._native_login_claims_by_user_id.pop(int(user_id), None)
+            return ""
+        return claim.username
+
+    def _attach_native_login_claim(self, user_id: int, client_id: int) -> None:
+        self._expire_native_login_claims()
+        normalized = self._native_login_claims_by_user_id.get(int(user_id))
+        if not normalized:
+            return
+        claim = self._native_login_claims.get(normalized)
+        if claim is None:
+            self._native_login_claims_by_user_id.pop(int(user_id), None)
+            return
+        claim.attached = True
+        claim.client_id = int(client_id)
+        claim.expires_at = 0.0
+        LOGGER.info(
+            "Auth1: native login attached user=%r user_id=%d client_id=%d",
+            claim.username,
+            claim.user_id,
+            claim.client_id,
+        )
+
+    def _release_native_login_claim(
+        self,
+        *,
+        user_id: int = 0,
+        username: str = "",
+        reason: str = "",
+    ) -> bool:
+        self._expire_native_login_claims()
+        normalized = ""
+        if user_id:
+            normalized = str(self._native_login_claims_by_user_id.get(int(user_id), "") or "")
+        if not normalized:
+            normalized = self._normalize_native_login_username(username)
+        if not normalized:
+            return False
+        claim = self._native_login_claims.pop(normalized, None)
+        if claim is None:
+            self._native_login_claims_by_user_id.pop(int(user_id), None)
+            return False
+        self._native_login_claims_by_user_id.pop(int(claim.user_id), None)
+        LOGGER.info(
+            "Auth1: native login released user=%r user_id=%d client_id=%d reason=%s",
+            claim.username,
+            claim.user_id,
+            claim.client_id,
+            reason or "released",
+        )
+        return True
+
     def _expire_peer_sessions(self) -> int:
         now = time.time()
         expired_ids = [
@@ -380,6 +508,7 @@ class BinaryGatewayServer:
             while True:
                 await asyncio.sleep(PEER_SESSION_SWEEP_INTERVAL_SECONDS)
                 self._expire_peer_sessions()
+                self._expire_native_login_claims()
                 self._prune_ip_activity()
                 self._emit_due_checkpoint_heartbeats()
         except asyncio.CancelledError:
@@ -2164,6 +2293,9 @@ class BinaryGatewayServer:
             client_ip = str(peer[0])
 
         native_login = None
+        username = ""
+        user_id = 0
+        login_reply_sent = False
         try:
             native_login = won_crypto.parse_auth1_login_payload(login_req["bf_data"], session_key)
             LOGGER.info(
@@ -2180,67 +2312,86 @@ class BinaryGatewayServer:
             LOGGER.warning("Auth1: failed to parse native login payload from %s:%s: %s", *peer, exc)
             return
 
-        backend = await self._call_backend(
-            {
-                "action": "AUTH_LOGIN_NATIVE",
-                "username": str(native_login["username"]),
-                "password": str(native_login["password"]),
-                "new_password": str(native_login["new_password"]),
-                "cd_key": str(native_login["cd_key"]),
-                "login_key": str(native_login["login_key"]),
-                "create_account": bool(native_login["create_account"]),
-                "client_ip": client_ip,
-            }
-        )
-        if not backend.get("ok"):
-            error_code = str(backend.get("error", "native_auth_failed"))
-            status = _native_auth_error_to_status(error_code)
-            LOGGER.warning(
-                "Auth1: native login rejected for user=%r from %s:%s error=%s status=%d",
-                native_login["username"],
-                *peer,
-                error_code,
-                status,
-            )
-            try:
-                writer.write(won_crypto.build_auth1_login_failure_reply(status))
-                await writer.drain()
-            except Exception as exc:
-                LOGGER.debug("Auth1: failed to send login failure reply to %s:%s: %s", *peer, exc)
-            return
-        native_result = backend.get("result", {})
-        if isinstance(native_result, dict):
+        try:
+            username = str(native_login["username"])
+            async with self._native_login_lock(username):
+                backend = await self._call_backend(
+                    {
+                        "action": "AUTH_LOGIN_NATIVE",
+                        "username": username,
+                        "password": str(native_login["password"]),
+                        "new_password": str(native_login["new_password"]),
+                        "cd_key": str(native_login["cd_key"]),
+                        "login_key": str(native_login["login_key"]),
+                        "create_account": bool(native_login["create_account"]),
+                        "client_ip": client_ip,
+                        "allow_cd_key_rebind": True,
+                        "account_active": self._is_native_login_active(username),
+                    }
+                )
+                if not backend.get("ok"):
+                    error_code = str(backend.get("error", "native_auth_failed"))
+                    status = _native_auth_error_to_status(error_code)
+                    LOGGER.warning(
+                        "Auth1: native login rejected for user=%r from %s:%s error=%s status=%d",
+                        native_login["username"],
+                        *peer,
+                        error_code,
+                        status,
+                    )
+                    try:
+                        writer.write(won_crypto.build_auth1_login_failure_reply(status))
+                        await writer.drain()
+                    except Exception as exc:
+                        LOGGER.debug("Auth1: failed to send login failure reply to %s:%s: %s", *peer, exc)
+                    return
+                native_result = backend.get("result", {})
+                if isinstance(native_result, dict):
+                    LOGGER.info(
+                        "Auth1: native account accepted user=%r created=%s cd_key_bound=%s binding_changed=%s",
+                        native_result.get("username", native_login["username"]),
+                        bool(native_result.get("created", False)),
+                        bool(native_result.get("cd_key_bound", False)),
+                        bool(native_result.get("binding_changed", False)),
+                    )
+                user_id = self._alloc_user_id()
+                self._register_native_login_claim(username, user_id)
+
+            challenge_seed = os.urandom(16)
+            challenge_reply = won_crypto.build_auth1_challenge(challenge_seed, session_key)
+            writer.write(challenge_reply)
+            await writer.drain()
+            LOGGER.info("Auth1: ChallengeHW sent to %s:%s", *peer)
+
+            body = await _titan_recv(reader)
+            svc, msg, confirm_body = won_crypto.parse_tmessage(body)
             LOGGER.info(
-                "Auth1: native account accepted user=%r created=%s cd_key_bound=%s binding_changed=%s",
-                native_result.get("username", native_login["username"]),
-                bool(native_result.get("created", False)),
-                bool(native_result.get("cd_key_bound", False)),
-                bool(native_result.get("binding_changed", False)),
+                "Auth1: ConfirmHW received from %s:%s (svc=%d msg=%d, %d bytes)",
+                *peer,
+                svc,
+                msg,
+                len(confirm_body),
             )
 
-        # --- Send LoginChallengeHW ---
-        challenge_seed = os.urandom(16)
-        challenge_reply = won_crypto.build_auth1_challenge(challenge_seed, session_key)
-        writer.write(challenge_reply)
-        await writer.drain()
-        LOGGER.info("Auth1: ChallengeHW sent to %s:%s", *peer)
-
-        # --- Receive LoginConfirmHW ---
-        body = await _titan_recv(reader)
-        svc, msg, confirm_body = won_crypto.parse_tmessage(body)
-        LOGGER.info("Auth1: ConfirmHW received from %s:%s (svc=%d msg=%d, %d bytes)",
-                     *peer, svc, msg, len(confirm_body))
-        # We accept any confirm — we're not doing real file hash verification
-
-        # --- Send LoginReply with certificate + client private key ---
-        user_id = self._alloc_user_id()
-        cert, user_y, user_x = self._build_user_cert(user_id)
-
-        login_reply = self._build_auth1_login_reply_with_key(cert, user_x, session_key)
-        writer.write(login_reply)
-        await writer.drain()
-        LOGGER.info("Auth1: LoginReply sent to %s:%s (user_id=%d, cert=%d bytes)",
-                     *peer, user_id, len(cert))
+            cert, _user_y, user_x = self._build_user_cert(user_id)
+            login_reply = self._build_auth1_login_reply_with_key(cert, user_x, session_key)
+            writer.write(login_reply)
+            await writer.drain()
+            login_reply_sent = True
+            LOGGER.info(
+                "Auth1: LoginReply sent to %s:%s (user_id=%d, cert=%d bytes)",
+                *peer,
+                user_id,
+                len(cert),
+            )
+        except Exception:
+            if user_id and not login_reply_sent:
+                self._release_native_login_claim(
+                    user_id=user_id,
+                    username=username,
+                    reason="auth_login_aborted",
+                )
+            raise
 
     def _build_auth1_login_reply_with_key(self, cert: bytes, user_x: int,
                                            session_key: bytes) -> bytes:
@@ -3598,62 +3749,89 @@ class SharedBinaryGatewayServer:
             runtime.product_profile.key,
         )
 
-        backend = await runtime._call_backend(
-            {
-                "action": "AUTH_LOGIN_NATIVE",
-                "username": str(native_login["username"]),
-                "password": str(native_login["password"]),
-                "new_password": str(native_login["new_password"]),
-                "cd_key": str(native_login["cd_key"]),
-                "login_key": str(native_login["login_key"]),
-                "create_account": bool(native_login["create_account"]),
-                "client_ip": client_ip,
-            }
-        )
-        if not backend.get("ok"):
-            error_code = str(backend.get("error", "native_auth_failed"))
-            status = _native_auth_error_to_status(error_code)
-            LOGGER.warning(
-                "Auth1(shared): native login rejected for user=%r from %s:%s error=%s status=%d product=%s",
-                native_login["username"],
+        username = str(native_login["username"])
+        user_id = 0
+        login_reply_sent = False
+        try:
+            async with runtime._native_login_lock(username):
+                backend = await runtime._call_backend(
+                    {
+                        "action": "AUTH_LOGIN_NATIVE",
+                        "username": username,
+                        "password": str(native_login["password"]),
+                        "new_password": str(native_login["new_password"]),
+                        "cd_key": str(native_login["cd_key"]),
+                        "login_key": str(native_login["login_key"]),
+                        "create_account": bool(native_login["create_account"]),
+                        "client_ip": client_ip,
+                        "allow_cd_key_rebind": True,
+                        "account_active": runtime._is_native_login_active(username),
+                    }
+                )
+                if not backend.get("ok"):
+                    error_code = str(backend.get("error", "native_auth_failed"))
+                    status = _native_auth_error_to_status(error_code)
+                    LOGGER.warning(
+                        "Auth1(shared): native login rejected for user=%r from %s:%s error=%s status=%d product=%s",
+                        native_login["username"],
+                        *peer,
+                        error_code,
+                        status,
+                        runtime.product_profile.key,
+                    )
+                    with contextlib.suppress(Exception):
+                        writer.write(won_crypto.build_auth1_login_failure_reply(status))
+                        await writer.drain()
+                    return
+                native_result = backend.get("result", {})
+                if isinstance(native_result, dict):
+                    LOGGER.info(
+                        "Auth1(shared): native account accepted user=%r created=%s cd_key_bound=%s binding_changed=%s product=%s",
+                        native_result.get("username", native_login["username"]),
+                        bool(native_result.get("created", False)),
+                        bool(native_result.get("cd_key_bound", False)),
+                        bool(native_result.get("binding_changed", False)),
+                        runtime.product_profile.key,
+                    )
+                user_id = runtime._alloc_user_id()
+                runtime._register_native_login_claim(username, user_id)
+
+            challenge_seed = os.urandom(16)
+            challenge_reply = won_crypto.build_auth1_challenge(challenge_seed, session_key)
+            writer.write(challenge_reply)
+            await writer.drain()
+            LOGGER.info("Auth1(shared): ChallengeHW sent to %s:%s", *peer)
+
+            body = await _titan_recv(reader)
+            svc, msg, confirm_body = won_crypto.parse_tmessage(body)
+            LOGGER.info(
+                "Auth1(shared): ConfirmHW received from %s:%s (svc=%d msg=%d, %d bytes)",
                 *peer,
-                error_code,
-                status,
-                runtime.product_profile.key,
+                svc,
+                msg,
+                len(confirm_body),
             )
-            with contextlib.suppress(Exception):
-                writer.write(won_crypto.build_auth1_login_failure_reply(status))
-                await writer.drain()
-            return
 
-        challenge_seed = os.urandom(16)
-        challenge_reply = won_crypto.build_auth1_challenge(challenge_seed, session_key)
-        writer.write(challenge_reply)
-        await writer.drain()
-        LOGGER.info("Auth1(shared): ChallengeHW sent to %s:%s", *peer)
-
-        body = await _titan_recv(reader)
-        svc, msg, confirm_body = won_crypto.parse_tmessage(body)
-        LOGGER.info(
-            "Auth1(shared): ConfirmHW received from %s:%s (svc=%d msg=%d, %d bytes)",
-            *peer,
-            svc,
-            msg,
-            len(confirm_body),
-        )
-
-        user_id = runtime._alloc_user_id()
-        cert, _user_y, user_x = runtime._build_user_cert(user_id)
-        login_reply = runtime._build_auth1_login_reply_with_key(cert, user_x, session_key)
-        writer.write(login_reply)
-        await writer.drain()
-        LOGGER.info(
-            "Auth1(shared): LoginReply sent to %s:%s (product=%s user_id=%d cert=%d bytes)",
-            *peer,
-            runtime.product_profile.key,
-            user_id,
-            len(cert),
-        )
+            cert, _user_y, user_x = runtime._build_user_cert(user_id)
+            login_reply = runtime._build_auth1_login_reply_with_key(cert, user_x, session_key)
+            writer.write(login_reply)
+            await writer.drain()
+            login_reply_sent = True
+            LOGGER.info(
+                "Auth1(shared): LoginReply sent to %s:%s (product=%s user_id=%d cert=%d bytes)",
+                *peer,
+                runtime.product_profile.key,
+                user_id,
+                len(cert),
+            )
+        except Exception:
+            if user_id and not login_reply_sent:
+                runtime._release_native_login_claim(
+                    user_id=user_id,
+                    username=username,
+                    reason="auth_login_aborted",
+                )
+            raise
 
     async def _handle_titan_native(
         self,
