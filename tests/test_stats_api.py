@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import struct
 import time
 
 from product_profile import CATACLYSM_PRODUCT_PROFILE, HOMEWORLD_PRODUCT_PROFILE
 import titan_binary_gateway
+
+
+def _build_hw_packet(packet_type: int, frame: int, commands: list[tuple[int, bytes]], *, sender: int = 0) -> bytes:
+    header = struct.pack("<HHIHHffH", packet_type, sender, frame, frame, 0, 0.0, 0.0, len(commands)) + b"\x00\x00"
+    encoded_commands = b"".join(struct.pack("<H", command_type) + body for command_type, body in commands)
+    return header + encoded_commands
 
 
 class _FakeRoutingManager:
@@ -1258,6 +1265,412 @@ def test_gateway_preserves_ai_slot_metadata_in_launch_config_events() -> None:
             "ai_difficulty": "Hard",
         },
     ]
+
+
+def test_gateway_emits_checkpoint_hint_with_presence_and_launch_context() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+    gateway.queue_match_launch_config(
+        room_port=15102,
+        lobby_title="2v2 no rush",
+        map_name="Clan Wars (2-6)",
+        map_code="pkwar6",
+        settings={"room_flags": 7, "allied_victory": True},
+        captain_identity={"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "role": "lobby_owner"},
+        players=[
+            {"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "gameplay_index": 0, "player_type": "human"},
+            {"player_id": "cpu-1", "player_name": "CPU Alpha", "gameplay_index": 3, "player_type": "ai", "is_ai": True, "difficulty": "Hard"},
+        ],
+        transport_mode="routed",
+    )
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="&Z&e&r&o|&S&F",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_room_refresh(15102)
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    checkpoint = next(event for event in events if event["event"] == "match_checkpoint_hint")
+    assert checkpoint["hint_authority"] == "advisory"
+    assert checkpoint["reason"] in {"player_joined", "room_refresh", "heartbeat"}
+    assert checkpoint["launch_config"]["lobby_title"] == "2v2 no rush"
+    assert checkpoint["launch_config"]["players"][1]["ai_difficulty"] == "Hard"
+    assert checkpoint["presence"]["connected"][0]["player_name"] == "&Z&e&r&o|&S&F"
+
+
+def test_gateway_emits_checkpoint_hint_with_packet_hints_for_alliance_drop_and_sync() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="&Z&e&r&o|&S&F",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=2,
+        player_name="Volans|SF",
+        player_ip="2.2.2.2",
+    )
+
+    alliance_body = struct.pack("<IHH", 1, 0, 1)
+    player_dropped_mask = 1 << 1
+    verify = player_dropped_mask ^ 0xFE389BCA
+    sync_body = struct.pack("<IH14x", 3104, 77)
+    command_payload = b"\x03\xe2\x60" + _build_hw_packet(
+        0xCCCC,
+        2103,
+        [
+            (13, alliance_body),
+            (17, struct.pack("<II", player_dropped_mask, verify)),
+        ],
+        sender=0,
+    )
+    sync_payload = b"\x03\xe2\x60" + _build_hw_packet(0x5555, 2104, [(16, sync_body)], sender=0)
+
+    gateway.record_live_peer_packet(
+        "peer_packet",
+        room_port=15102,
+        sender_client_id=1,
+        sender_name="&Z&e&r&o|&S&F",
+        recipient_client_ids=[2],
+        recipient_count=1,
+        payload=command_payload,
+        packet_kind="SendDataBroadcast",
+    )
+    gateway.record_live_peer_packet(
+        "peer_packet",
+        room_port=15102,
+        sender_client_id=1,
+        sender_name="&Z&e&r&o|&S&F",
+        recipient_client_ids=[2],
+        recipient_count=1,
+        payload=sync_payload,
+        packet_kind="SendDataBroadcast",
+    )
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    checkpoint = next(event for event in reversed(events) if event["event"] == "match_checkpoint_hint")
+    assert checkpoint["packet_hints"]["alliance_changes"]
+    assert checkpoint["packet_hints"]["player_dropped_masks"] == [2]
+    assert checkpoint["packet_hints"]["sync_anchors"][0]["randcheck"] == 77
+
+
+def test_gateway_emits_periodic_checkpoint_heartbeat_without_room_refresh() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+    gateway.queue_match_slot_manifest(
+        room_port=15102,
+        players=[
+            {"player_id": "zero", "player_name": "&Z&e&r&o|&S&F", "gameplay_index": 0, "player_type": "human"},
+            {"player_id": "volans", "player_name": "Volans|SF", "gameplay_index": 1, "player_type": "human"},
+        ],
+    )
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="&Z&e&r&o|&S&F",
+        player_ip="1.1.1.1",
+    )
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+    match_id = str(gateway._live_matches[15102]["match_id"])
+    hint_state = gateway._ensure_match_hint_state(15102, match_id)
+    hint_state["last_checkpoint_emitted_at"] = time.time() - 30.0
+
+    gateway._emit_due_checkpoint_heartbeats(now=time.time())
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    checkpoint = next(event for event in events if event["event"] == "match_checkpoint_hint")
+    assert checkpoint["reason"] == "heartbeat"
+    assert checkpoint["presence"]["connected"][0]["gameplay_index"] == 0
+    assert checkpoint["presence"]["connected"][0]["player_type"] == "human"
+
+
+def test_gateway_emits_checkpoint_hint_for_routing_object_changes() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="Alpha",
+        player_ip="1.1.1.1",
+    )
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+    gateway.record_live_routing_object_event(
+        "routing_object_upsert",
+        room_port=15102,
+        link_id=44,
+        owner_id=1,
+        owner_name="Alpha",
+        data_type_text="hw_game",
+        payload=b"\x01\x02\x03\x04",
+        lifespan=90,
+    )
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    checkpoint = next(event for event in events if event["event"] == "match_checkpoint_hint")
+    assert checkpoint["reason"] == "routing_object_change"
+    assert checkpoint["room_state"]["data_object_count"] >= 1
+
+
+def test_gateway_emits_resolution_hint_for_clean_finish() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="Alpha",
+        player_ip="1.1.1.1",
+    )
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=2,
+        player_name="Bravo",
+        player_ip="2.2.2.2",
+    )
+    routing_server.snapshot.update(
+        {
+            "is_game_room": False,
+            "active_game_count": 0,
+            "native_client_count": 0,
+            "pending_reconnect_count": 0,
+            "pending_reconnects": [],
+            "clients": [],
+            "peer_data_messages": 0,
+            "peer_data_bytes": 0,
+            "game_count": 0,
+            "games": [],
+            "data_object_count": 0,
+        }
+    )
+
+    gateway.record_live_room_refresh(15102)
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    resolution = next(event for event in events if event["event"] == "match_resolution_hint")
+    assert resolution["hint_authority"] == "terminal_support"
+    assert resolution["basis"] == "clean_finish"
+    assert resolution["classification"] == "clean_terminal_support"
+    assert resolution["evidence"]
+
+
+def test_gateway_resolution_hint_includes_survivor_mapping_from_slot_metadata() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+    gateway.queue_match_slot_manifest(
+        room_port=15102,
+        players=[
+            {"player_id": "zero", "player_name": "Alpha", "gameplay_index": 0, "player_type": "human"},
+            {"player_id": "cpu-1", "player_name": "CPU Alpha", "gameplay_index": 3, "player_type": "ai", "is_ai": True, "ai_difficulty": "Hard"},
+        ],
+    )
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="Alpha",
+        player_ip="1.1.1.1",
+    )
+    routing_server.snapshot.update(
+        {
+            "is_game_room": False,
+            "active_game_count": 0,
+            "native_client_count": 1,
+            "pending_reconnect_count": 0,
+            "pending_reconnects": [],
+            "clients": [
+                {
+                    "client_id": 1,
+                    "client_name": "Alpha",
+                    "client_ip": "1.1.1.1",
+                }
+            ],
+            "peer_data_messages": 0,
+            "peer_data_bytes": 0,
+            "game_count": 0,
+            "games": [],
+            "data_object_count": 0,
+        }
+    )
+
+    gateway.record_live_room_refresh(15102)
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    resolution = next(event for event in events if event["event"] == "match_resolution_hint")
+    assert resolution["presence"]["connected_final"][0]["gameplay_index"] == 0
+    assert resolution["presence"]["connected_final"][0]["player_type"] == "human"
+    assert resolution["survivor_hint"]["surviving_player_names"] == ["Alpha"]
+    assert resolution["survivor_hint"]["surviving_gameplay_indices"] == [0]
+
+
+def test_gateway_emits_resolution_hint_for_reconnect_heavy_collapse() -> None:
+    gateway = titan_binary_gateway.BinaryGatewayServer(
+        "127.0.0.1",
+        9100,
+        public_host="homeworld.kerrbell.dev",
+        public_port=15101,
+        routing_port=15100,
+        valid_versions=["0110"],
+    )
+    routing_server = _LiveFeedRoutingServer()
+    gateway.routing_manager = _LiveFeedRoutingManager(routing_server)
+
+    queue = gateway.subscribe_live_feed()
+    gateway.record_live_player_event(
+        "player_joined",
+        room_port=15102,
+        player_id=1,
+        player_name="Alpha",
+        player_ip="1.1.1.1",
+    )
+    routing_server.snapshot.update(
+        {
+            "is_game_room": False,
+            "active_game_count": 0,
+            "native_client_count": 0,
+            "pending_reconnect_count": 2,
+            "pending_reconnects": [
+                {"client_id": 1, "client_name": "Alpha", "client_ip": "1.1.1.1", "seconds_remaining": 42},
+                {"client_id": 9, "client_name": "Ghost", "client_ip": "9.9.9.9", "seconds_remaining": 12},
+            ],
+            "clients": [],
+            "peer_data_messages": 0,
+            "peer_data_bytes": 0,
+            "game_count": 0,
+            "games": [],
+            "data_object_count": 0,
+        }
+    )
+
+    gateway.record_live_room_refresh(15102)
+
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+
+    resolution = next(event for event in events if event["event"] == "match_resolution_hint")
+    assert resolution["basis"] == "reconnect_heavy_collapse"
+    assert resolution["classification"] == "likely_disconnect_heavy"
+    assert resolution["room_state"]["pending_reconnect_count"] == 2
 
 
 def test_gateway_infers_homeworld_match_metadata_from_peer_packet_payload() -> None:

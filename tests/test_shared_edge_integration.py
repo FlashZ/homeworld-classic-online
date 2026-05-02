@@ -53,10 +53,11 @@ def _build_auth1_login_request(
     community_name: str,
     cd_key_raw: bytes,
     login_key_raw: bytes,
+    create_account: bool = True,
 ) -> tuple[bytes, bytes]:
     session_key = b"sekey123"
     clear = (
-        struct.pack("<HBB", 1, 1, 1)
+        struct.pack("<HBB", 1, 1, 1 if create_account else 0)
         + _pack_pw_string(username)
         + _pack_pw_string(community_name)
         + _pack_pw_string("")
@@ -110,8 +111,11 @@ async def _perform_native_login(
     password: str,
     community_name: str,
     login_key_raw: bytes,
+    cd_key_raw: bytes | None = None,
+    create_account: bool = True,
 ) -> int:
-    cd_key_raw = won_crypto.generate_cd_key(community_name)["raw_key"]
+    if cd_key_raw is None:
+        cd_key_raw = won_crypto.generate_cd_key(community_name)["raw_key"]
     request, _session_key = _build_auth1_login_request(
         runtime,
         username=username,
@@ -119,6 +123,7 @@ async def _perform_native_login(
         community_name=community_name,
         cd_key_raw=cd_key_raw,
         login_key_raw=login_key_raw,
+        create_account=create_account,
     )
     reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
     try:
@@ -145,6 +150,42 @@ async def _perform_native_login(
         assert reply_type == won_crypto.AUTH1_LOGIN_REPLY
         cert = _parse_login_reply_cert(reply_body)
         return int(cert["user_id"])
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def _perform_native_login_failure_status(
+    runtime: titan_binary_gateway.BinaryGatewayServer,
+    *,
+    gateway_port: int,
+    username: str,
+    password: str,
+    community_name: str,
+    login_key_raw: bytes,
+    cd_key_raw: bytes,
+    create_account: bool = False,
+) -> int:
+    request, _session_key = _build_auth1_login_request(
+        runtime,
+        username=username,
+        password=password,
+        community_name=community_name,
+        cd_key_raw=cd_key_raw,
+        login_key_raw=login_key_raw,
+        create_account=create_account,
+    )
+    reader, writer = await asyncio.open_connection("127.0.0.1", gateway_port)
+    try:
+        writer.write(request)
+        await writer.drain()
+
+        reply = await _recv_tmessage(reader)
+        reply_service, reply_type, reply_body = won_crypto.parse_tmessage(reply)
+        assert reply_service == won_crypto.AUTH1_SERVICE_TYPE
+        assert reply_type == won_crypto.AUTH1_LOGIN_REPLY
+        status, = struct.unpack("<h", reply_body[:2])
+        return int(status)
     finally:
         writer.close()
         await writer.wait_closed()
@@ -242,5 +283,74 @@ def test_shared_edge_native_auth_routes_homeworld_and_cataclysm_over_one_gateway
             await cat_backend.wait_closed()
             home_store.close()
             cat_store.close()
+
+    asyncio.run(_run())
+
+
+def test_shared_edge_rejects_second_native_login_for_same_active_user(
+    tmp_path: Path,
+) -> None:
+    async def _run() -> None:
+        keys_dir = _write_test_keys(tmp_path / "keys")
+        home_backend, _home_state, home_store = await won_server.run_server(
+            host="127.0.0.1",
+            port=0,
+            timeout_s=45,
+            db_path=str(tmp_path / "homeworld.db"),
+            product_profile=HOMEWORLD_PRODUCT_PROFILE,
+        )
+        home_port = int(home_backend.sockets[0].getsockname()[1])
+
+        home_runtime = titan_binary_gateway.BinaryGatewayServer(
+            "127.0.0.1",
+            home_port,
+            public_host="127.0.0.1",
+            public_port=15101,
+            routing_port=15100,
+            routing_max_port=15109,
+            keys_dir=str(keys_dir),
+            product_profile=HOMEWORLD_PRODUCT_PROFILE,
+            user_id_start=1000,
+            peer_session_id_min=1,
+            peer_session_id_max=32767,
+        )
+        shared = titan_binary_gateway.SharedBinaryGatewayServer(
+            {
+                "homeworld": home_runtime,
+            }
+        )
+        gateway_server = await asyncio.start_server(shared.handle_client, "127.0.0.1", 0)
+        gateway_port = int(gateway_server.sockets[0].getsockname()[1])
+        shared_cd_key = won_crypto.generate_cd_key("Homeworld")["raw_key"]
+
+        try:
+            first_user_id = await _perform_native_login(
+                home_runtime,
+                gateway_port=gateway_port,
+                username="HomeUser",
+                password="pw-home",
+                community_name="Homeworld",
+                login_key_raw=b"hw-log01",
+                cd_key_raw=shared_cd_key,
+            )
+            assert first_user_id in home_runtime._issued_user_ids
+
+            duplicate_status = await _perform_native_login_failure_status(
+                home_runtime,
+                gateway_port=gateway_port,
+                username="HomeUser",
+                password="pw-home",
+                community_name="Homeworld",
+                login_key_raw=b"hw-log02",
+                cd_key_raw=shared_cd_key,
+            )
+
+            assert duplicate_status == won_crypto.STATUS_AUTH_CD_KEY_IN_USE
+        finally:
+            gateway_server.close()
+            await gateway_server.wait_closed()
+            home_backend.close()
+            await home_backend.wait_closed()
+            home_store.close()
 
     asyncio.run(_run())

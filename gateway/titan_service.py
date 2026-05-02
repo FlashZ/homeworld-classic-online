@@ -5,6 +5,7 @@ import asyncio
 import base64
 from collections import deque
 import contextlib
+from dataclasses import dataclass, field
 import hashlib
 import logging
 import os
@@ -38,6 +39,21 @@ _PRINTABLE_TEXT_RE = re.compile(rb"[ -~]{4,}")
 _PRINTABLE_UTF16LE_RE = re.compile(rb"(?:(?:[ -~]\x00)){4,}")
 _MAP_CODE_TEXT_RE = re.compile(r"^pkwar[0-9a-z%._-]+$", re.IGNORECASE)
 _HUMAN_TITLE_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 &'(),_.:+!-]{2,63}$")
+_HW_WRAPPED_PREFIX = b"\x03\xe2\x60"
+_CHECKPOINT_HEARTBEAT_SECONDS = 12.0
+_HW_COMMAND_PACKET_TYPES = {0xCCCC, 0x5555, 0xE555}
+_HW_DROPPED_VERIFY = 0xFE389BCA
+_NATIVE_LOGIN_HANDOFF_SECONDS = 120.0
+
+
+@dataclass
+class NativeLoginClaim:
+    username: str
+    user_id: int
+    attached: bool = False
+    client_id: int = 0
+    created_at: float = field(default_factory=time.time)
+    expires_at: float = field(default_factory=lambda: time.time() + _NATIVE_LOGIN_HANDOFF_SECONDS)
 
 
 def _extract_payload_strings(payload: bytes) -> list[str]:
@@ -117,6 +133,99 @@ def _infer_setup_titles_from_payload(payload: bytes, *, fallback_map_code: str) 
         "map_code": map_code,
     }
 
+
+def _read_u16(data: bytes, offset: int) -> int:
+    if len(data) < offset + 2:
+        return 0
+    return int.from_bytes(data[offset : offset + 2], "little")
+
+
+def _find_hw_packet_offset(payload: bytes) -> int | None:
+    if payload.startswith(_HW_WRAPPED_PREFIX):
+        return len(_HW_WRAPPED_PREFIX)
+    max_offset = min(8, max(0, len(payload) - 2))
+    for offset in range(max_offset + 1):
+        packet_type = int.from_bytes(payload[offset : offset + 2], "little")
+        if packet_type in _HW_COMMAND_PACKET_TYPES and len(payload) >= offset + 24:
+            return offset
+    return None
+
+
+def _selection_size(num_ships: int) -> int:
+    return 2 + max(0, int(num_ships or 0)) * 2
+
+
+def _extract_gateway_packet_hints(payload: bytes) -> Dict[str, list[Dict[str, object]]]:
+    offset = _find_hw_packet_offset(payload)
+    hints: Dict[str, list[Dict[str, object]]] = {
+        "alliance_changes": [],
+        "player_dropped_masks": [],
+        "sync_anchors": [],
+        "godsync_anchors": [],
+        "scuttle_candidates": [],
+        "command_ship_signals": [],
+    }
+    if offset is None or len(payload) < offset + 24:
+        return hints
+
+    frame = int.from_bytes(payload[offset + 4 : offset + 8], "little") if len(payload) >= offset + 8 else 0
+    number_of_commands = _read_u16(payload, offset + 20)
+    cursor = offset + 24
+    for _index in range(number_of_commands):
+        if cursor + 2 > len(payload):
+            break
+        raw_command = int.from_bytes(payload[cursor : cursor + 2], "little")
+        command_type = raw_command & 0xFF
+        body = payload[cursor + 2 :]
+        size = 0
+        if command_type == 13 and len(body) >= 8:
+            hints["alliance_changes"].append(
+                {
+                    "frame": frame,
+                    "alliance_msg_type": int.from_bytes(body[0:4], "little"),
+                    "current_alliance": _read_u16(body, 4),
+                    "new_alliance": _read_u16(body, 6),
+                }
+            )
+            size = 8
+        elif command_type == 16 and len(body) >= 20:
+            hints["sync_anchors"].append(
+                {
+                    "frame": frame,
+                    "univ_frame": int.from_bytes(body[0:4], "little"),
+                    "randcheck": _read_u16(body, 4),
+                }
+            )
+            size = 20
+        elif command_type == 17 and len(body) >= 8:
+            player_dropped_mask = int.from_bytes(body[0:4], "little")
+            verify = int.from_bytes(body[4:8], "little")
+            if (player_dropped_mask ^ verify) == _HW_DROPPED_VERIFY:
+                hints["player_dropped_masks"].append(
+                    {
+                        "frame": frame,
+                        "player_dropped_mask": player_dropped_mask,
+                    }
+                )
+            size = 8
+        elif command_type == 10 and len(body) >= 8:
+            misc_command = _read_u16(body, 4)
+            num_ships = _read_u16(body, 6)
+            if misc_command == 1:
+                hints["scuttle_candidates"].append(
+                    {
+                        "frame": frame,
+                        "num_ships": num_ships,
+                    }
+                )
+            size = 6 + _selection_size(num_ships)
+        else:
+            break
+        if size <= 0 or cursor + 2 + size > len(payload):
+            break
+        cursor += 2 + size
+    return hints
+
 class BinaryGatewayServer:
     def __init__(self, backend_host: str, backend_port: int,
                  event_bus: Optional[GatewayEventBus] = None,
@@ -163,6 +272,9 @@ class BinaryGatewayServer:
         self._ver_p = self._ver_q = self._ver_g = 0
         self._next_user_id = int(user_id_start)
         self._issued_user_ids: set[int] = set()
+        self._native_login_claims: Dict[str, NativeLoginClaim] = {}
+        self._native_login_claims_by_user_id: Dict[int, str] = {}
+        self._native_login_locks: Dict[str, asyncio.Lock] = {}
         self._peer_session_id_min = max(1, int(peer_session_id_min))
         self._peer_session_id_max = max(
             self._peer_session_id_min,
@@ -178,6 +290,7 @@ class BinaryGatewayServer:
         self._maintenance_task: Optional[asyncio.Task] = None
         self._live_feed_event_id = 0
         self._live_matches: Dict[int, Dict[str, object]] = {}
+        self._match_hint_state: Dict[int, Dict[str, object]] = {}
         self._inferred_room_metadata: Dict[int, Dict[str, object]] = {}
         self._pending_match_slot_manifests: Dict[int, Dict[str, object]] = {}
         self._pending_match_launch_configs: Dict[int, Dict[str, object]] = {}
@@ -258,6 +371,119 @@ class BinaryGatewayServer:
         self._issued_user_ids.add(user_id)
         return user_id
 
+    @staticmethod
+    def _normalize_native_login_username(username: str) -> str:
+        return str(username or "").strip()
+
+    def _native_login_lock(self, username: str) -> asyncio.Lock:
+        normalized = self._normalize_native_login_username(username)
+        lock = self._native_login_locks.get(normalized)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._native_login_locks[normalized] = lock
+        return lock
+
+    def _expire_native_login_claims(self) -> int:
+        now = time.time()
+        expired_users = [
+            username
+            for username, claim in list(self._native_login_claims.items())
+            if not claim.attached and claim.expires_at <= now
+        ]
+        for username in expired_users:
+            claim = self._native_login_claims.pop(username, None)
+            if claim is None:
+                continue
+            self._native_login_claims_by_user_id.pop(int(claim.user_id), None)
+            LOGGER.info(
+                "Auth1: native login handoff expired user=%r user_id=%d idle_for=%.1fs",
+                claim.username,
+                claim.user_id,
+                max(0.0, now - claim.created_at),
+            )
+        return len(expired_users)
+
+    def _is_native_login_active(self, username: str) -> bool:
+        self._expire_native_login_claims()
+        normalized = self._normalize_native_login_username(username)
+        return normalized in self._native_login_claims
+
+    def _register_native_login_claim(self, username: str, user_id: int) -> None:
+        normalized = self._normalize_native_login_username(username)
+        if not normalized:
+            return
+        existing = self._native_login_claims.pop(normalized, None)
+        if existing is not None:
+            self._native_login_claims_by_user_id.pop(int(existing.user_id), None)
+        claim = NativeLoginClaim(username=normalized, user_id=int(user_id))
+        self._native_login_claims[normalized] = claim
+        self._native_login_claims_by_user_id[int(user_id)] = normalized
+        LOGGER.info(
+            "Auth1: native login handoff reserved user=%r user_id=%d window=%.1fs",
+            claim.username,
+            claim.user_id,
+            max(0.0, claim.expires_at - claim.created_at),
+        )
+
+    def _username_for_active_native_login(self, user_id: int) -> str:
+        self._expire_native_login_claims()
+        normalized = self._native_login_claims_by_user_id.get(int(user_id))
+        if not normalized:
+            return ""
+        claim = self._native_login_claims.get(normalized)
+        if claim is None:
+            self._native_login_claims_by_user_id.pop(int(user_id), None)
+            return ""
+        return claim.username
+
+    def _attach_native_login_claim(self, user_id: int, client_id: int) -> None:
+        self._expire_native_login_claims()
+        normalized = self._native_login_claims_by_user_id.get(int(user_id))
+        if not normalized:
+            return
+        claim = self._native_login_claims.get(normalized)
+        if claim is None:
+            self._native_login_claims_by_user_id.pop(int(user_id), None)
+            return
+        claim.attached = True
+        claim.client_id = int(client_id)
+        claim.expires_at = 0.0
+        LOGGER.info(
+            "Auth1: native login attached user=%r user_id=%d client_id=%d",
+            claim.username,
+            claim.user_id,
+            claim.client_id,
+        )
+
+    def _release_native_login_claim(
+        self,
+        *,
+        user_id: int = 0,
+        username: str = "",
+        reason: str = "",
+    ) -> bool:
+        self._expire_native_login_claims()
+        normalized = ""
+        if user_id:
+            normalized = str(self._native_login_claims_by_user_id.get(int(user_id), "") or "")
+        if not normalized:
+            normalized = self._normalize_native_login_username(username)
+        if not normalized:
+            return False
+        claim = self._native_login_claims.pop(normalized, None)
+        if claim is None:
+            self._native_login_claims_by_user_id.pop(int(user_id), None)
+            return False
+        self._native_login_claims_by_user_id.pop(int(claim.user_id), None)
+        LOGGER.info(
+            "Auth1: native login released user=%r user_id=%d client_id=%d reason=%s",
+            claim.username,
+            claim.user_id,
+            claim.client_id,
+            reason or "released",
+        )
+        return True
+
     def _expire_peer_sessions(self) -> int:
         now = time.time()
         expired_ids = [
@@ -282,9 +508,27 @@ class BinaryGatewayServer:
             while True:
                 await asyncio.sleep(PEER_SESSION_SWEEP_INTERVAL_SECONDS)
                 self._expire_peer_sessions()
+                self._expire_native_login_claims()
                 self._prune_ip_activity()
+                self._emit_due_checkpoint_heartbeats()
         except asyncio.CancelledError:
             raise
+
+    def _emit_due_checkpoint_heartbeats(self, *, now: float | None = None) -> int:
+        emitted = 0
+        current_time = float(now if now is not None else time.time())
+        for room_port in list(self._live_matches.keys()):
+            room_snapshot = self._routing_room_snapshot(int(room_port))
+            match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=False)
+            if not match_id:
+                continue
+            hint_state = self._ensure_match_hint_state(int(room_port), str(match_id))
+            last_emitted_at = float(hint_state.get("last_checkpoint_emitted_at") or 0.0)
+            if current_time - last_emitted_at < _CHECKPOINT_HEARTBEAT_SECONDS:
+                continue
+            if self._emit_match_checkpoint_hint(int(room_port), reason="heartbeat", snapshot=room_snapshot):
+                emitted += 1
+        return emitted
 
     def _prune_ip_activity(self) -> int:
         now = time.time()
@@ -818,6 +1062,397 @@ class BinaryGatewayServer:
             "owner_name": str(first_game.get("owner_name") or ""),
         }
 
+    def _ensure_match_hint_state(self, room_port: int, match_id: str) -> Dict[str, object]:
+        state = self._match_hint_state.setdefault(
+            int(room_port),
+            {
+                "match_id": str(match_id),
+                "last_checkpoint_emitted_at": 0.0,
+                "slot_manifest": {},
+                "launch_config": {},
+                "presence": {"connected": [], "reconnecting": [], "departed_recently": []},
+                "packet_hints": {
+                    "alliance_changes": [],
+                    "player_dropped_masks": [],
+                    "sync_anchors": [],
+                    "godsync_anchors": [],
+                    "scuttle_candidates": [],
+                    "command_ship_signals": [],
+                },
+            },
+        )
+        state["match_id"] = str(match_id)
+        return state
+
+    @staticmethod
+    def _hint_player_identity_key(player_name: object) -> str:
+        return str(player_name or "").strip()
+
+    def _hint_player_lookup(self, hint_state: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+        merged: Dict[str, Dict[str, object]] = {}
+        for container_key in ("slot_manifest", "launch_config"):
+            container = dict(hint_state.get(container_key) or {})
+            for raw_player in list(container.get("players") or []):
+                if not isinstance(raw_player, dict):
+                    continue
+                player_name = self._hint_player_identity_key(raw_player.get("player_name"))
+                if not player_name:
+                    continue
+                merged.setdefault(player_name, {}).update(dict(raw_player))
+        return merged
+
+    def _enrich_hint_presence_entry(
+        self,
+        hint_state: Dict[str, object],
+        entry: Dict[str, object],
+    ) -> Dict[str, object]:
+        enriched = dict(entry)
+        player_name = self._hint_player_identity_key(enriched.get("player_name"))
+        metadata = self._hint_player_lookup(hint_state).get(player_name)
+        if metadata is None:
+            return enriched
+        gameplay_index = metadata.get("gameplay_index")
+        try:
+            if gameplay_index is not None:
+                enriched["gameplay_index"] = int(gameplay_index)
+        except (TypeError, ValueError):
+            pass
+        player_id = str(metadata.get("player_id") or "").strip()
+        if player_id:
+            enriched["player_id"] = player_id
+        player_type = str(metadata.get("player_type") or "").strip()
+        if player_type:
+            enriched["player_type"] = player_type
+        if "is_ai" in metadata:
+            enriched["is_ai"] = bool(metadata.get("is_ai"))
+        ai_difficulty = str(metadata.get("ai_difficulty") or "").strip()
+        if ai_difficulty:
+            enriched["ai_difficulty"] = ai_difficulty
+        race = str(metadata.get("race") or "").strip()
+        if race:
+            enriched["race"] = race
+        return enriched
+
+    def _enrich_hint_presence(
+        self,
+        hint_state: Dict[str, object],
+        presence: Dict[str, object],
+    ) -> Dict[str, object]:
+        enriched = dict(presence or {})
+        for key in ("connected", "reconnecting", "departed_recently"):
+            enriched[key] = [
+                self._enrich_hint_presence_entry(hint_state, dict(entry))
+                for entry in list(enriched.get(key) or [])
+                if isinstance(entry, dict)
+            ]
+        return enriched
+
+    @staticmethod
+    def _survivor_hint_from_presence(presence: Dict[str, object]) -> Dict[str, object]:
+        candidates = [
+            dict(entry)
+            for entry in list(presence.get("connected") or [])
+            if isinstance(entry, dict)
+        ]
+        if not candidates:
+            candidates = [
+                dict(entry)
+                for entry in list(presence.get("reconnecting") or [])
+                if isinstance(entry, dict)
+            ]
+        if not candidates:
+            return {}
+        player_names = sorted(
+            {
+                str(entry.get("player_name") or "").strip()
+                for entry in candidates
+                if str(entry.get("player_name") or "").strip()
+            }
+        )
+        gameplay_indices = sorted(
+            {
+                int(entry.get("gameplay_index") or 0)
+                for entry in candidates
+                if entry.get("gameplay_index") is not None
+            }
+        )
+        player_ids = sorted(
+            {
+                str(entry.get("player_id") or "").strip()
+                for entry in candidates
+                if str(entry.get("player_id") or "").strip()
+            }
+        )
+        player_types = sorted(
+            {
+                str(entry.get("player_type") or "").strip()
+                for entry in candidates
+                if str(entry.get("player_type") or "").strip()
+            }
+        )
+        return {
+            "surviving_player_names": player_names,
+            "surviving_gameplay_indices": gameplay_indices,
+            "surviving_player_ids": player_ids,
+            "surviving_player_types": player_types,
+        }
+
+    def _presence_snapshot(
+        self,
+        room_snapshot: Dict[str, object],
+        *,
+        prior_departed_recently: list[dict[str, object]] | None = None,
+    ) -> Dict[str, object]:
+        connected: list[Dict[str, object]] = []
+        for client in list(room_snapshot.get("clients", []) or []):
+            if not isinstance(client, dict):
+                continue
+            connected.append(
+                {
+                    "client_id": int(client.get("client_id") or 0),
+                    "player_name": str(client.get("client_name") or ""),
+                    "player_ip": str(client.get("client_ip") or ""),
+                }
+            )
+        reconnecting: list[Dict[str, object]] = []
+        for client in list(room_snapshot.get("pending_reconnects", []) or []):
+            if not isinstance(client, dict):
+                continue
+            reconnecting.append(
+                {
+                    "client_id": int(client.get("client_id") or 0),
+                    "player_name": str(client.get("client_name") or ""),
+                    "player_ip": str(client.get("client_ip") or ""),
+                    "seconds_remaining": int(client.get("seconds_remaining") or 0),
+                }
+            )
+        return {
+            "connected": connected,
+            "reconnecting": reconnecting,
+            "departed_recently": list(prior_departed_recently or []),
+        }
+
+    def _remember_departed_player(
+        self,
+        room_port: int,
+        *,
+        player_id: int,
+        player_name: str,
+        player_ip: str,
+    ) -> None:
+        state = self._match_hint_state.get(int(room_port))
+        if state is None:
+            return
+        presence = dict(state.get("presence") or {})
+        departed = [
+            dict(entry)
+            for entry in list(presence.get("departed_recently") or [])
+            if isinstance(entry, dict)
+        ]
+        departed.insert(
+            0,
+            {
+                "client_id": int(player_id),
+                "player_name": str(player_name or ""),
+                "player_ip": str(player_ip or ""),
+            },
+        )
+        presence["departed_recently"] = departed[:4]
+        state["presence"] = presence
+
+    def _upsert_connected_player(
+        self,
+        room_port: int,
+        *,
+        player_id: int,
+        player_name: str,
+        player_ip: str,
+    ) -> None:
+        state = self._match_hint_state.get(int(room_port))
+        if state is None:
+            return
+        presence = dict(state.get("presence") or {})
+        connected = [
+            dict(entry)
+            for entry in list(presence.get("connected") or [])
+            if isinstance(entry, dict)
+        ]
+        updated = False
+        for entry in connected:
+            if int(entry.get("client_id") or 0) == int(player_id):
+                entry["player_name"] = str(player_name or entry.get("player_name") or "")
+                entry["player_ip"] = str(player_ip or entry.get("player_ip") or "")
+                updated = True
+                break
+        if not updated:
+            connected.append(
+                {
+                    "client_id": int(player_id),
+                    "player_name": str(player_name or ""),
+                    "player_ip": str(player_ip or ""),
+                }
+            )
+        connected.sort(key=lambda item: (int(item.get("client_id") or 0), str(item.get("player_name") or "")))
+        presence["connected"] = connected
+        state["presence"] = presence
+
+    def _refresh_hint_presence(self, room_port: int, room_snapshot: Dict[str, object]) -> None:
+        live_state = self._live_matches.get(int(room_port))
+        if live_state is None:
+            return
+        hint_state = self._ensure_match_hint_state(int(room_port), str(live_state["match_id"]))
+        prior_presence = dict(hint_state.get("presence") or {})
+        prior_departed = list(prior_presence.get("departed_recently") or [])
+        prior_connected_by_id = {
+            int(entry.get("client_id") or 0): dict(entry)
+            for entry in list(prior_presence.get("connected") or [])
+            if isinstance(entry, dict)
+        }
+        next_presence = self._presence_snapshot(room_snapshot, prior_departed_recently=prior_departed)
+        merged_connected: list[Dict[str, object]] = []
+        for entry in list(next_presence.get("connected") or []):
+            hydrated = dict(entry)
+            prior_entry = prior_connected_by_id.get(int(hydrated.get("client_id") or 0))
+            if prior_entry:
+                hydrated["player_name"] = str(prior_entry.get("player_name") or hydrated.get("player_name") or "")
+                hydrated["player_ip"] = str(prior_entry.get("player_ip") or hydrated.get("player_ip") or "")
+            merged_connected.append(hydrated)
+        next_presence["connected"] = merged_connected
+        hint_state["presence"] = self._enrich_hint_presence(hint_state, next_presence)
+
+    def _drain_match_packet_hints(self, room_port: int, *, clear: bool = True) -> Dict[str, list[Dict[str, object]]]:
+        hint_state = self._match_hint_state.get(int(room_port))
+        if hint_state is None:
+            return {
+                "alliance_changes": [],
+                "player_dropped_masks": [],
+                "sync_anchors": [],
+                "godsync_anchors": [],
+                "scuttle_candidates": [],
+                "command_ship_signals": [],
+            }
+        packet_hints = dict(hint_state.get("packet_hints") or {})
+        result = {
+            "alliance_changes": list(packet_hints.get("alliance_changes") or []),
+            "player_dropped_masks": [
+                int(entry.get("player_dropped_mask") or 0)
+                for entry in list(packet_hints.get("player_dropped_masks") or [])
+                if int(entry.get("player_dropped_mask") or 0) > 0
+            ],
+            "sync_anchors": list(packet_hints.get("sync_anchors") or []),
+            "godsync_anchors": list(packet_hints.get("godsync_anchors") or []),
+            "scuttle_candidates": list(packet_hints.get("scuttle_candidates") or []),
+            "command_ship_signals": list(packet_hints.get("command_ship_signals") or []),
+        }
+        if clear:
+            hint_state["packet_hints"] = {
+                "alliance_changes": [],
+                "player_dropped_masks": [],
+                "sync_anchors": [],
+                "godsync_anchors": [],
+                "scuttle_candidates": [],
+                "command_ship_signals": [],
+            }
+        return result
+
+    def _append_packet_hints(self, room_port: int, payload: bytes) -> bool:
+        live_state = self._live_matches.get(int(room_port))
+        if live_state is None:
+            return False
+        hint_state = self._ensure_match_hint_state(int(room_port), str(live_state["match_id"]))
+        current_hints = dict(hint_state.get("packet_hints") or {})
+        next_hints = _extract_gateway_packet_hints(bytes(payload or b""))
+        changed = False
+        for key, values in next_hints.items():
+            if not values:
+                continue
+            bucket = list(current_hints.get(key) or [])
+            bucket.extend(values)
+            current_hints[key] = bucket
+            changed = True
+        if changed:
+            hint_state["packet_hints"] = current_hints
+        return changed
+
+    def _emit_match_checkpoint_hint(
+        self,
+        room_port: int,
+        *,
+        reason: str,
+        snapshot: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object] | None:
+        state = self._live_matches.get(int(room_port))
+        if state is None:
+            return None
+        room_snapshot = dict(snapshot or self._routing_room_snapshot(int(room_port)))
+        hint_state = self._ensure_match_hint_state(int(room_port), str(state["match_id"]))
+        self._refresh_hint_presence(int(room_port), room_snapshot)
+        should_clear_packet_hints = str(reason or "") not in {"peer_decode"}
+        payload = {
+            "match_id": str(state["match_id"]),
+            "room_port": int(room_port),
+            "room_name": self._preferred_room_title(room_snapshot, fallback=state.get("room_name")),
+            "room_path": str(room_snapshot.get("room_path") or state.get("room_path") or ""),
+            "transport_mode": "routed",
+            "capture_source": "routed_live_feed",
+            "reason": str(reason or "heartbeat"),
+            "hint_authority": "advisory",
+            "started_at": float(state.get("started_at") or 0.0),
+            "participant_count": self._room_participant_count(room_snapshot),
+            "room_state": {
+                "published": bool(room_snapshot.get("published", False)),
+                "is_game_room": bool(room_snapshot.get("is_game_room", False)),
+                "active_game_count": int(room_snapshot.get("active_game_count") or 0),
+                "data_object_count": int(room_snapshot.get("data_object_count") or 0),
+                "pending_reconnect_count": int(room_snapshot.get("pending_reconnect_count") or 0),
+            },
+            "presence": dict(hint_state.get("presence") or {}),
+            "slot_manifest": dict(hint_state.get("slot_manifest") or {}),
+            "launch_config": dict(hint_state.get("launch_config") or {}),
+            "packet_hints": self._drain_match_packet_hints(int(room_port), clear=should_clear_packet_hints),
+            "evidence": [str(reason or "heartbeat")],
+        }
+        hint_state["last_checkpoint_emitted_at"] = time.time()
+        return self._publish_live_feed_event("match_checkpoint_hint", payload)
+
+    def _emit_match_resolution_hint(
+        self,
+        room_port: int,
+        *,
+        basis: str,
+        classification: str,
+        snapshot: Optional[Dict[str, object]] = None,
+        evidence: Optional[list[str]] = None,
+    ) -> Dict[str, object] | None:
+        state = self._live_matches.get(int(room_port))
+        if state is None:
+            return None
+        room_snapshot = dict(snapshot or self._routing_room_snapshot(int(room_port)))
+        hint_state = self._ensure_match_hint_state(int(room_port), str(state["match_id"]))
+        self._refresh_hint_presence(int(room_port), room_snapshot)
+        payload = {
+            "match_id": str(state["match_id"]),
+            "room_port": int(room_port),
+            "room_name": self._preferred_room_title(room_snapshot, fallback=state.get("room_name")),
+            "room_path": str(room_snapshot.get("room_path") or state.get("room_path") or ""),
+            "hint_authority": "terminal_support",
+            "basis": str(basis or "clean_finish"),
+            "classification": str(classification or "clean_terminal_support"),
+            "room_state": {
+                "published": bool(room_snapshot.get("published", False)),
+                "is_game_room": bool(room_snapshot.get("is_game_room", False)),
+                "pending_reconnect_count": int(room_snapshot.get("pending_reconnect_count") or 0),
+            },
+            "presence": {
+                "connected_final": list(dict(hint_state.get("presence") or {}).get("connected") or []),
+                "reconnecting_final": list(dict(hint_state.get("presence") or {}).get("reconnecting") or []),
+            },
+            "survivor_hint": self._survivor_hint_from_presence(dict(hint_state.get("presence") or {})),
+            "packet_hints": self._drain_match_packet_hints(int(room_port), clear=False),
+            "evidence": list(evidence or []),
+        }
+        return self._publish_live_feed_event("match_resolution_hint", payload)
+
     @staticmethod
     def _normalize_match_slot_manifest_players(players: Any) -> list[Dict[str, object]]:
         normalized: list[Dict[str, object]] = []
@@ -939,6 +1574,8 @@ class BinaryGatewayServer:
             "room_path": str(room_snapshot.get("room_path") or state.get("room_path") or ""),
             "players": list(pending.get("players") or []),
         }
+        hint_state = self._ensure_match_hint_state(port, str(state["match_id"]))
+        hint_state["slot_manifest"] = {"players": list(pending.get("players") or [])}
         self._publish_live_feed_event("match_slot_manifest", payload)
         self._pending_match_slot_manifests.pop(port, None)
 
@@ -960,6 +1597,17 @@ class BinaryGatewayServer:
             "room_port": port,
             "room_name": room_title,
             "room_path": str(room_snapshot.get("room_path") or state.get("room_path") or ""),
+            "transport_mode": str(pending.get("transport_mode") or "routed"),
+            "capture_source": "routed_live_feed",
+            "lobby_title": str(pending.get("lobby_title") or room_title or ""),
+            "map_name": str(pending.get("map_name") or ""),
+            "map_code": str(pending.get("map_code") or ""),
+            "settings": dict(pending.get("settings") or {}),
+            "captain_identity": dict(pending.get("captain_identity") or {}),
+            "players": list(pending.get("players") or []),
+        }
+        hint_state = self._ensure_match_hint_state(port, str(state["match_id"]))
+        hint_state["launch_config"] = {
             "transport_mode": str(pending.get("transport_mode") or "routed"),
             "capture_source": "routed_live_feed",
             "lobby_title": str(pending.get("lobby_title") or room_title or ""),
@@ -993,6 +1641,7 @@ class BinaryGatewayServer:
                 "room_path": str(room_snapshot.get("room_path") or ""),
             }
             self._live_matches[room_port] = state
+            self._ensure_match_hint_state(room_port, str(state["match_id"]))
             self._publish_live_feed_event(
                 "match_started",
                 self._live_match_payload(room_port, room_snapshot, state, now=now),
@@ -1017,11 +1666,35 @@ class BinaryGatewayServer:
                 self._inferred_room_metadata.pop(room_port, None)
                 self._pending_match_slot_manifests.pop(room_port, None)
                 self._pending_match_launch_configs.pop(room_port, None)
+                pending_reconnect_count = int(room_snapshot.get("pending_reconnect_count") or 0)
+                if pending_reconnect_count > 0:
+                    self._emit_match_resolution_hint(
+                        room_port,
+                        basis="reconnect_heavy_collapse",
+                        classification="likely_disconnect_heavy",
+                        snapshot=room_snapshot,
+                        evidence=[
+                            "room_unpublished_with_reconnect_holds",
+                            "gateway_room_collapse",
+                        ],
+                    )
+                else:
+                    self._emit_match_resolution_hint(
+                        room_port,
+                        basis="clean_finish",
+                        classification="clean_terminal_support",
+                        snapshot=room_snapshot,
+                        evidence=[
+                            "room_transitioned_out_of_game",
+                            "gateway_match_finished",
+                        ],
+                    )
                 self._publish_live_feed_event(
                     "match_finished",
                     self._live_match_payload(room_port, room_snapshot, state, now=now),
                 )
                 self._live_matches.pop(room_port, None)
+                self._match_hint_state.pop(room_port, None)
                 return None
             if emit_update:
                 self._publish_live_feed_event(
@@ -1034,7 +1707,12 @@ class BinaryGatewayServer:
 
     def record_live_room_refresh(self, room_port: int) -> None:
         room_snapshot = self._routing_room_snapshot(room_port)
-        self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+        match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+        if match_id:
+            hint_state = self._ensure_match_hint_state(int(room_port), str(match_id))
+            last_emitted_at = float(hint_state.get("last_checkpoint_emitted_at") or 0.0)
+            reason = "heartbeat" if time.time() - last_emitted_at >= _CHECKPOINT_HEARTBEAT_SECONDS else "room_refresh"
+            self._emit_match_checkpoint_hint(int(room_port), reason=reason, snapshot=room_snapshot)
 
     def record_live_player_event(
         self,
@@ -1063,7 +1741,24 @@ class BinaryGatewayServer:
         if details:
             payload["details"] = dict(details)
         self._publish_live_feed_event(event_name, payload)
-        self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+        match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+        if match_id:
+            self._ensure_match_hint_state(int(room_port), str(match_id))
+            if event_name == "player_joined":
+                self._upsert_connected_player(
+                    int(room_port),
+                    player_id=int(player_id),
+                    player_name=str(player_name or ""),
+                    player_ip=str(player_ip or ""),
+                )
+            if event_name == "player_left":
+                self._remember_departed_player(
+                    int(room_port),
+                    player_id=int(player_id),
+                    player_name=str(player_name or ""),
+                    player_ip=str(player_ip or ""),
+                )
+            self._emit_match_checkpoint_hint(int(room_port), reason=event_name, snapshot=room_snapshot)
 
     def record_live_routing_object_event(
         self,
@@ -1098,7 +1793,13 @@ class BinaryGatewayServer:
         if match_id:
             event_payload["match_id"] = match_id
         self._publish_live_feed_event(event_name, event_payload)
-        self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+        updated_match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+        if updated_match_id:
+            self._emit_match_checkpoint_hint(
+                int(room_port),
+                reason="routing_object_change",
+                snapshot=room_snapshot,
+            )
 
     def record_live_peer_packet(
         self,
@@ -1141,6 +1842,8 @@ class BinaryGatewayServer:
             event_payload["match_id"] = match_id
         self._publish_live_feed_event(event_name, event_payload)
         self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=True)
+        if match_id and self._append_packet_hints(int(room_port), raw_payload):
+            self._emit_match_checkpoint_hint(int(room_port), reason="peer_decode", snapshot=room_snapshot)
 
     def _routing_dashboard_snapshot(self) -> Dict[str, object]:
         raw_snapshot = (
@@ -1590,6 +2293,9 @@ class BinaryGatewayServer:
             client_ip = str(peer[0])
 
         native_login = None
+        username = ""
+        user_id = 0
+        login_reply_sent = False
         try:
             native_login = won_crypto.parse_auth1_login_payload(login_req["bf_data"], session_key)
             LOGGER.info(
@@ -1606,67 +2312,86 @@ class BinaryGatewayServer:
             LOGGER.warning("Auth1: failed to parse native login payload from %s:%s: %s", *peer, exc)
             return
 
-        backend = await self._call_backend(
-            {
-                "action": "AUTH_LOGIN_NATIVE",
-                "username": str(native_login["username"]),
-                "password": str(native_login["password"]),
-                "new_password": str(native_login["new_password"]),
-                "cd_key": str(native_login["cd_key"]),
-                "login_key": str(native_login["login_key"]),
-                "create_account": bool(native_login["create_account"]),
-                "client_ip": client_ip,
-            }
-        )
-        if not backend.get("ok"):
-            error_code = str(backend.get("error", "native_auth_failed"))
-            status = _native_auth_error_to_status(error_code)
-            LOGGER.warning(
-                "Auth1: native login rejected for user=%r from %s:%s error=%s status=%d",
-                native_login["username"],
-                *peer,
-                error_code,
-                status,
-            )
-            try:
-                writer.write(won_crypto.build_auth1_login_failure_reply(status))
-                await writer.drain()
-            except Exception as exc:
-                LOGGER.debug("Auth1: failed to send login failure reply to %s:%s: %s", *peer, exc)
-            return
-        native_result = backend.get("result", {})
-        if isinstance(native_result, dict):
+        try:
+            username = str(native_login["username"])
+            async with self._native_login_lock(username):
+                backend = await self._call_backend(
+                    {
+                        "action": "AUTH_LOGIN_NATIVE",
+                        "username": username,
+                        "password": str(native_login["password"]),
+                        "new_password": str(native_login["new_password"]),
+                        "cd_key": str(native_login["cd_key"]),
+                        "login_key": str(native_login["login_key"]),
+                        "create_account": bool(native_login["create_account"]),
+                        "client_ip": client_ip,
+                        "allow_cd_key_rebind": True,
+                        "account_active": self._is_native_login_active(username),
+                    }
+                )
+                if not backend.get("ok"):
+                    error_code = str(backend.get("error", "native_auth_failed"))
+                    status = _native_auth_error_to_status(error_code)
+                    LOGGER.warning(
+                        "Auth1: native login rejected for user=%r from %s:%s error=%s status=%d",
+                        native_login["username"],
+                        *peer,
+                        error_code,
+                        status,
+                    )
+                    try:
+                        writer.write(won_crypto.build_auth1_login_failure_reply(status))
+                        await writer.drain()
+                    except Exception as exc:
+                        LOGGER.debug("Auth1: failed to send login failure reply to %s:%s: %s", *peer, exc)
+                    return
+                native_result = backend.get("result", {})
+                if isinstance(native_result, dict):
+                    LOGGER.info(
+                        "Auth1: native account accepted user=%r created=%s cd_key_bound=%s binding_changed=%s",
+                        native_result.get("username", native_login["username"]),
+                        bool(native_result.get("created", False)),
+                        bool(native_result.get("cd_key_bound", False)),
+                        bool(native_result.get("binding_changed", False)),
+                    )
+                user_id = self._alloc_user_id()
+                self._register_native_login_claim(username, user_id)
+
+            challenge_seed = os.urandom(16)
+            challenge_reply = won_crypto.build_auth1_challenge(challenge_seed, session_key)
+            writer.write(challenge_reply)
+            await writer.drain()
+            LOGGER.info("Auth1: ChallengeHW sent to %s:%s", *peer)
+
+            body = await _titan_recv(reader)
+            svc, msg, confirm_body = won_crypto.parse_tmessage(body)
             LOGGER.info(
-                "Auth1: native account accepted user=%r created=%s cd_key_bound=%s binding_changed=%s",
-                native_result.get("username", native_login["username"]),
-                bool(native_result.get("created", False)),
-                bool(native_result.get("cd_key_bound", False)),
-                bool(native_result.get("binding_changed", False)),
+                "Auth1: ConfirmHW received from %s:%s (svc=%d msg=%d, %d bytes)",
+                *peer,
+                svc,
+                msg,
+                len(confirm_body),
             )
 
-        # --- Send LoginChallengeHW ---
-        challenge_seed = os.urandom(16)
-        challenge_reply = won_crypto.build_auth1_challenge(challenge_seed, session_key)
-        writer.write(challenge_reply)
-        await writer.drain()
-        LOGGER.info("Auth1: ChallengeHW sent to %s:%s", *peer)
-
-        # --- Receive LoginConfirmHW ---
-        body = await _titan_recv(reader)
-        svc, msg, confirm_body = won_crypto.parse_tmessage(body)
-        LOGGER.info("Auth1: ConfirmHW received from %s:%s (svc=%d msg=%d, %d bytes)",
-                     *peer, svc, msg, len(confirm_body))
-        # We accept any confirm — we're not doing real file hash verification
-
-        # --- Send LoginReply with certificate + client private key ---
-        user_id = self._alloc_user_id()
-        cert, user_y, user_x = self._build_user_cert(user_id)
-
-        login_reply = self._build_auth1_login_reply_with_key(cert, user_x, session_key)
-        writer.write(login_reply)
-        await writer.drain()
-        LOGGER.info("Auth1: LoginReply sent to %s:%s (user_id=%d, cert=%d bytes)",
-                     *peer, user_id, len(cert))
+            cert, _user_y, user_x = self._build_user_cert(user_id)
+            login_reply = self._build_auth1_login_reply_with_key(cert, user_x, session_key)
+            writer.write(login_reply)
+            await writer.drain()
+            login_reply_sent = True
+            LOGGER.info(
+                "Auth1: LoginReply sent to %s:%s (user_id=%d, cert=%d bytes)",
+                *peer,
+                user_id,
+                len(cert),
+            )
+        except Exception:
+            if user_id and not login_reply_sent:
+                self._release_native_login_claim(
+                    user_id=user_id,
+                    username=username,
+                    reason="auth_login_aborted",
+                )
+            raise
 
     def _build_auth1_login_reply_with_key(self, cert: bytes, user_x: int,
                                            session_key: bytes) -> bytes:
@@ -3024,62 +3749,89 @@ class SharedBinaryGatewayServer:
             runtime.product_profile.key,
         )
 
-        backend = await runtime._call_backend(
-            {
-                "action": "AUTH_LOGIN_NATIVE",
-                "username": str(native_login["username"]),
-                "password": str(native_login["password"]),
-                "new_password": str(native_login["new_password"]),
-                "cd_key": str(native_login["cd_key"]),
-                "login_key": str(native_login["login_key"]),
-                "create_account": bool(native_login["create_account"]),
-                "client_ip": client_ip,
-            }
-        )
-        if not backend.get("ok"):
-            error_code = str(backend.get("error", "native_auth_failed"))
-            status = _native_auth_error_to_status(error_code)
-            LOGGER.warning(
-                "Auth1(shared): native login rejected for user=%r from %s:%s error=%s status=%d product=%s",
-                native_login["username"],
+        username = str(native_login["username"])
+        user_id = 0
+        login_reply_sent = False
+        try:
+            async with runtime._native_login_lock(username):
+                backend = await runtime._call_backend(
+                    {
+                        "action": "AUTH_LOGIN_NATIVE",
+                        "username": username,
+                        "password": str(native_login["password"]),
+                        "new_password": str(native_login["new_password"]),
+                        "cd_key": str(native_login["cd_key"]),
+                        "login_key": str(native_login["login_key"]),
+                        "create_account": bool(native_login["create_account"]),
+                        "client_ip": client_ip,
+                        "allow_cd_key_rebind": True,
+                        "account_active": runtime._is_native_login_active(username),
+                    }
+                )
+                if not backend.get("ok"):
+                    error_code = str(backend.get("error", "native_auth_failed"))
+                    status = _native_auth_error_to_status(error_code)
+                    LOGGER.warning(
+                        "Auth1(shared): native login rejected for user=%r from %s:%s error=%s status=%d product=%s",
+                        native_login["username"],
+                        *peer,
+                        error_code,
+                        status,
+                        runtime.product_profile.key,
+                    )
+                    with contextlib.suppress(Exception):
+                        writer.write(won_crypto.build_auth1_login_failure_reply(status))
+                        await writer.drain()
+                    return
+                native_result = backend.get("result", {})
+                if isinstance(native_result, dict):
+                    LOGGER.info(
+                        "Auth1(shared): native account accepted user=%r created=%s cd_key_bound=%s binding_changed=%s product=%s",
+                        native_result.get("username", native_login["username"]),
+                        bool(native_result.get("created", False)),
+                        bool(native_result.get("cd_key_bound", False)),
+                        bool(native_result.get("binding_changed", False)),
+                        runtime.product_profile.key,
+                    )
+                user_id = runtime._alloc_user_id()
+                runtime._register_native_login_claim(username, user_id)
+
+            challenge_seed = os.urandom(16)
+            challenge_reply = won_crypto.build_auth1_challenge(challenge_seed, session_key)
+            writer.write(challenge_reply)
+            await writer.drain()
+            LOGGER.info("Auth1(shared): ChallengeHW sent to %s:%s", *peer)
+
+            body = await _titan_recv(reader)
+            svc, msg, confirm_body = won_crypto.parse_tmessage(body)
+            LOGGER.info(
+                "Auth1(shared): ConfirmHW received from %s:%s (svc=%d msg=%d, %d bytes)",
                 *peer,
-                error_code,
-                status,
-                runtime.product_profile.key,
+                svc,
+                msg,
+                len(confirm_body),
             )
-            with contextlib.suppress(Exception):
-                writer.write(won_crypto.build_auth1_login_failure_reply(status))
-                await writer.drain()
-            return
 
-        challenge_seed = os.urandom(16)
-        challenge_reply = won_crypto.build_auth1_challenge(challenge_seed, session_key)
-        writer.write(challenge_reply)
-        await writer.drain()
-        LOGGER.info("Auth1(shared): ChallengeHW sent to %s:%s", *peer)
-
-        body = await _titan_recv(reader)
-        svc, msg, confirm_body = won_crypto.parse_tmessage(body)
-        LOGGER.info(
-            "Auth1(shared): ConfirmHW received from %s:%s (svc=%d msg=%d, %d bytes)",
-            *peer,
-            svc,
-            msg,
-            len(confirm_body),
-        )
-
-        user_id = runtime._alloc_user_id()
-        cert, _user_y, user_x = runtime._build_user_cert(user_id)
-        login_reply = runtime._build_auth1_login_reply_with_key(cert, user_x, session_key)
-        writer.write(login_reply)
-        await writer.drain()
-        LOGGER.info(
-            "Auth1(shared): LoginReply sent to %s:%s (product=%s user_id=%d cert=%d bytes)",
-            *peer,
-            runtime.product_profile.key,
-            user_id,
-            len(cert),
-        )
+            cert, _user_y, user_x = runtime._build_user_cert(user_id)
+            login_reply = runtime._build_auth1_login_reply_with_key(cert, user_x, session_key)
+            writer.write(login_reply)
+            await writer.drain()
+            login_reply_sent = True
+            LOGGER.info(
+                "Auth1(shared): LoginReply sent to %s:%s (product=%s user_id=%d cert=%d bytes)",
+                *peer,
+                runtime.product_profile.key,
+                user_id,
+                len(cert),
+            )
+        except Exception:
+            if user_id and not login_reply_sent:
+                runtime._release_native_login_claim(
+                    user_id=user_id,
+                    username=username,
+                    reason="auth_login_aborted",
+                )
+            raise
 
     async def _handle_titan_native(
         self,

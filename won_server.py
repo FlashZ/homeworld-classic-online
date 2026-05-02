@@ -564,6 +564,8 @@ class WONLikeState:
         client_ip: Optional[str] = None,
         create_account: bool = False,
         new_password: str = "",
+        allow_cd_key_rebind: bool = True,
+        account_active: bool = False,
     ) -> Dict[str, Any]:
         self.cleanup_expired_sessions()
         username = username.strip()
@@ -613,13 +615,24 @@ class WONLikeState:
 
         if self._hash_password(password) != row["password_hash"]:
             raise ValueError("invalid_credentials")
+        if account_active:
+            raise ValueError("already_logged_in")
 
         existing_cd_key = self._normalize_native_key(str(row["native_cd_key"]))
         binding_changed = False
 
         if existing_cd_key:
             if normalized_cd_key and normalized_cd_key != existing_cd_key:
-                raise ValueError("cd_key_mismatch")
+                if not allow_cd_key_rebind:
+                    raise ValueError("cd_key_mismatch")
+                if not self._allow_native_key_write(username, client_ip):
+                    raise ValueError("rate_limited")
+                cur.execute(
+                    "UPDATE users SET native_cd_key=? WHERE username=?",
+                    (normalized_cd_key, username),
+                )
+                existing_cd_key = normalized_cd_key
+                binding_changed = True
         elif normalized_cd_key:
             if not self._allow_native_key_write(username, client_ip):
                 raise ValueError("rate_limited")
@@ -1002,6 +1015,8 @@ class WONLikeProtocolServer:
                     client_ip=req.get("client_ip"),
                     create_account=bool(req.get("create_account", False)),
                     new_password=req.get("new_password", ""),
+                    allow_cd_key_rebind=bool(req.get("allow_cd_key_rebind", True)),
+                    account_active=bool(req.get("account_active", False)),
                 ),
             }
         if action == "AUTH_VALIDATE":

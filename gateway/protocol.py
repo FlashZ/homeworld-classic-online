@@ -742,6 +742,7 @@ def _native_auth_error_to_status(error: str) -> int:
         "missing_cd_key": won_crypto.STATUS_AUTH_INVALID_CD_KEY,
         "invalid_cd_key": won_crypto.STATUS_AUTH_INVALID_CD_KEY,
         "cd_key_mismatch": won_crypto.STATUS_AUTH_INVALID_CD_KEY,
+        "already_logged_in": won_crypto.STATUS_AUTH_CD_KEY_IN_USE,
         "rate_limited": won_crypto.STATUS_AUTH_BAD_PASSWORD,
     }
     return mapping.get(str(error), won_crypto.STATUS_COMMON_INVALID_PARAMETERS)
