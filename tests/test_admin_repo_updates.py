@@ -594,6 +594,67 @@ def test_admin_html_contains_clear_cd_key_action() -> None:
     assert "Clear CD Key" in html
 
 
+def test_admin_html_contains_slow_peer_delivery_diagnostics() -> None:
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=_FakeGateway(),
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    html = dashboard._html("")
+
+    assert "Connection Health" in html
+    assert "Slow Send Events" in html
+    assert "Last Slow Send" in html
+
+
+def test_admin_html_contains_responsive_shell_primitives() -> None:
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=_FakeGateway(),
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    html = dashboard._html("")
+
+    assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in html
+    assert 'id="shell-toggle"' in html
+    assert 'id="sidebar-scrim"' in html
+    assert "ops-summary-grid" in html
+
+
+def test_admin_html_contains_transport_health_copy() -> None:
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=_FakeGateway(),
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    html = dashboard._html("")
+
+    assert "Transport Health" in html
+    assert "Slow Delivery Alerts" in html
+    assert "Connection Health" in html
+
+
+def test_admin_html_contains_health_first_players_and_rooms_copy() -> None:
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=_FakeGateway(),
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        repo_monitor=_FakeRepoMonitor(),
+    )
+
+    html = dashboard._html("")
+
+    assert "Player Activity" in html
+    assert "Room Health" in html
+    assert "Transport Warning" in html
+
+
 def test_admin_live_feed_disconnect_suppresses_broken_pipe_on_wait_closed(monkeypatch) -> None:
     class _LiveFeedGateway(_FakeGateway):
         def __init__(self) -> None:

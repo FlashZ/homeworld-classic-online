@@ -23,6 +23,8 @@ globals().update({name: getattr(_protocol, name) for name in dir(_protocol) if n
 LOGGER = logging.getLogger(__name__)
 
 PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS = 15.0
+SLOW_PEER_DATA_DELIVERY_THRESHOLD_SECONDS = 0.150
+SLOW_PEER_DATA_LOG_COOLDOWN_SECONDS = 15.0
 _MULTIPLAYER_LEVEL_PATH_RE = re.compile(
     rb"(?i)multiplayer\\(?P<folder>[^\\\x00\r\n]+)\\(?P<file>[^\\\x00\r\n]+)\.level"
 )
@@ -73,6 +75,11 @@ class NativeRouteClientState:
     chat_count: int = 0
     peer_data_messages: int = 0
     peer_data_bytes: int = 0
+    slow_peer_data_events: int = 0
+    slowest_peer_data_send_ms: int = 0
+    last_slow_peer_data_send_ms: int = 0
+    last_slow_peer_data_at: float = 0.0
+    last_slow_peer_data_log_at: float = 0.0
     admin_sender_announced: bool = False
     subscriptions: list[NativeRouteSubscription] = field(default_factory=list)
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -91,6 +98,11 @@ class PendingNativeReconnect:
     chat_count: int
     peer_data_messages: int
     peer_data_bytes: int
+    slow_peer_data_events: int = 0
+    slowest_peer_data_send_ms: int = 0
+    last_slow_peer_data_send_ms: int = 0
+    last_slow_peer_data_at: float = 0.0
+    last_slow_peer_data_log_at: float = 0.0
     auth_user_id: int = 0
     account_username: str = ""
     subscriptions: list[NativeRouteSubscription] = field(default_factory=list)
@@ -325,6 +337,11 @@ class SilencerRoutingServer:
             chat_count=int(client.chat_count),
             peer_data_messages=int(client.peer_data_messages),
             peer_data_bytes=int(client.peer_data_bytes),
+            slow_peer_data_events=int(client.slow_peer_data_events),
+            slowest_peer_data_send_ms=int(client.slowest_peer_data_send_ms),
+            last_slow_peer_data_send_ms=int(client.last_slow_peer_data_send_ms),
+            last_slow_peer_data_at=float(client.last_slow_peer_data_at),
+            last_slow_peer_data_log_at=float(client.last_slow_peer_data_log_at),
             auth_user_id=int(client.auth_user_id),
             account_username=str(client.account_username),
             subscriptions=[
@@ -593,6 +610,51 @@ class SilencerRoutingServer:
             client.peer_data_bytes += max(0, int(payload_len))
         return client
 
+    def _record_slow_peer_data_delivery(
+        self,
+        *,
+        sender_client_id: int,
+        recipient: NativeRouteClientState,
+        payload_len: int,
+        elapsed_seconds: float,
+    ) -> None:
+        threshold_seconds = max(0.0, float(SLOW_PEER_DATA_DELIVERY_THRESHOLD_SECONDS))
+        if elapsed_seconds < threshold_seconds:
+            return
+        elapsed_ms = max(1, int(round(max(0.0, elapsed_seconds) * 1000.0)))
+        previous_slowest_ms = int(recipient.slowest_peer_data_send_ms)
+        recipient.slow_peer_data_events += 1
+        recipient.last_slow_peer_data_send_ms = elapsed_ms
+        recipient.last_slow_peer_data_at = time.time()
+        if elapsed_ms > previous_slowest_ms:
+            recipient.slowest_peer_data_send_ms = elapsed_ms
+
+        now_monotonic = time.monotonic()
+        should_log = (
+            recipient.last_slow_peer_data_log_at <= 0.0
+            or (now_monotonic - recipient.last_slow_peer_data_log_at)
+            >= max(0.0, float(SLOW_PEER_DATA_LOG_COOLDOWN_SECONDS))
+            or elapsed_ms > previous_slowest_ms
+        )
+        if not should_log:
+            return
+
+        recipient.last_slow_peer_data_log_at = now_monotonic
+        sender_name = ""
+        sender = self._native_clients.get(int(sender_client_id))
+        if sender is not None:
+            sender_name = str(sender.client_name)
+        LOGGER.warning(
+            "Routing(native): slow peer-data delivery sender_id=%d sender_name=%r recipient_id=%d recipient_name=%r elapsed_ms=%d payload_len=%d room_port=%s",
+            int(sender_client_id),
+            sender_name,
+            recipient.client_id,
+            recipient.client_name,
+            elapsed_ms,
+            max(0, int(payload_len)),
+            self.listen_port,
+        )
+
     def _recent_published_game_activity(
         self,
         now: float,
@@ -818,14 +880,22 @@ class SilencerRoutingServer:
                     "connected_seconds": int(max(0.0, now - client.connected_at)),
                     "last_activity_at": client.last_activity_at,
                     "idle_seconds": int(max(0.0, now - client.last_activity_at)),
-                    "last_activity_kind": client.last_activity_kind,
-                    "chat_count": client.chat_count,
-                    "peer_data_messages": client.peer_data_messages,
-                    "peer_data_bytes": client.peer_data_bytes,
-                    "subscription_count": len(client.subscriptions),
-                    "subscriptions": [
-                        {
-                            "link_id": sub.link_id,
+                      "last_activity_kind": client.last_activity_kind,
+                      "chat_count": client.chat_count,
+                      "peer_data_messages": client.peer_data_messages,
+                      "peer_data_bytes": client.peer_data_bytes,
+                      "slow_peer_data_events": client.slow_peer_data_events,
+                      "slowest_peer_data_send_ms": client.slowest_peer_data_send_ms,
+                      "last_slow_peer_data_send_ms": client.last_slow_peer_data_send_ms,
+                      "seconds_since_last_slow_peer_data": (
+                          max(0, int(now - client.last_slow_peer_data_at))
+                          if client.last_slow_peer_data_at > 0.0
+                          else None
+                      ),
+                      "subscription_count": len(client.subscriptions),
+                      "subscriptions": [
+                          {
+                              "link_id": sub.link_id,
                             "data_type_hex": sub.data_type.hex(),
                             "data_type_text": _decode_routing_data_type(sub.data_type),
                             "exact_or_recursive": sub.exact_or_recursive,
@@ -841,6 +911,13 @@ class SilencerRoutingServer:
         )
         room_peer_data_bytes = sum(
             int(client["peer_data_bytes"]) for client in clients
+        )
+        room_slow_peer_data_events = sum(
+            int(client["slow_peer_data_events"]) for client in clients
+        )
+        room_slowest_peer_data_send_ms = max(
+            (int(client["slowest_peer_data_send_ms"]) for client in clients),
+            default=0,
         )
 
         games = []
@@ -882,12 +959,20 @@ class SilencerRoutingServer:
                     "client_name": reservation.client_name,
                     "client_ip": reservation.client_ip,
                     "reserved_at": reservation.reserved_at,
-                    "seconds_remaining": max(0, int(reservation.expires_at - now)),
-                    "last_activity_kind": reservation.last_activity_kind,
-                    "peer_data_messages": reservation.peer_data_messages,
-                    "peer_data_bytes": reservation.peer_data_bytes,
-                }
-            )
+                      "seconds_remaining": max(0, int(reservation.expires_at - now)),
+                      "last_activity_kind": reservation.last_activity_kind,
+                      "peer_data_messages": reservation.peer_data_messages,
+                      "peer_data_bytes": reservation.peer_data_bytes,
+                      "slow_peer_data_events": reservation.slow_peer_data_events,
+                      "slowest_peer_data_send_ms": reservation.slowest_peer_data_send_ms,
+                      "last_slow_peer_data_send_ms": reservation.last_slow_peer_data_send_ms,
+                      "seconds_since_last_slow_peer_data": (
+                          max(0, int(now - reservation.last_slow_peer_data_at))
+                          if reservation.last_slow_peer_data_at > 0.0
+                          else None
+                      ),
+                  }
+              )
 
         active_participant_count = len(clients) + len(pending_reconnects)
         is_game_room = bool(
@@ -927,13 +1012,15 @@ class SilencerRoutingServer:
             "client_names": [client["client_name"] for client in clients],
             "clients": clients,
             "game_count": len(games),
-            "games": games,
-            "peer_data_messages": room_peer_data_messages,
-            "peer_data_bytes": room_peer_data_bytes,
-            "seconds_since_last_peer_data": (
-                max(0, int(now - self._last_peer_data_at))
-                if self._last_peer_data_at > 0.0
-                else None
+              "games": games,
+              "peer_data_messages": room_peer_data_messages,
+              "peer_data_bytes": room_peer_data_bytes,
+              "slow_peer_data_events": room_slow_peer_data_events,
+              "slowest_peer_data_send_ms": room_slowest_peer_data_send_ms,
+              "seconds_since_last_peer_data": (
+                  max(0, int(now - self._last_peer_data_at))
+                  if self._last_peer_data_at > 0.0
+                  else None
             ),
             "data_object_count": len(data_objects),
             "data_objects": data_objects,
@@ -1061,7 +1148,14 @@ class SilencerRoutingServer:
         delivered = 0
         for client in targets:
             try:
+                send_started_at = time.perf_counter()
                 await self._send_native_route_client_reply(client, peer_data)
+                self._record_slow_peer_data_delivery(
+                    sender_client_id=int(sender_client_id),
+                    recipient=client,
+                    payload_len=len(bytes(data or b"")),
+                    elapsed_seconds=(time.perf_counter() - send_started_at),
+                )
                 delivered += 1
             except Exception as exc:
                 LOGGER.warning(
@@ -1495,6 +1589,31 @@ class SilencerRoutingServer:
                                 reconnect.peer_data_bytes
                                 if reconnect is not None
                                 else 0
+                            ),
+                            slow_peer_data_events=(
+                                reconnect.slow_peer_data_events
+                                if reconnect is not None
+                                else 0
+                            ),
+                            slowest_peer_data_send_ms=(
+                                reconnect.slowest_peer_data_send_ms
+                                if reconnect is not None
+                                else 0
+                            ),
+                            last_slow_peer_data_send_ms=(
+                                reconnect.last_slow_peer_data_send_ms
+                                if reconnect is not None
+                                else 0
+                            ),
+                            last_slow_peer_data_at=(
+                                reconnect.last_slow_peer_data_at
+                                if reconnect is not None
+                                else 0.0
+                            ),
+                            last_slow_peer_data_log_at=(
+                                reconnect.last_slow_peer_data_log_at
+                                if reconnect is not None
+                                else 0.0
                             ),
                             subscriptions=(
                                 [
@@ -2033,6 +2152,11 @@ class SilencerRoutingServer:
                             chat_count=int(reconnect.chat_count),
                             peer_data_messages=int(reconnect.peer_data_messages),
                             peer_data_bytes=int(reconnect.peer_data_bytes),
+                            slow_peer_data_events=int(reconnect.slow_peer_data_events),
+                            slowest_peer_data_send_ms=int(reconnect.slowest_peer_data_send_ms),
+                            last_slow_peer_data_send_ms=int(reconnect.last_slow_peer_data_send_ms),
+                            last_slow_peer_data_at=float(reconnect.last_slow_peer_data_at),
+                            last_slow_peer_data_log_at=float(reconnect.last_slow_peer_data_log_at),
                             subscriptions=[
                                 NativeRouteSubscription(
                                     link_id=sub.link_id,
@@ -2346,14 +2470,20 @@ class RoutingServerManager:
                     "client_ip": client.get("client_ip"),
                     "chat_count": client.get("chat_count", 0),
                     "connected_seconds": client.get("connected_seconds", 0),
-                    "idle_seconds": client.get("idle_seconds", 0),
-                    "last_activity_kind": client.get("last_activity_kind", ""),
-                    "subscription_count": client.get("subscription_count", 0),
-                    "peer_data_messages": client.get("peer_data_messages", 0),
-                    "peer_data_bytes": client.get("peer_data_bytes", 0),
-                    "room_port": room.get("listen_port"),
-                    "room_name": room.get("room_display_name"),
-                    "room_is_game": room_is_game,
+                      "idle_seconds": client.get("idle_seconds", 0),
+                      "last_activity_kind": client.get("last_activity_kind", ""),
+                      "subscription_count": client.get("subscription_count", 0),
+                      "peer_data_messages": client.get("peer_data_messages", 0),
+                      "peer_data_bytes": client.get("peer_data_bytes", 0),
+                      "slow_peer_data_events": client.get("slow_peer_data_events", 0),
+                      "slowest_peer_data_send_ms": client.get("slowest_peer_data_send_ms", 0),
+                      "last_slow_peer_data_send_ms": client.get("last_slow_peer_data_send_ms", 0),
+                      "seconds_since_last_slow_peer_data": client.get(
+                          "seconds_since_last_slow_peer_data"
+                      ),
+                      "room_port": room.get("listen_port"),
+                      "room_name": room.get("room_display_name"),
+                      "room_is_game": room_is_game,
                     "room_path": room.get("room_path"),
                     "room_password_set": room.get("room_password_set", False),
                 }
@@ -2382,12 +2512,14 @@ class RoutingServerManager:
                     "room_flags": room.get("room_flags", 0),
                     "player_count": len(room_players),
                     "is_game_room": room_is_game,
-                    "active_game_count": room.get("active_game_count", 1 if room_is_game else 0),
-                    "peer_data_messages": room.get("peer_data_messages", 0),
-                    "peer_data_bytes": room.get("peer_data_bytes", 0),
-                    "players": room_players,
-                    "game_count": len(room_games),
-                    "games": room_games,
+                      "active_game_count": room.get("active_game_count", 1 if room_is_game else 0),
+                      "peer_data_messages": room.get("peer_data_messages", 0),
+                      "peer_data_bytes": room.get("peer_data_bytes", 0),
+                      "slow_peer_data_events": room.get("slow_peer_data_events", 0),
+                      "slowest_peer_data_send_ms": room.get("slowest_peer_data_send_ms", 0),
+                      "players": room_players,
+                      "game_count": len(room_games),
+                      "games": room_games,
                 }
             )
 
