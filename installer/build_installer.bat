@@ -34,8 +34,11 @@ if errorlevel 1 exit /b %errorlevel%
   /win32manifest:"%SCRIPT_DIR%hwclient_setup.manifest" ^
   /reference:System.Windows.Forms.dll ^
   /reference:System.Drawing.dll ^
+  /reference:System.IO.Compression.dll ^
+  /reference:System.IO.Compression.FileSystem.dll ^
   "%ASSEMBLY_INFO%" ^
   "%SCRIPT_DIR%retail_cdkey.cs" ^
+  "%SCRIPT_DIR%hwclient_setup_maps.cs" ^
   "%SCRIPT_DIR%hwclient_setup.cs"
 
 set "BUILD_EXIT=%ERRORLEVEL%"
