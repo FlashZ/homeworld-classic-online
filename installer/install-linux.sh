@@ -8,9 +8,13 @@ GAME=""
 GAME_DIR=""
 WINE_PREFIX="${WINEPREFIX:-}"
 SERVER=""
+WINE_BIN="${WON_INSTALLER_WINE:-wine}"
+PYTHON_BIN="${WON_INSTALLER_PYTHON:-python3}"
 INSTALL_MAPS=0
 SKIP_REGISTRY=0
 NON_INTERACTIVE=0
+FORCE_NEW_KEY=0
+KEEP_KEY=0
 
 usage() {
   cat <<'EOF'
@@ -48,12 +52,17 @@ while [[ $# -gt 0 ]]; do
     --install-maps) INSTALL_MAPS=1; shift ;;
     --skip-maps) INSTALL_MAPS=0; shift ;;
     --skip-registry) SKIP_REGISTRY=1; shift ;;
-    --force-new-key|--keep-key) shift ;;
+    --force-new-key) FORCE_NEW_KEY=1; shift ;;
+    --keep-key) KEEP_KEY=1; shift ;;
     --non-interactive) NON_INTERACTIVE=1; shift ;;
     --help) usage; exit 0 ;;
     *) die "Unknown option: $1" ;;
   esac
 done
+
+if [[ "$FORCE_NEW_KEY" -eq 1 && "$KEEP_KEY" -eq 1 ]]; then
+  die "Use only one of --force-new-key or --keep-key"
+fi
 
 product_name() {
   case "$1" in
@@ -102,6 +111,79 @@ CONNECT_TIMEOUT 8000
 EOF
 }
 
+generate_key_json() {
+  local product="$1"
+  if [[ -n "${WON_INSTALLER_KEY_JSON:-}" ]]; then
+    printf '%s\n' "$WON_INSTALLER_KEY_JSON"
+    return
+  fi
+  "$PYTHON_BIN" "$REPO_ROOT/generate_cdkeys.py" --product "$product" --count 1 --format json
+}
+
+json_field() {
+  local field="$1"
+  "$PYTHON_BIN" -c 'import json, sys; print(json.load(sys.stdin)[0][sys.argv[1]])' "$field"
+}
+
+hex_for_reg() {
+  "$PYTHON_BIN" -c 'import sys; value=sys.stdin.read().strip(); print(",".join(value[i:i+2].lower() for i in range(0, len(value), 2)))'
+}
+
+query_existing_key() {
+  local product="$1"
+  local prefix="$2"
+  WINEPREFIX="$prefix" "$WINE_BIN" reg query "HKLM\\Software\\Sierra On-Line\\$product" /v CDKey 2>/dev/null \
+    | awk '/CDKey/ { print $NF; exit }' || true
+}
+
+write_registry_key() {
+  local game="$1"
+  local prefix="$2"
+  local product
+  product="$(product_name "$game")"
+
+  command -v "$WINE_BIN" >/dev/null 2>&1 || [[ -x "$WINE_BIN" ]] || die "wine was not found. Install Wine or set WON_INSTALLER_WINE."
+
+  local existing_key
+  existing_key="$(query_existing_key "$product" "$prefix")"
+  if [[ -n "$existing_key" && "$FORCE_NEW_KEY" -eq 0 ]]; then
+    if [[ "$KEEP_KEY" -eq 1 || "$NON_INTERACTIVE" -eq 1 ]]; then
+      echo "Keeping detected $product CD key: $existing_key"
+      return
+    fi
+
+    echo "Detected $product CD key: $existing_key"
+    read -r -p "Replace it with a generated key? [y/N] " answer
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) echo "Keeping detected $product CD key: $existing_key"; return ;;
+    esac
+  fi
+
+  local key_json display plain encrypted_hex encrypted_reg reg_file
+  key_json="$(generate_key_json "$product")"
+  display="$(printf '%s' "$key_json" | json_field display_key)"
+  plain="$(printf '%s' "$key_json" | json_field plain_key)"
+  encrypted_hex="$(printf '%s' "$key_json" | json_field encrypted_key_hex)"
+  encrypted_reg="$(printf '%s' "$encrypted_hex" | hex_for_reg)"
+  reg_file="$(mktemp)"
+
+  cat > "$reg_file" <<EOF
+REGEDIT4
+
+[HKEY_LOCAL_MACHINE\\Software\\WON\\CDKeys]
+"$product"=hex:$encrypted_reg
+
+[HKEY_LOCAL_MACHINE\\Software\\Sierra On-Line\\$product]
+"CDKey"="$plain"
+"${product}OnlineSetupWroteCdKey"=dword:00000001
+EOF
+
+  WINEPREFIX="$prefix" "$WINE_BIN" regedit "$reg_file"
+  rm -f "$reg_file"
+  echo "Wrote generated $product CD key: $display"
+}
+
 install_one_game() {
   local game="$1"
   local dir="$2"
@@ -119,6 +201,9 @@ install_one_game() {
   write_nettweak "$dir" "$host"
   cp "$REPO_ROOT/keys/kver.kp" "$dir/kver.kp"
   echo "Wrote NetTweak.script and kver.kp"
+  if [[ "$SKIP_REGISTRY" -eq 0 ]]; then
+    write_registry_key "$game" "$prefix"
+  fi
 }
 
 [[ -n "$GAME" ]] || die "--game is required"
