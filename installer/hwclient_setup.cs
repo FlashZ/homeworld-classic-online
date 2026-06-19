@@ -1,7 +1,9 @@
 using System;
+using System.ComponentModel;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
@@ -200,6 +202,7 @@ internal static class HWClientSetup
             string[] supportedExecutableNames,
             string[] defaultInstallDirectories,
             string[] retailNetTweakTemplate,
+            string mapPackSourceDirectoryName,
             bool experimentalRegistry,
             string sierraVirtualStoreRegistryPath,
             string sierraVersionSubkeyName)
@@ -218,6 +221,7 @@ internal static class HWClientSetup
             SupportedExecutableNames = supportedExecutableNames;
             DefaultInstallDirectories = defaultInstallDirectories;
             RetailNetTweakTemplate = retailNetTweakTemplate;
+            MapPackSourceDirectoryName = mapPackSourceDirectoryName;
             ExperimentalRegistry = experimentalRegistry;
             SierraVirtualStoreRegistryPath = sierraVirtualStoreRegistryPath;
             SierraVersionSubkeyName = sierraVersionSubkeyName;
@@ -237,6 +241,7 @@ internal static class HWClientSetup
         public string[] SupportedExecutableNames { get; private set; }
         public string[] DefaultInstallDirectories { get; private set; }
         public string[] RetailNetTweakTemplate { get; private set; }
+        public string MapPackSourceDirectoryName { get; private set; }
         public bool ExperimentalRegistry { get; private set; }
         public string SierraVirtualStoreRegistryPath { get; private set; }
         public string SierraVersionSubkeyName { get; private set; }
@@ -276,6 +281,7 @@ internal static class HWClientSetup
             @"C:\Sierra\Homeworld",
         },
         retailNetTweakTemplate: HomeworldRetailNetTweakTemplate,
+        mapPackSourceDirectoryName: MapPackInstaller.HomeworldSourceDirectoryName,
         experimentalRegistry: false,
         sierraVirtualStoreRegistryPath: null,
         sierraVersionSubkeyName: null
@@ -307,6 +313,7 @@ internal static class HWClientSetup
             @"C:\GOG Games\Homeworld Cataclysm",
         },
         retailNetTweakTemplate: CataclysmRetailNetTweakTemplate,
+        mapPackSourceDirectoryName: MapPackInstaller.CataclysmSourceDirectoryName,
         experimentalRegistry: true,
         sierraVirtualStoreRegistryPath: @"SOFTWARE\Classes\VirtualStore\MACHINE\SOFTWARE\WOW6432Node\Sierra On-Line\Cataclysm",
         sierraVersionSubkeyName: "1.0.0.0"
@@ -415,7 +422,12 @@ internal static class HWClientSetup
                 ? gameDirectory
                 : installChoices.GameDirectory.Trim();
 
-            results.Add(Install(gameDirectory, installChoices.ServerHost, installChoices.WriteRegistryKeys, installChoices.RegistryCdKey));
+            results.Add(InstallWithMapPackProgress(
+                gameDirectory,
+                installChoices.ServerHost,
+                installChoices.WriteRegistryKeys,
+                installChoices.RegistryCdKey,
+                installChoices.InstallMaps));
         }
 
         MessageBox.Show(
@@ -427,7 +439,123 @@ internal static class HWClientSetup
             MessageBoxIcon.Information);
     }
 
-    private static InstallResult Install(string gameDirectory, string serverHost, bool writeRegistryKeys, RegistryCdKeyOption registryCdKey)
+    private static InstallResult InstallWithMapPackProgress(string gameDirectory, string serverHost, bool writeRegistryKeys, RegistryCdKeyOption registryCdKey, bool installMaps)
+    {
+        if (!installMaps)
+        {
+            return Install(gameDirectory, serverHost, writeRegistryKeys, registryCdKey, false, null);
+        }
+
+        using (Form progressForm = new Form())
+        using (Label stageLabel = new Label())
+        using (ProgressBar progressBar = new ProgressBar())
+        using (Label detailLabel = new Label())
+        using (BackgroundWorker worker = new BackgroundWorker())
+        {
+            InstallResult installResult = null;
+            Exception installError = null;
+
+            progressForm.Text = "Installing Community Maps";
+            progressForm.FormBorderStyle = FormBorderStyle.FixedDialog;
+            progressForm.StartPosition = FormStartPosition.CenterScreen;
+            progressForm.ClientSize = new Size(420, 136);
+            progressForm.MinimizeBox = false;
+            progressForm.MaximizeBox = false;
+            progressForm.ControlBox = false;
+            progressForm.Font = SystemFonts.MessageBoxFont;
+
+            stageLabel.Location = new Point(15, 16);
+            stageLabel.Size = new Size(390, 22);
+            stageLabel.Text = "Preparing community maps...";
+
+            progressBar.Location = new Point(15, 48);
+            progressBar.Size = new Size(390, 22);
+            progressBar.Minimum = 0;
+            progressBar.Maximum = 100;
+
+            detailLabel.Location = new Point(15, 82);
+            detailLabel.Size = new Size(390, 38);
+            detailLabel.ForeColor = SystemColors.GrayText;
+            detailLabel.Text = "Downloading from FlashZ/Homeworld_Map_Collection.";
+
+            progressForm.Controls.Add(stageLabel);
+            progressForm.Controls.Add(progressBar);
+            progressForm.Controls.Add(detailLabel);
+
+            Action<MapPackProgress> progress = delegate(MapPackProgress update)
+            {
+                if (update == null)
+                {
+                    return;
+                }
+                try
+                {
+                    if (progressForm.IsHandleCreated && !progressForm.IsDisposed)
+                    {
+                        progressForm.BeginInvoke((MethodInvoker)delegate
+                        {
+                            ApplyMapPackProgress(update, stageLabel, progressBar, detailLabel);
+                        });
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            };
+
+            worker.DoWork += delegate(object sender, DoWorkEventArgs e)
+            {
+                e.Result = Install(gameDirectory, serverHost, writeRegistryKeys, registryCdKey, true, progress);
+            };
+            worker.RunWorkerCompleted += delegate(object sender, RunWorkerCompletedEventArgs e)
+            {
+                installError = e.Error;
+                installResult = e.Result as InstallResult;
+                progressForm.DialogResult = installError == null ? DialogResult.OK : DialogResult.Abort;
+                progressForm.Close();
+            };
+            progressForm.Shown += delegate
+            {
+                worker.RunWorkerAsync();
+            };
+
+            progressForm.ShowDialog();
+            if (installError != null)
+            {
+                throw installError;
+            }
+            return installResult;
+        }
+    }
+
+    private static void ApplyMapPackProgress(MapPackProgress progress, Label stageLabel, ProgressBar progressBar, Label detailLabel)
+    {
+        stageLabel.Text = string.IsNullOrWhiteSpace(progress.Stage)
+            ? "Installing community maps..."
+            : progress.Stage;
+        progressBar.Value = ClampPercent(progress.Percent);
+        detailLabel.Text = string.IsNullOrWhiteSpace(progress.Detail)
+            ? string.Empty
+            : progress.Detail;
+    }
+
+    private static int ClampPercent(int percent)
+    {
+        if (percent < 0)
+        {
+            return 0;
+        }
+        if (percent > 100)
+        {
+            return 100;
+        }
+        return percent;
+    }
+
+    private static InstallResult Install(string gameDirectory, string serverHost, bool writeRegistryKeys, RegistryCdKeyOption registryCdKey, bool installMaps, Action<MapPackProgress> mapProgress)
     {
         EnsureSelectedGameDirectory(gameDirectory);
         RegistryWriteResult registryWriteResult = null;
@@ -438,6 +566,9 @@ internal static class HWClientSetup
         BackupNetTweak(gameDirectory);
         WriteNetTweak(gameDirectory, serverHost);
         WriteFileBytes(Path.Combine(gameDirectory, "kver.kp"), EmbeddedKver, "kver.kp");
+        MapPackInstallResult mapPackResult = installMaps
+            ? InstallMapPack(gameDirectory, mapProgress)
+            : null;
 
         return new InstallResult
         {
@@ -445,7 +576,70 @@ internal static class HWClientSetup
             GameDirectory = Path.GetFullPath(gameDirectory),
             ServerHost = serverHost,
             RegistryWrite = registryWriteResult,
+            MapPack = mapPackResult,
         };
+    }
+
+    private static MapPackInstallResult InstallMapPack(string gameDirectory, Action<MapPackProgress> progress)
+    {
+        string normalizedGameDirectory = Path.GetFullPath(gameDirectory);
+        string destinationDirectory = Path.Combine(normalizedGameDirectory, "MultiPlayer");
+        string tempRoot = Path.Combine(Path.GetTempPath(), "RetailWONMaps-" + Guid.NewGuid().ToString("N"));
+        string archivePath = Path.Combine(tempRoot, "maps.zip");
+        string extractedPath = Path.Combine(tempRoot, "extracted");
+
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            ReportMapPackProgress(progress, "Preparing community maps", 0, "Creating temporary download folder.");
+            MapPackInstaller.DownloadArchive(MapPackInstaller.RepositoryArchiveUrl, archivePath, progress);
+            ReportMapPackProgress(progress, "Extracting community maps", 0, "Unpacking downloaded archive.");
+            Directory.CreateDirectory(extractedPath);
+            ZipFile.ExtractToDirectory(archivePath, extractedPath);
+            return MapPackInstaller.CopyMapsFromExtractedArchive(
+                extractedPath,
+                CurrentGame.MapPackSourceDirectoryName,
+                normalizedGameDirectory,
+                progress);
+        }
+        catch (Exception ex)
+        {
+            ReportMapPackProgress(progress, "Community maps failed", 100, ex.Message);
+            return new MapPackInstallResult
+            {
+                Attempted = true,
+                Succeeded = false,
+                ErrorMessage = ex.Message,
+                DestinationDirectory = destinationDirectory,
+            };
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                {
+                    Directory.Delete(tempRoot, true);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static void ReportMapPackProgress(Action<MapPackProgress> progress, string stage, int percent, string detail)
+    {
+        if (progress == null)
+        {
+            return;
+        }
+        progress(new MapPackProgress
+        {
+            Stage = stage,
+            Percent = percent,
+            Detail = detail,
+        });
     }
 
     private static void Uninstall(string gameDirectory)
@@ -1563,6 +1757,11 @@ internal static class HWClientSetup
             builder.AppendFormat("CD key: {0}", result.RegistryWrite.DisplayCdKey);
             builder.AppendLine();
         }
+        if (result.MapPack != null && result.MapPack.Attempted)
+        {
+            builder.Append(result.MapPack.BuildSummaryLine());
+            builder.AppendLine();
+        }
 
         builder.AppendLine();
         builder.Append("Launch the game normally to play online.");
@@ -1585,6 +1784,12 @@ internal static class HWClientSetup
             if (result.RegistryWrite != null)
             {
                 builder.AppendFormat("  CD key: {0}", result.RegistryWrite.DisplayCdKey);
+                builder.AppendLine();
+            }
+            if (result.MapPack != null && result.MapPack.Attempted)
+            {
+                builder.Append("  ");
+                builder.Append(result.MapPack.BuildSummaryLine());
                 builder.AppendLine();
             }
             builder.AppendLine();
@@ -2138,5 +2343,6 @@ internal static class HWClientSetup
         public string GameDirectory { get; set; }
         public string ServerHost { get; set; }
         public RegistryWriteResult RegistryWrite { get; set; }
+        public MapPackInstallResult MapPack { get; set; }
     }
 }

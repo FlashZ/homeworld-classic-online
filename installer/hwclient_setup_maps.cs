@@ -19,6 +19,29 @@ internal sealed class MapPackInstallResult
     public int CopiedCount { get; set; }
     public int SkippedCount { get; set; }
     public string DestinationDirectory { get; set; }
+
+    public string BuildSummaryLine()
+    {
+        if (!Attempted)
+        {
+            return "Community maps: not selected.";
+        }
+
+        if (!Succeeded)
+        {
+            string error = string.IsNullOrWhiteSpace(ErrorMessage)
+                ? "unknown error"
+                : ErrorMessage;
+            return "Community maps: failed - " + error + ".";
+        }
+
+        string summary = "Community maps: copied " + CopiedCount + ", skipped " + SkippedCount + " existing";
+        if (!string.IsNullOrWhiteSpace(DestinationDirectory))
+        {
+            summary += " in " + DestinationDirectory;
+        }
+        return summary + ".";
+    }
 }
 
 internal static class MapPackInstaller
@@ -26,6 +49,7 @@ internal static class MapPackInstaller
     public const string RepositoryArchiveUrl = "https://github.com/FlashZ/Homeworld_Map_Collection/archive/refs/heads/main.zip";
     public const string HomeworldSourceDirectoryName = "HW1_maps";
     public const string CataclysmSourceDirectoryName = "CATA_maps";
+    private const SecurityProtocolType Tls12 = (SecurityProtocolType)3072;
 
     public static MapPackInstallResult CopyMapsFromExtractedArchive(
         string extractedArchiveDirectory,
@@ -104,6 +128,14 @@ internal static class MapPackInstaller
 
     public static void DownloadArchive(string url, string destinationPath, Action<MapPackProgress> progress)
     {
+        try
+        {
+            ServicePointManager.SecurityProtocol = ServicePointManager.SecurityProtocol | Tls12;
+        }
+        catch (NotSupportedException)
+        {
+        }
+
         using (WebClient client = new WebClient())
         {
             client.DownloadProgressChanged += delegate(object sender, DownloadProgressChangedEventArgs e)

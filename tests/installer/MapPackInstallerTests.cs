@@ -13,6 +13,7 @@ internal static class MapPackInstallerTests
         CdKeyChoiceDefaultsPreferKeepingPlayerOwnedKeys();
         CdKeyChoiceDefaultsReplaceInstallerOwnedKeys();
         DetectedCdKeyTextExplainsPlayerOwnedDefault();
+        MapPackSummaryReportsCopiedAndSkippedMaps();
 
         if (failures > 0)
         {
@@ -129,6 +130,24 @@ internal static class MapPackInstallerTests
         AssertTrue(text.Contains("KAY9-2MJT-8P3D-R4FW-7192"), "mentions detected key");
         AssertTrue(text.Contains("player-owned"), "explains player-owned key");
         AssertTrue(text.Contains("keeping it is the default"), "explains default action");
+    }
+
+    private static void MapPackSummaryReportsCopiedAndSkippedMaps()
+    {
+        MapPackInstallResult result = new MapPackInstallResult
+        {
+            Attempted = true,
+            Succeeded = true,
+            CopiedCount = 12,
+            SkippedCount = 3,
+            DestinationDirectory = @"C:\Games\Homeworld\MultiPlayer",
+        };
+
+        string text = result.BuildSummaryLine();
+
+        AssertTrue(text.Contains("copied 12"), "mentions copied maps");
+        AssertTrue(text.Contains("skipped 3"), "mentions skipped maps");
+        AssertTrue(text.Contains(@"C:\Games\Homeworld\MultiPlayer"), "mentions destination");
     }
 
     private static string CreateTempRoot()
