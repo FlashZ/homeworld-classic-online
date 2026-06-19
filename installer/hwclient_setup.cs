@@ -384,8 +384,10 @@ internal static class HWClientSetup
             }
 
             ExistingInstallState existingState = DetectExistingInstallState(gameDirectory);
-            bool shouldRefreshInstallerOwnedKey = existingState.HasAnyRegistryCdKey && existingState.ShouldRefreshRegistryKeyByDefault;
-            bool defaultWriteRegistryKeys = options.WriteRegistryKeys ?? (!existingState.HasAnyRegistryCdKey || shouldRefreshInstallerOwnedKey);
+            RegistryCdKeyAction defaultRegistryAction = options.WriteRegistryKeys.HasValue
+                ? (options.WriteRegistryKeys.Value ? RegistryCdKeyAction.WriteGenerated : RegistryCdKeyAction.KeepExisting)
+                : PickDefaultRegistryCdKeyAction(existingState);
+            bool defaultWriteRegistryKeys = defaultRegistryAction == RegistryCdKeyAction.WriteGenerated;
 
             // Generate a unique random key by default so users don't all share the
             // same hardcoded key.  The known-good default is only used as a self-test
@@ -399,7 +401,7 @@ internal static class HWClientSetup
                 {
                     ServerHost = options.ServerHost.Trim(),
                     GameDirectory = gameDirectory,
-                    WriteRegistryKeys = defaultWriteRegistryKeys,
+                    RegistryCdKeyAction = defaultRegistryAction,
                     RegistryCdKey = initialCdKey,
                 };
 
@@ -1436,6 +1438,26 @@ internal static class HWClientSetup
         return "Writes " + selectedCdKey.DisplayCdKey + " to the Sierra and WON registry entries for stock " + CurrentGame.DisplayName + " login.";
     }
 
+    private static RegistryCdKeyAction PickDefaultRegistryCdKeyAction(ExistingInstallState state)
+    {
+        return RegistryCdKeyActionPolicy.PickDefaultAction(ToRegistryCdKeyState(state));
+    }
+
+    private static RegistryCdKeyState ToRegistryCdKeyState(ExistingInstallState state)
+    {
+        if (state == null)
+        {
+            return null;
+        }
+        return new RegistryCdKeyState
+        {
+            HasAnyRegistryCdKey = state.HasAnyRegistryCdKey,
+            RegistryOwnedByInstaller = state.RegistryOwnedByInstaller,
+            RegistryUsesLegacySharedDefault = state.RegistryUsesLegacySharedDefault,
+            SierraCdKeyDisplay = state.SierraCdKeyDisplay,
+        };
+    }
+
     private static string BuildExistingRegistryPrompt(ExistingInstallState existingState, RegistryCdKeyOption selectedCdKey)
     {
         StringBuilder prompt = new StringBuilder();
@@ -1844,21 +1866,6 @@ internal static class HWClientSetup
                     return;
                 }
 
-                if (registryCheckBox.Checked && selectedInstallState.HasAnyRegistryCdKey && !selectedInstallState.ShouldRefreshRegistryKeyByDefault)
-                {
-                    DialogResult overwriteResult = MessageBox.Show(
-                        form,
-                        BuildExistingRegistryPrompt(selectedInstallState, selectedCdKey),
-                        CurrentGame.WindowTitle,
-                        MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Warning);
-
-                    if (overwriteResult == DialogResult.No)
-                    {
-                        registryCheckBox.Checked = false;
-                    }
-                }
-
                 form.DialogResult = DialogResult.OK;
                 form.Close();
             };
@@ -1887,7 +1894,9 @@ internal static class HWClientSetup
             {
                 GameDirectory = selectedGameDirectory,
                 ServerHost = serverHost,
-                WriteRegistryKeys = registryCheckBox.Checked,
+                RegistryCdKeyAction = registryCheckBox.Checked
+                    ? RegistryCdKeyAction.WriteGenerated
+                    : RegistryCdKeyAction.KeepExisting,
                 RegistryCdKey = selectedCdKey,
             };
         }
@@ -1980,8 +1989,13 @@ internal static class HWClientSetup
     {
         public string GameDirectory { get; set; }
         public string ServerHost { get; set; }
-        public bool WriteRegistryKeys { get; set; }
+        public RegistryCdKeyAction RegistryCdKeyAction { get; set; }
         public RegistryCdKeyOption RegistryCdKey { get; set; }
+
+        public bool WriteRegistryKeys
+        {
+            get { return RegistryCdKeyAction == RegistryCdKeyAction.WriteGenerated; }
+        }
     }
 
     private sealed class RegistryCdKeyOption

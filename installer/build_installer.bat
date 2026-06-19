@@ -38,6 +38,7 @@ if errorlevel 1 exit /b %errorlevel%
   /reference:System.IO.Compression.FileSystem.dll ^
   "%ASSEMBLY_INFO%" ^
   "%SCRIPT_DIR%retail_cdkey.cs" ^
+  "%SCRIPT_DIR%hwclient_setup_choices.cs" ^
   "%SCRIPT_DIR%hwclient_setup_maps.cs" ^
   "%SCRIPT_DIR%hwclient_setup.cs"
 

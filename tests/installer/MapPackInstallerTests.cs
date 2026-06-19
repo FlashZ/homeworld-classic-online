@@ -10,6 +10,8 @@ internal static class MapPackInstallerTests
         CopiesOnlyMatchingGameMaps();
         SkipsExistingMapFolders();
         ReportsMissingSourceDirectory();
+        CdKeyChoiceDefaultsPreferKeepingPlayerOwnedKeys();
+        CdKeyChoiceDefaultsReplaceInstallerOwnedKeys();
 
         if (failures > 0)
         {
@@ -79,6 +81,36 @@ internal static class MapPackInstallerTests
         {
             AssertTrue(ex.Message.Contains("HW1_maps"), "mentions missing source directory");
         }
+    }
+
+    private static void CdKeyChoiceDefaultsPreferKeepingPlayerOwnedKeys()
+    {
+        RegistryCdKeyState state = new RegistryCdKeyState
+        {
+            HasAnyRegistryCdKey = true,
+            SierraCdKeyDisplay = "KAY9-2MJT-8P3D-R4FW-7192",
+            RegistryOwnedByInstaller = false,
+            RegistryUsesLegacySharedDefault = false,
+        };
+
+        RegistryCdKeyAction action = RegistryCdKeyActionPolicy.PickDefaultAction(state);
+
+        AssertEqual(RegistryCdKeyAction.KeepExisting, action, "player-owned default action");
+    }
+
+    private static void CdKeyChoiceDefaultsReplaceInstallerOwnedKeys()
+    {
+        RegistryCdKeyState state = new RegistryCdKeyState
+        {
+            HasAnyRegistryCdKey = true,
+            SierraCdKeyDisplay = "NYX7-ZEC9-FYZ6-GUX8-4253",
+            RegistryOwnedByInstaller = true,
+            RegistryUsesLegacySharedDefault = false,
+        };
+
+        RegistryCdKeyAction action = RegistryCdKeyActionPolicy.PickDefaultAction(state);
+
+        AssertEqual(RegistryCdKeyAction.WriteGenerated, action, "installer-owned default action");
     }
 
     private static string CreateTempRoot()
