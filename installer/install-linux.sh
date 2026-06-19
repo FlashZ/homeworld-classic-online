@@ -10,6 +10,7 @@ WINE_PREFIX="${WINEPREFIX:-}"
 SERVER=""
 WINE_BIN="${WON_INSTALLER_WINE:-wine}"
 PYTHON_BIN="${WON_INSTALLER_PYTHON:-python3}"
+MAP_ARCHIVE_URL="https://github.com/FlashZ/Homeworld_Map_Collection/archive/refs/heads/main.zip"
 INSTALL_MAPS=0
 SKIP_REGISTRY=0
 NON_INTERACTIVE=0
@@ -87,6 +88,14 @@ supported_exe_exists() {
     homeworld) [[ -f "$dir/Homeworld.exe" ]] ;;
     cataclysm) [[ -f "$dir/Cataclysm.exe" || -f "$dir/HomeworldCataclysm.exe" || -f "$dir/Homeworld.exe" ]] ;;
     *) return 1 ;;
+  esac
+}
+
+map_source_dir_name() {
+  case "$1" in
+    homeworld) echo "HW1_maps" ;;
+    cataclysm) echo "CATA_maps" ;;
+    *) die "Unknown game: $1" ;;
   esac
 }
 
@@ -184,6 +193,70 @@ EOF
   echo "Wrote generated $product CD key: $display"
 }
 
+download_maps() {
+  local destination="$1"
+  if [[ -n "${WON_INSTALLER_MAP_ARCHIVE:-}" ]]; then
+    cp "$WON_INSTALLER_MAP_ARCHIVE" "$destination"
+    return
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -L --progress-bar "$MAP_ARCHIVE_URL" -o "$destination"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --show-progress -O "$destination" "$MAP_ARCHIVE_URL"
+  else
+    die "curl or wget is required to download community maps."
+  fi
+}
+
+install_maps() {
+  local game="$1"
+  local dir="$2"
+  local source_name
+  source_name="$(map_source_dir_name "$game")"
+
+  command -v "$PYTHON_BIN" >/dev/null 2>&1 || [[ -x "$PYTHON_BIN" ]] || die "python3 is required to extract map archives."
+
+  local temp_dir archive source_dir destination copied skipped
+  temp_dir="$(mktemp -d)"
+  archive="$temp_dir/maps.zip"
+  destination="$dir/MultiPlayer"
+  copied=0
+  skipped=0
+
+  echo "Downloading community maps..."
+  download_maps "$archive"
+  "$PYTHON_BIN" - "$archive" "$temp_dir/extract" <<'PY'
+import sys
+import zipfile
+from pathlib import Path
+
+archive = Path(sys.argv[1])
+dest = Path(sys.argv[2])
+dest.mkdir(parents=True, exist_ok=True)
+with zipfile.ZipFile(archive) as zf:
+    zf.extractall(dest)
+PY
+
+  source_dir="$(find "$temp_dir/extract" -type d -name "$source_name" | head -n 1)"
+  [[ -n "$source_dir" ]] || die "Map archive did not contain $source_name."
+  mkdir -p "$destination"
+  while IFS= read -r map_dir; do
+    local target
+    target="$destination/$(basename "$map_dir")"
+    if [[ -e "$target" ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    cp -R "$map_dir" "$target"
+    copied=$((copied + 1))
+    echo "Copied $(basename "$map_dir")"
+  done < <(find "$source_dir" -mindepth 1 -maxdepth 1 -type d | sort)
+
+  rm -rf "$temp_dir"
+  echo "Community maps: copied $copied, skipped $skipped existing."
+}
+
 install_one_game() {
   local game="$1"
   local dir="$2"
@@ -203,6 +276,9 @@ install_one_game() {
   echo "Wrote NetTweak.script and kver.kp"
   if [[ "$SKIP_REGISTRY" -eq 0 ]]; then
     write_registry_key "$game" "$prefix"
+  fi
+  if [[ "$INSTALL_MAPS" -eq 1 ]]; then
+    install_maps "$game" "$dir"
   fi
 }
 

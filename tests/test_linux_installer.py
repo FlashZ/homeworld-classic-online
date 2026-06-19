@@ -183,3 +183,41 @@ def test_non_interactive_registry_keeps_detected_key_by_default(tmp_path: Path) 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Keeping detected Homeworld CD key: EXISTINGKEY" in result.stdout
     assert "SHOULD_NOT_IMPORT" not in wine_log.read_text(encoding="utf-8")
+
+
+def test_linux_helper_installs_matching_maps_from_local_archive(tmp_path: Path) -> None:
+    game = _fake_game(tmp_path)
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    archive_root = tmp_path / "map_repo"
+    hw_map = archive_root / "Homeworld_Map_Collection-main" / "HW1_maps" / "Garden2"
+    cata_map = archive_root / "Homeworld_Map_Collection-main" / "CATA_maps" / "CataOnly2"
+    hw_map.mkdir(parents=True)
+    cata_map.mkdir(parents=True)
+    (hw_map / "Garden.level").write_text("homeworld", encoding="utf-8")
+    (cata_map / "Cata.level").write_text("cataclysm", encoding="utf-8")
+    archive = Path(shutil.make_archive(str(tmp_path / "maps"), "zip", archive_root))
+
+    result = _run(
+        [
+            "--game",
+            "homeworld",
+            "--game-dir",
+            _bash_path(game),
+            "--wine-prefix",
+            _bash_path(prefix),
+            "--server",
+            "example.test",
+            "--skip-registry",
+            "--install-maps",
+            "--non-interactive",
+        ],
+        env={
+            "WON_INSTALLER_MAP_ARCHIVE": _bash_path(archive),
+            "WON_INSTALLER_PYTHON": _bash_path(Path(sys.executable)),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (game / "MultiPlayer" / "Garden2" / "Garden.level").read_text(encoding="utf-8") == "homeworld"
+    assert not (game / "MultiPlayer" / "CataOnly2").exists()
