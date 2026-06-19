@@ -12,6 +12,7 @@ internal static class MapPackInstallerTests
         ReportsMissingSourceDirectory();
         CdKeyChoiceDefaultsPreferKeepingPlayerOwnedKeys();
         CdKeyChoiceDefaultsReplaceInstallerOwnedKeys();
+        DetectedCdKeyTextExplainsPlayerOwnedDefault();
 
         if (failures > 0)
         {
@@ -111,6 +112,23 @@ internal static class MapPackInstallerTests
         RegistryCdKeyAction action = RegistryCdKeyActionPolicy.PickDefaultAction(state);
 
         AssertEqual(RegistryCdKeyAction.WriteGenerated, action, "installer-owned default action");
+    }
+
+    private static void DetectedCdKeyTextExplainsPlayerOwnedDefault()
+    {
+        RegistryCdKeyState state = new RegistryCdKeyState
+        {
+            HasAnyRegistryCdKey = true,
+            SierraCdKeyDisplay = "KAY9-2MJT-8P3D-R4FW-7192",
+            RegistryOwnedByInstaller = false,
+            RegistryUsesLegacySharedDefault = false,
+        };
+
+        string text = RegistryCdKeyActionPolicy.BuildDetectedKeyText(state);
+
+        AssertTrue(text.Contains("KAY9-2MJT-8P3D-R4FW-7192"), "mentions detected key");
+        AssertTrue(text.Contains("player-owned"), "explains player-owned key");
+        AssertTrue(text.Contains("keeping it is the default"), "explains default action");
     }
 
     private static string CreateTempRoot()
