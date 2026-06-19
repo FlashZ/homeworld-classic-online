@@ -158,7 +158,7 @@ Swap `homeworld` for `cataclysm` to run the Cataclysm profile instead.
 - The dashboard defaults to `127.0.0.1`.
 - If you bind the dashboard to a non-loopback address, set `--admin-token` and use `?token=...`.
 
-## Rebuilding the Windows Installer
+## Rebuilding and Packaging Installers
 
 Build the installer from source with:
 
@@ -172,6 +172,26 @@ Output:
 
 You can override the output filename with `INSTALLER_OUTPUT_NAME=...`.
 
+The Linux/Wine helper lives at `installer/install-linux.sh`. Release builds package it as `RetailWONSetup-linux-<tag>.zip` with:
+
+- `installer/install-linux.sh`
+- `generate_cdkeys.py`
+- `won_crypto.py`
+- `keys/kver.kp`
+
+The helper can be run from the extracted bundle with:
+
+```bash
+bash installer/install-linux.sh \
+  --game homeworld \
+  --game-dir /path/to/Homeworld \
+  --wine-prefix "$HOME/.wine" \
+  --server your.host.name \
+  --install-maps
+```
+
+It writes `NetTweak.script`, `kver.kp`, and Wine registry CD-key values unless `--skip-registry` is passed. If a CD key is already present, interactive runs ask before replacing it; non-interactive runs keep it unless `--force-new-key` is passed.
+
 ## Self-Hosting with Your Own Keys
 
 The network identity is defined by the verifier/auth key material under `keys/`.
@@ -183,7 +203,7 @@ To run an independent network:
 2. Use a fresh hostname/IP and database.
 3. If using Docker, place your key files in `./data/<product>/keys/` before first startup.
 4. Rebuild the installer with your host and matching `kver.kp`.
-5. Distribute that installer, or manually distribute `kver.kp` plus a matching `NetTweak.script`.
+5. Distribute that installer, the Linux helper bundle, or manually distribute `kver.kp` plus a matching `NetTweak.script`.
 
 Rules to keep straight:
 

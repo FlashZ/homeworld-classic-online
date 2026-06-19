@@ -9,7 +9,7 @@
 
 Open-source online bootstrap for the original retail **Homeworld** and **Homeworld: Cataclysm** clients.
 
-This project gives players a simple Windows installer that points the retail games at a working WON-compatible server, installs the required verifier key, and can write a matching retail-format CD key for online login.
+This project gives players a simple Windows installer and a Linux/Wine helper that point the retail games at a working WON-compatible server, install the required verifier key, and can write a matching retail-format CD key for online login.
 
 Homeworld Remastered Classic is not supported.
 
@@ -27,14 +27,16 @@ This is also an unofficial fan project. It is not affiliated with, endorsed by, 
 
 Download the latest installer from [GitHub Releases](https://github.com/FlashZ/won_oss_server/releases).
 
-### Quick install
+### Windows quick install
 
 1. Download `RetailWONSetup.exe`.
 2. Right-click it and choose `Run as administrator`.
 3. Let it detect your Homeworld and/or Cataclysm install.
 4. If you have both games installed, you can configure both in one run.
 5. Confirm the detected install folder for each game.
-6. Finish the setup, then launch the game normally.
+6. Keep the detected CD key, or replace it with a generated one.
+7. Optionally install the community map pack.
+8. Finish the setup, then launch the game normally.
 
 The installer can:
 
@@ -43,9 +45,31 @@ The installer can:
 - let you change that folder if it found the wrong copy
 - update `NetTweak.script` to point at your server
 - install the matching `kver.kp` verifier key
+- show detected CD keys and let you keep or replace them
 - optionally write a randomized retail CD key for the selected game
+- optionally download community multiplayer maps from `FlashZ/Homeworld_Map_Collection`
 
-No Python is required on the client machine.
+No Python is required for the Windows installer.
+
+### Linux / Wine / Proton
+
+Linux players hosting or running the retail Windows games under Wine or Proton can use the release Linux helper bundle.
+
+1. Download `RetailWONSetup-linux-....zip` from GitHub Releases.
+2. Extract it.
+3. Run the helper from the extracted folder:
+
+```bash
+bash installer/install-linux.sh \
+  --game homeworld \
+  --game-dir "$HOME/Games/Homeworld" \
+  --wine-prefix "$HOME/.wine" \
+  --install-maps
+```
+
+Use `--game cataclysm` for Homeworld: Cataclysm/Emergence. Pass `--server your.host.name` for a private server, `--skip-registry` to avoid Wine registry writes, or `--force-new-key` to replace a detected CD key. The helper writes a generated retail CD key by default when no existing key is found; if it detects one, interactive runs ask before replacing it and `--non-interactive` keeps it unless `--force-new-key` is set.
+
+The Linux helper needs `bash`, `python3`, and either `curl` or `wget` when `--install-maps` downloads the map archive.
 
 ### In Game (Homeworld)
 
@@ -75,6 +99,7 @@ The installer only touches the files and registry values needed for online play:
 - `NetTweak.script`
 - `kver.kp`
 - the Sierra/WON CD key registry values for the selected game, if you leave CD key install enabled
+- community map folders under `MultiPlayer`, if you select the map pack
 
 If an older shared installer key is detected, the current installer now refreshes it to a new random key by default.
 
@@ -85,6 +110,7 @@ GitHub releases include:
 - `RetailWONSetup-....exe`
 - `RetailWONSetup-....exe.sha256`
 - `RetailWONSetup-....exe.VERIFY.txt`
+- `RetailWONSetup-linux-....zip`
 
 If Windows SmartScreen appears, check the file hash first:
 
@@ -132,6 +158,8 @@ Additional technical docs:
 - retail Homeworld 1.05 bootstrap/install flow
 - retail Homeworld: Cataclysm 1.0.0.1 bootstrap/install flow
 - randomized retail-format CD key generation per game
+- optional community multiplayer map installation
+- Linux/Wine/Proton helper setup
 - WON-style Auth1, directory, routing, factory, and firewall services
 - an admin dashboard for live server monitoring
 
