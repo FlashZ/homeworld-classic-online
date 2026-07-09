@@ -954,6 +954,12 @@ class AdminDashboardServer:
       if(!lastMs)return '<span class="muted">-</span>';
       return `${esc(lastMs)}ms${since?` <span class="muted">${esc(since)} ago</span>`:""}`;
     }
+    function writeBufferSummary(row){
+      const size=Number((row&&row.write_buffer_size)||0);
+      const high=Number((row&&row.write_buffer_high_water)||0);
+      if(!size)return '<span class="muted">-</span>';
+      return `${esc(formatBytes(size))}${high?` <span class="muted">/ ${esc(formatBytes(high))} high</span>`:""}`;
+    }
     function displayRoomName(snapshot,roomName,roomPort,isGameRoom=false){
       const gw=snapshot.gateway||{};
       const basePort=Number(gw.routing_port||0);
@@ -1300,8 +1306,10 @@ class AdminDashboardServer:
       const metrics=overallMetrics||productMetrics(snapshot).overall;
       const rooms=rt.servers||[];
       const slowCount=rooms.reduce((sum,room)=>sum+Number(room.slow_peer_data_events||0),0);
+      const bufferCount=rooms.filter(room=>Number(room.largest_write_buffer_size||0)>0).length;
       const items=[];
       if(slowCount>0)items.push({tone:"warn",label:"Slow Delivery Alerts",value:`${slowCount} events`});
+      if(bufferCount>0)items.push({tone:"warn",label:"Queued Writes",value:`${bufferCount} rooms`});
       if(Number(metrics.reconnecting||0)>0)items.push({tone:"warn",label:"Reconnect Holds",value:String(metrics.reconnecting)});
       if(gw.auth_keys_loaded===false)items.push({tone:"danger",label:"Auth Keys",value:"Missing"});
       if((snapshot.repo||{}).update_available)items.push({tone:"warn",label:"GitHub Update",value:"Available"});
@@ -1322,6 +1330,10 @@ class AdminDashboardServer:
     }
     function connectionHealth(row){
       const slowEvents=Number((row&&row.slow_peer_data_events)||0);
+      const bufferSize=Number((row&&row.write_buffer_size)||0);
+      const highWater=Number((row&&row.write_buffer_high_water)||0);
+      if(highWater>0&&bufferSize>=highWater)return {label:"Backpressure",tone:"warn"};
+      if(bufferSize>0)return {label:"Queued Writes",tone:"watch"};
       if(slowEvents>=3)return {label:"Transport Warning",tone:"warn"};
       if(slowEvents>0)return {label:"Watch",tone:"watch"};
       return {label:"Stable",tone:"ok"};
@@ -1332,6 +1344,8 @@ class AdminDashboardServer:
     }
     function roomHealth(room){
       const slowEvents=Number((room&&room.slow_peer_data_events)||0);
+      const bufferSize=Number((room&&room.largest_write_buffer_size)||0);
+      if(bufferSize>0)return {label:"Queued Writes",tone:"warn"};
       return slowEvents>0?{label:"Transport Warning",tone:"warn"}:{label:"Stable",tone:"ok"};
     }
 
@@ -1598,6 +1612,7 @@ class AdminDashboardServer:
                   <div class="k">Slow Send Events</div><div class="v">${esc(p.slow_peer_data_events||0)}</div>
                   <div class="k">Slowest Send</div><div class="v">${Number(p.slowest_peer_data_send_ms||0)>0?`${esc(p.slowest_peer_data_send_ms)}ms`:'-'}</div>
                   <div class="k">Last Slow Send</div><div class="v">${slowPeerLast(p)}</div>
+                  <div class="k">Write Buffer</div><div class="v">${writeBufferSummary(p)}</div>
                   <div class="k">Idle</div><div class="v">${age(p.idle_seconds)}</div>
                 </div>
               </div></details>`;
@@ -1655,6 +1670,7 @@ class AdminDashboardServer:
                     <div class="k">Peer Data Bytes</div><div class="v">${esc(formatBytes(peerBytes))}</div>
                     <div class="k">Slow Send Events</div><div class="v">${esc(room.slow_peer_data_events||0)}</div>
                     <div class="k">Slowest Send</div><div class="v">${Number(room.slowest_peer_data_send_ms||0)>0?`${esc(room.slowest_peer_data_send_ms)}ms`:'-'}</div>
+                    <div class="k">Largest Write Buffer</div><div class="v">${esc(formatBytes(room.largest_write_buffer_size||0))}</div>
                     <div class="k">Game/Object Bytes</div><div class="v">${esc(formatBytes(gameBytes))}</div>
                   </div>
                 </div>

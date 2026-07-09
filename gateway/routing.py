@@ -25,6 +25,7 @@ LOGGER = logging.getLogger(__name__)
 PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS = 15.0
 SLOW_PEER_DATA_DELIVERY_THRESHOLD_SECONDS = 0.150
 SLOW_PEER_DATA_LOG_COOLDOWN_SECONDS = 15.0
+PEER_DATA_SEND_TIMEOUT_SECONDS = 1.0
 _MULTIPLAYER_LEVEL_PATH_RE = re.compile(
     rb"(?i)multiplayer\\(?P<folder>[^\\\x00\r\n]+)\\(?P<file>[^\\\x00\r\n]+)\.level"
 )
@@ -655,6 +656,41 @@ class SilencerRoutingServer:
             self.listen_port,
         )
 
+    @staticmethod
+    def _writer_transport(writer: object) -> object | None:
+        if writer is None:
+            return None
+        get_extra_info = getattr(writer, "get_extra_info", None)
+        if callable(get_extra_info):
+            with contextlib.suppress(Exception):
+                transport = get_extra_info("transport", None)
+                if transport is not None:
+                    return transport
+        return getattr(writer, "transport", None) or getattr(writer, "_transport", None)
+
+    @classmethod
+    def _writer_buffer_stats(cls, writer: object) -> Dict[str, int]:
+        transport = cls._writer_transport(writer)
+        write_buffer_size = 0
+        write_buffer_low_water = 0
+        write_buffer_high_water = 0
+        if transport is not None:
+            get_size = getattr(transport, "get_write_buffer_size", None)
+            if callable(get_size):
+                with contextlib.suppress(Exception):
+                    write_buffer_size = max(0, int(get_size()))
+            get_limits = getattr(transport, "get_write_buffer_limits", None)
+            if callable(get_limits):
+                with contextlib.suppress(Exception):
+                    low, high = get_limits()
+                    write_buffer_low_water = max(0, int(low))
+                    write_buffer_high_water = max(0, int(high))
+        return {
+            "write_buffer_size": write_buffer_size,
+            "write_buffer_low_water": write_buffer_low_water,
+            "write_buffer_high_water": write_buffer_high_water,
+        }
+
     def _recent_published_game_activity(
         self,
         now: float,
@@ -868,6 +904,7 @@ class SilencerRoutingServer:
         for client_id in sorted(self._native_clients):
             client = self._native_clients[client_id]
             client_lookup[client.client_id] = client
+            writer_buffer_stats = self._writer_buffer_stats(client.writer)
             clients.append(
                 {
                     "client_id": client.client_id,
@@ -892,6 +929,9 @@ class SilencerRoutingServer:
                           if client.last_slow_peer_data_at > 0.0
                           else None
                       ),
+                      "write_buffer_size": writer_buffer_stats["write_buffer_size"],
+                      "write_buffer_low_water": writer_buffer_stats["write_buffer_low_water"],
+                      "write_buffer_high_water": writer_buffer_stats["write_buffer_high_water"],
                       "subscription_count": len(client.subscriptions),
                       "subscriptions": [
                           {
@@ -917,6 +957,10 @@ class SilencerRoutingServer:
         )
         room_slowest_peer_data_send_ms = max(
             (int(client["slowest_peer_data_send_ms"]) for client in clients),
+            default=0,
+        )
+        room_largest_write_buffer_size = max(
+            (int(client["write_buffer_size"]) for client in clients),
             default=0,
         )
 
@@ -1017,6 +1061,7 @@ class SilencerRoutingServer:
               "peer_data_bytes": room_peer_data_bytes,
               "slow_peer_data_events": room_slow_peer_data_events,
               "slowest_peer_data_send_ms": room_slowest_peer_data_send_ms,
+              "largest_write_buffer_size": room_largest_write_buffer_size,
               "seconds_since_last_peer_data": (
                   max(0, int(now - self._last_peer_data_at))
                   if self._last_peer_data_at > 0.0
@@ -1121,6 +1166,64 @@ class SilencerRoutingServer:
                 )
         return delivered
 
+    async def _deliver_native_route_peer_data(
+        self,
+        *,
+        sender_client_id: int,
+        client: NativeRouteClientState,
+        peer_data: bytes,
+        payload_len: int,
+    ) -> bool:
+        send_started_at = time.perf_counter()
+        timeout_seconds = max(0.0, float(PEER_DATA_SEND_TIMEOUT_SECONDS))
+        try:
+            if timeout_seconds > 0.0:
+                await asyncio.wait_for(
+                    self._send_native_route_client_reply(client, peer_data),
+                    timeout=timeout_seconds,
+                )
+            else:
+                await self._send_native_route_client_reply(client, peer_data)
+            self._record_slow_peer_data_delivery(
+                sender_client_id=int(sender_client_id),
+                recipient=client,
+                payload_len=payload_len,
+                elapsed_seconds=(time.perf_counter() - send_started_at),
+            )
+            return True
+        except asyncio.TimeoutError:
+            elapsed_seconds = time.perf_counter() - send_started_at
+            self._record_slow_peer_data_delivery(
+                sender_client_id=int(sender_client_id),
+                recipient=client,
+                payload_len=payload_len,
+                elapsed_seconds=elapsed_seconds,
+            )
+            stats = self._writer_buffer_stats(client.writer)
+            LOGGER.warning(
+                "Routing(native): peer-data delivery timed out sender_id=%d recipient_id=%d recipient_name=%r elapsed_ms=%d timeout_ms=%d payload_len=%d write_buffer_size=%d write_buffer_high_water=%d room_port=%s",
+                int(sender_client_id),
+                client.client_id,
+                client.client_name,
+                max(1, int(round(elapsed_seconds * 1000.0))),
+                max(1, int(round(timeout_seconds * 1000.0))),
+                max(0, int(payload_len)),
+                int(stats["write_buffer_size"]),
+                int(stats["write_buffer_high_water"]),
+                self.listen_port,
+            )
+            with contextlib.suppress(Exception):
+                client.writer.close()
+            return False
+        except Exception as exc:
+            LOGGER.warning(
+                "Routing(native): failed peer-data delivery to client_id=%d name=%r: %s",
+                client.client_id,
+                client.client_name,
+                exc,
+            )
+            return False
+
     async def _broadcast_native_route_peer_data(
         self,
         sender_client_id: int,
@@ -1145,26 +1248,19 @@ class SilencerRoutingServer:
                 continue
             targets.append(client)
 
-        delivered = 0
-        for client in targets:
-            try:
-                send_started_at = time.perf_counter()
-                await self._send_native_route_client_reply(client, peer_data)
-                self._record_slow_peer_data_delivery(
+        payload_len = len(bytes(data or b""))
+        deliveries = await asyncio.gather(
+            *[
+                self._deliver_native_route_peer_data(
                     sender_client_id=int(sender_client_id),
-                    recipient=client,
-                    payload_len=len(bytes(data or b"")),
-                    elapsed_seconds=(time.perf_counter() - send_started_at),
+                    client=client,
+                    peer_data=peer_data,
+                    payload_len=payload_len,
                 )
-                delivered += 1
-            except Exception as exc:
-                LOGGER.warning(
-                    "Routing(native): failed peer-data delivery to client_id=%d name=%r: %s",
-                    client.client_id,
-                    client.client_name,
-                    exc,
-                )
-        return delivered
+                for client in targets
+            ]
+        )
+        return sum(1 for delivered in deliveries if delivered)
 
     async def _broadcast_native_route_group_change(
         self,
@@ -2481,6 +2577,9 @@ class RoutingServerManager:
                       "seconds_since_last_slow_peer_data": client.get(
                           "seconds_since_last_slow_peer_data"
                       ),
+                      "write_buffer_size": client.get("write_buffer_size", 0),
+                      "write_buffer_low_water": client.get("write_buffer_low_water", 0),
+                      "write_buffer_high_water": client.get("write_buffer_high_water", 0),
                       "room_port": room.get("listen_port"),
                       "room_name": room.get("room_display_name"),
                       "room_is_game": room_is_game,
@@ -2517,6 +2616,7 @@ class RoutingServerManager:
                       "peer_data_bytes": room.get("peer_data_bytes", 0),
                       "slow_peer_data_events": room.get("slow_peer_data_events", 0),
                       "slowest_peer_data_send_ms": room.get("slowest_peer_data_send_ms", 0),
+                      "largest_write_buffer_size": room.get("largest_write_buffer_size", 0),
                       "players": room_players,
                       "game_count": len(room_games),
                       "games": room_games,

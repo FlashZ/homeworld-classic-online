@@ -89,6 +89,10 @@ def test_file_only_setup_writes_nettweak_and_kver(tmp_path: Path) -> None:
     nettweak = (game / "NetTweak.script").read_text(encoding="utf-8")
     assert "DIRSERVER_IPSTRINGS example.test" in nettweak
     assert "PATCHSERVER_IPSTRINGS example.test" in nettweak
+    assert "T1_Timeout" in nettweak
+    assert "T2_Timeout" in nettweak
+    assert "KEEPALIVE_SEND_IAMALIVE_TIME" in nettweak
+    assert "KEEPALIVE_IAMALIVE_TIMEOUT" in nettweak
     assert (game / "kver.kp").read_bytes() == (ROOT / "keys" / "kver.kp").read_bytes()
 
 
