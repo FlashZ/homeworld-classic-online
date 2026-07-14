@@ -751,11 +751,96 @@ class AdminDashboardServer:
             "db": default_db,
             "dbs": dbs,
             "db_default_product": self.default_db_product,
+            "factories": self._factories_snapshot(),
             "logs": self._annotate_logs(
                 self.log_handler.snapshot(limit=max(1, log_limit)),
                 gateway_snapshot,
             ),
         }
+
+    def _factories_snapshot(self) -> list[Dict[str, object]]:
+        """Enumerate factory/region entries across product databases so the
+        admin 'Gateways & Factories' view can show real regions.
+
+        Two sources are merged: TitanFactoryServer directory entities (which
+        carry the multi-region publish address via public_host/public_port) and
+        runtime rows in the factories table (region + running/max)."""
+        out: list[Dict[str, object]] = []
+        for product, path in self.db_paths.items():
+            db_path = Path(path).resolve()
+            if not db_path.exists() or db_path.is_dir():
+                continue
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            try:
+                tables = {
+                    str(r["name"])
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                if "directory_entities" in tables:
+                    for row in conn.execute(
+                        "SELECT entity_name, entity_type, payload FROM directory_entities"
+                    ):
+                        name = str(row["entity_name"] or "")
+                        etype = str(row["entity_type"] or "")
+                        is_factory = (
+                            etype == "factory"
+                            or name == "TitanFactoryServer"
+                            or name.startswith("Factory:")
+                        )
+                        if not is_factory:
+                            continue
+                        try:
+                            payload = json.loads(row["payload"] or "{}")
+                        except (ValueError, TypeError):
+                            payload = {}
+                        if not isinstance(payload, dict):
+                            payload = {}
+                        public_host = str(payload.get("public_host") or "").strip()
+                        public_port = payload.get("public_port")
+                        out.append(
+                            {
+                                "product": product,
+                                "source": "directory",
+                                "description": str(
+                                    payload.get("Description")
+                                    or name.split(":", 1)[-1]
+                                    or "factory"
+                                ),
+                                "public_host": public_host,
+                                "public_port": public_port,
+                                "host": str(payload.get("host") or ""),
+                                "port": payload.get("port"),
+                                # A dedicated public address means this entry
+                                # points clients at a remote region's gateway.
+                                "remote": bool(public_host and public_port),
+                            }
+                        )
+                if "factories" in tables:
+                    for row in conn.execute(
+                        "SELECT factory_id, host, region, max_processes, running, total_started FROM factories"
+                    ):
+                        out.append(
+                            {
+                                "product": product,
+                                "source": "registered",
+                                "description": str(row["region"] or row["factory_id"] or "factory"),
+                                "factory_id": str(row["factory_id"] or ""),
+                                "region": str(row["region"] or ""),
+                                "host": str(row["host"] or ""),
+                                "running": int(row["running"] or 0),
+                                "max_processes": int(row["max_processes"] or 0),
+                                "total_started": int(row["total_started"] or 0),
+                                "remote": True,
+                            }
+                        )
+            except sqlite3.Error as exc:
+                LOGGER.debug("Factory snapshot failed for %s: %s", product, exc)
+            finally:
+                conn.close()
+        return out
 
     @staticmethod
     def _http_response(
@@ -1703,14 +1788,22 @@ class AdminDashboardServer:
 
     function renderFactoriesCard(snapshot){
       const gw=snapshot.gateway||{};
-      const factories=gw.factories||(gw.routing_manager||{}).factories||[];
-      const regions=Array.isArray(factories)?factories.filter(f=>productScope==="all"||inScope(f.product||f.region_product||"")):[];
-      const rows=regions.length?regions.map(f=>{
+      const factories=Array.isArray(snapshot.factories)?snapshot.factories:[];
+      const regions=factories.filter(f=>inScope(f.product||""));
+      const rows=regions.map(f=>{
         const name=esc(f.description||f.region||f.factory_id||"factory");
-        const host=esc((f.public_host||f.host||"")+((f.public_port||f.port)?(":"+(f.public_port||f.port)):""));
-        const running=Number(f.running||0),max=Number(f.max_processes||0);
-        return `<div class="region"><div class="rg-name">${productBadge(f.product||"")}${name}<span class="pill pill-ok" style="margin-left:auto">${f.online===false?"registered":"live"}</span></div><div class="rg-meta mono">${host||"&mdash;"}<br>${running}/${max||"&infin;"} processes</div></div>`;
-      }).join(""):`<p class="muted">No remote factories registered. In shared-edge single-region mode this gateway is the factory. Register a factory with <span class="mono">public_host</span> / <span class="mono">public_port</span> to add a geographic region.</p>`;
+        const remote=!!f.remote;
+        // Registered factory rows carry live process counts; directory rows
+        // carry the published address (remote region) or fall back to local.
+        const addr=(f.public_host&&f.public_port)?`${f.public_host}:${f.public_port}`
+          :(f.host?`${f.host}${f.port?(":"+f.port):""}`:"");
+        const tag=f.source==="registered"?"registered":(remote?"remote region":"local gateway");
+        const tagCls=remote?"pill-ok":"pill";
+        const detail=f.source==="registered"
+          ?`${Number(f.running||0)}/${Number(f.max_processes||0)||"&infin;"} processes`
+          :(remote?"published to clients":"served by this gateway");
+        return `<div class="region"><div class="rg-name">${productBadge(f.product||"")}${name}<span class="pill ${tagCls}" style="margin-left:auto">${tag}</span></div><div class="rg-meta"><span class="mono">${esc(addr)||"&mdash;"}</span><br>${detail}</div></div>`;
+      }).join("")||`<p class="muted">No factory entries found. In shared-edge single-region mode this gateway is the factory. Add a TitanFactoryServer directory entity with <span class="mono">public_host</span> / <span class="mono">public_port</span> to publish another region.</p>`;
       return `<section class="card">
         <span class="eyebrow">Topology</span>
         <h2>Gateways &amp; Factories <span class="pill">${regions.length}</span></h2>
