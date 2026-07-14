@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import time
 
-import gateway.routing as routing_module
 import titan_binary_gateway
+
+routing_module = importlib.import_module("gateway.routing")
 
 
 def test_native_route_subscription_is_constructible() -> None:
@@ -343,3 +345,269 @@ def test_routing_recv_skips_wait_for_when_idle_timeout_is_disabled(monkeypatch) 
     payload = asyncio.run(routing_module._routing_recv_with_idle_timeout(object()))
 
     assert payload == b"payload"
+
+
+def test_broadcast_native_route_peer_data_records_slow_recipient_diagnostics(
+    monkeypatch,
+    caplog,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    sender = titan_binary_gateway.NativeRouteClientState(
+        client_id=1,
+        client_name_raw=b"Alpha",
+        client_name="Alpha",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+    recipient = titan_binary_gateway.NativeRouteClientState(
+        client_id=2,
+        client_name_raw=b"Bravo",
+        client_name="Bravo",
+        client_ip="1.2.3.5",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+    recipient.slow_peer_data_events = 0
+    recipient.slowest_peer_data_send_ms = 0
+    recipient.last_slow_peer_data_send_ms = 0
+    recipient.last_slow_peer_data_at = 0.0
+    server._native_clients = {1: sender, 2: recipient}
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert client.client_id == 2
+        assert clear_msg
+        await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+
+    with caplog.at_level(logging.WARNING):
+        delivered = asyncio.run(
+            server._broadcast_native_route_peer_data(
+                1,
+                b"\x01\x02\x03\x04",
+                [],
+                False,
+            )
+        )
+
+    assert delivered == 1
+    assert recipient.slow_peer_data_events == 1
+    assert recipient.slowest_peer_data_send_ms >= 1
+    assert recipient.last_slow_peer_data_send_ms >= 1
+    assert recipient.last_slow_peer_data_at > 0.0
+    assert "slow peer-data delivery" in caplog.text
+    assert "recipient_id=2" in caplog.text
+
+
+def test_broadcast_native_route_peer_data_does_not_wait_for_slow_recipient(
+    monkeypatch,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    for client_id, name in ((1, "Alpha"), (2, "Bravo"), (3, "Charlie")):
+        server._native_clients[client_id] = titan_binary_gateway.NativeRouteClientState(
+            client_id=client_id,
+            client_name_raw=name.encode("ascii"),
+            client_name=name,
+            client_ip=f"1.2.3.{client_id}",
+            client_ip_u32=0,
+            writer=None,  # type: ignore[arg-type]
+            session_key=b"",
+            out_seq=None,
+        )
+
+    events: list[tuple[int, str, float]] = []
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        events.append((client.client_id, "start", time.perf_counter()))
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+        events.append((client.client_id, "end", time.perf_counter()))
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+
+    delivered = asyncio.run(
+        server._broadcast_native_route_peer_data(
+            1,
+            b"\x01\x02\x03\x04",
+            [],
+            False,
+        )
+    )
+
+    assert delivered == 2
+    starts = {
+        client_id: timestamp
+        for client_id, phase, timestamp in events
+        if phase == "start"
+    }
+    ends = {
+        client_id: timestamp
+        for client_id, phase, timestamp in events
+        if phase == "end"
+    }
+    assert starts[3] - starts[2] < 0.05
+    assert ends[3] < ends[2]
+
+
+def test_broadcast_native_route_peer_data_times_out_stalled_recipient(
+    monkeypatch,
+    caplog,
+) -> None:
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    sender = titan_binary_gateway.NativeRouteClientState(
+        client_id=1,
+        client_name_raw=b"Alpha",
+        client_name="Alpha",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+    slow_writer = FakeWriter()
+    slow = titan_binary_gateway.NativeRouteClientState(
+        client_id=2,
+        client_name_raw=b"Bravo",
+        client_name="Bravo",
+        client_ip="1.2.3.5",
+        client_ip_u32=0,
+        writer=slow_writer,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+    fast = titan_binary_gateway.NativeRouteClientState(
+        client_id=3,
+        client_name_raw=b"Charlie",
+        client_name="Charlie",
+        client_ip="1.2.3.6",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+    server._native_clients = {1: sender, 2: slow, 3: fast}
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+    monkeypatch.setattr(routing_module, "PEER_DATA_SEND_TIMEOUT_SECONDS", 0.05, raising=False)
+
+    with caplog.at_level(logging.WARNING):
+        delivered = asyncio.run(
+            server._broadcast_native_route_peer_data(
+                1,
+                b"\x01\x02\x03\x04",
+                [],
+                False,
+            )
+        )
+
+    assert delivered == 1
+    assert slow_writer.closed is True
+    assert "peer-data delivery timed out" in caplog.text
+    assert "recipient_id=2" in caplog.text
+
+
+def test_dashboard_snapshot_reports_slow_peer_data_delivery_diagnostics() -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    client = titan_binary_gateway.NativeRouteClientState(
+        client_id=1,
+        client_name_raw=b"Alpha",
+        client_name="Alpha",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=None,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+    client.slow_peer_data_events = 3
+    client.slowest_peer_data_send_ms = 187
+    client.last_slow_peer_data_send_ms = 133
+    client.last_slow_peer_data_at = time.time() - 5.0
+    server._native_clients[1] = client
+
+    snapshot = server.dashboard_snapshot()
+
+    assert snapshot["slow_peer_data_events"] == 3
+    assert snapshot["slowest_peer_data_send_ms"] == 187
+    assert snapshot["clients"][0]["slow_peer_data_events"] == 3
+    assert snapshot["clients"][0]["slowest_peer_data_send_ms"] == 187
+    assert snapshot["clients"][0]["last_slow_peer_data_send_ms"] == 133
+    assert snapshot["clients"][0]["seconds_since_last_slow_peer_data"] >= 0
+
+
+def test_dashboard_snapshot_reports_peer_write_buffer_diagnostics() -> None:
+    class FakeTransport:
+        def get_write_buffer_size(self) -> int:
+            return 4096
+
+        def get_write_buffer_limits(self) -> tuple[int, int]:
+            return (1024, 2048)
+
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.transport = FakeTransport()
+
+        def get_extra_info(self, name: str, default: object = None) -> object:
+            if name == "transport":
+                return self.transport
+            return default
+
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    client = titan_binary_gateway.NativeRouteClientState(
+        client_id=1,
+        client_name_raw=b"Alpha",
+        client_name="Alpha",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=FakeWriter(),  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+    server._native_clients[1] = client
+
+    snapshot = server.dashboard_snapshot()
+
+    assert snapshot["largest_write_buffer_size"] == 4096
+    assert snapshot["clients"][0]["write_buffer_size"] == 4096
+    assert snapshot["clients"][0]["write_buffer_high_water"] == 2048

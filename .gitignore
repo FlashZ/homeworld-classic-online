@@ -22,3 +22,7 @@ docs/discord-stats-bot.md
 docs/stats-api-production-access.md
 docs/unified-edge-two-backend-architecture.md
 examples/
+.tmp/
+docs/superpowers/
+.ui_mock/
+.superpowers/

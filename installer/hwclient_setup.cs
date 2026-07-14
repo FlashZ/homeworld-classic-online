@@ -1,7 +1,9 @@
 using System;
+using System.ComponentModel;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Windows.Forms;
@@ -200,6 +202,7 @@ internal static class HWClientSetup
             string[] supportedExecutableNames,
             string[] defaultInstallDirectories,
             string[] retailNetTweakTemplate,
+            string mapPackSourceDirectoryName,
             bool experimentalRegistry,
             string sierraVirtualStoreRegistryPath,
             string sierraVersionSubkeyName)
@@ -218,6 +221,7 @@ internal static class HWClientSetup
             SupportedExecutableNames = supportedExecutableNames;
             DefaultInstallDirectories = defaultInstallDirectories;
             RetailNetTweakTemplate = retailNetTweakTemplate;
+            MapPackSourceDirectoryName = mapPackSourceDirectoryName;
             ExperimentalRegistry = experimentalRegistry;
             SierraVirtualStoreRegistryPath = sierraVirtualStoreRegistryPath;
             SierraVersionSubkeyName = sierraVersionSubkeyName;
@@ -237,6 +241,7 @@ internal static class HWClientSetup
         public string[] SupportedExecutableNames { get; private set; }
         public string[] DefaultInstallDirectories { get; private set; }
         public string[] RetailNetTweakTemplate { get; private set; }
+        public string MapPackSourceDirectoryName { get; private set; }
         public bool ExperimentalRegistry { get; private set; }
         public string SierraVirtualStoreRegistryPath { get; private set; }
         public string SierraVersionSubkeyName { get; private set; }
@@ -276,6 +281,7 @@ internal static class HWClientSetup
             @"C:\Sierra\Homeworld",
         },
         retailNetTweakTemplate: HomeworldRetailNetTweakTemplate,
+        mapPackSourceDirectoryName: MapPackInstaller.HomeworldSourceDirectoryName,
         experimentalRegistry: false,
         sierraVirtualStoreRegistryPath: null,
         sierraVersionSubkeyName: null
@@ -307,6 +313,7 @@ internal static class HWClientSetup
             @"C:\GOG Games\Homeworld Cataclysm",
         },
         retailNetTweakTemplate: CataclysmRetailNetTweakTemplate,
+        mapPackSourceDirectoryName: MapPackInstaller.CataclysmSourceDirectoryName,
         experimentalRegistry: true,
         sierraVirtualStoreRegistryPath: @"SOFTWARE\Classes\VirtualStore\MACHINE\SOFTWARE\WOW6432Node\Sierra On-Line\Cataclysm",
         sierraVersionSubkeyName: "1.0.0.0"
@@ -384,8 +391,10 @@ internal static class HWClientSetup
             }
 
             ExistingInstallState existingState = DetectExistingInstallState(gameDirectory);
-            bool shouldRefreshInstallerOwnedKey = existingState.HasAnyRegistryCdKey && existingState.ShouldRefreshRegistryKeyByDefault;
-            bool defaultWriteRegistryKeys = options.WriteRegistryKeys ?? (!existingState.HasAnyRegistryCdKey || shouldRefreshInstallerOwnedKey);
+            RegistryCdKeyAction defaultRegistryAction = options.WriteRegistryKeys.HasValue
+                ? (options.WriteRegistryKeys.Value ? RegistryCdKeyAction.WriteGenerated : RegistryCdKeyAction.KeepExisting)
+                : PickDefaultRegistryCdKeyAction(existingState);
+            bool defaultWriteRegistryKeys = defaultRegistryAction == RegistryCdKeyAction.WriteGenerated;
 
             // Generate a unique random key by default so users don't all share the
             // same hardcoded key.  The known-good default is only used as a self-test
@@ -399,7 +408,7 @@ internal static class HWClientSetup
                 {
                     ServerHost = options.ServerHost.Trim(),
                     GameDirectory = gameDirectory,
-                    WriteRegistryKeys = defaultWriteRegistryKeys,
+                    RegistryCdKeyAction = defaultRegistryAction,
                     RegistryCdKey = initialCdKey,
                 };
 
@@ -413,7 +422,12 @@ internal static class HWClientSetup
                 ? gameDirectory
                 : installChoices.GameDirectory.Trim();
 
-            results.Add(Install(gameDirectory, installChoices.ServerHost, installChoices.WriteRegistryKeys, installChoices.RegistryCdKey));
+            results.Add(InstallWithMapPackProgress(
+                gameDirectory,
+                installChoices.ServerHost,
+                installChoices.WriteRegistryKeys,
+                installChoices.RegistryCdKey,
+                installChoices.InstallMaps));
         }
 
         MessageBox.Show(
@@ -425,7 +439,123 @@ internal static class HWClientSetup
             MessageBoxIcon.Information);
     }
 
-    private static InstallResult Install(string gameDirectory, string serverHost, bool writeRegistryKeys, RegistryCdKeyOption registryCdKey)
+    private static InstallResult InstallWithMapPackProgress(string gameDirectory, string serverHost, bool writeRegistryKeys, RegistryCdKeyOption registryCdKey, bool installMaps)
+    {
+        if (!installMaps)
+        {
+            return Install(gameDirectory, serverHost, writeRegistryKeys, registryCdKey, false, null);
+        }
+
+        using (Form progressForm = new Form())
+        using (Label stageLabel = new Label())
+        using (ProgressBar progressBar = new ProgressBar())
+        using (Label detailLabel = new Label())
+        using (BackgroundWorker worker = new BackgroundWorker())
+        {
+            InstallResult installResult = null;
+            Exception installError = null;
+
+            progressForm.Text = "Installing Community Maps";
+            progressForm.FormBorderStyle = FormBorderStyle.FixedDialog;
+            progressForm.StartPosition = FormStartPosition.CenterScreen;
+            progressForm.ClientSize = new Size(420, 136);
+            progressForm.MinimizeBox = false;
+            progressForm.MaximizeBox = false;
+            progressForm.ControlBox = false;
+            progressForm.Font = SystemFonts.MessageBoxFont;
+
+            stageLabel.Location = new Point(15, 16);
+            stageLabel.Size = new Size(390, 22);
+            stageLabel.Text = "Preparing community maps...";
+
+            progressBar.Location = new Point(15, 48);
+            progressBar.Size = new Size(390, 22);
+            progressBar.Minimum = 0;
+            progressBar.Maximum = 100;
+
+            detailLabel.Location = new Point(15, 82);
+            detailLabel.Size = new Size(390, 38);
+            detailLabel.ForeColor = SystemColors.GrayText;
+            detailLabel.Text = "Downloading from FlashZ/Homeworld_Map_Collection.";
+
+            progressForm.Controls.Add(stageLabel);
+            progressForm.Controls.Add(progressBar);
+            progressForm.Controls.Add(detailLabel);
+
+            Action<MapPackProgress> progress = delegate(MapPackProgress update)
+            {
+                if (update == null)
+                {
+                    return;
+                }
+                try
+                {
+                    if (progressForm.IsHandleCreated && !progressForm.IsDisposed)
+                    {
+                        progressForm.BeginInvoke((MethodInvoker)delegate
+                        {
+                            ApplyMapPackProgress(update, stageLabel, progressBar, detailLabel);
+                        });
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (InvalidOperationException)
+                {
+                }
+            };
+
+            worker.DoWork += delegate(object sender, DoWorkEventArgs e)
+            {
+                e.Result = Install(gameDirectory, serverHost, writeRegistryKeys, registryCdKey, true, progress);
+            };
+            worker.RunWorkerCompleted += delegate(object sender, RunWorkerCompletedEventArgs e)
+            {
+                installError = e.Error;
+                installResult = e.Result as InstallResult;
+                progressForm.DialogResult = installError == null ? DialogResult.OK : DialogResult.Abort;
+                progressForm.Close();
+            };
+            progressForm.Shown += delegate
+            {
+                worker.RunWorkerAsync();
+            };
+
+            progressForm.ShowDialog();
+            if (installError != null)
+            {
+                throw installError;
+            }
+            return installResult;
+        }
+    }
+
+    private static void ApplyMapPackProgress(MapPackProgress progress, Label stageLabel, ProgressBar progressBar, Label detailLabel)
+    {
+        stageLabel.Text = string.IsNullOrWhiteSpace(progress.Stage)
+            ? "Installing community maps..."
+            : progress.Stage;
+        progressBar.Value = ClampPercent(progress.Percent);
+        detailLabel.Text = string.IsNullOrWhiteSpace(progress.Detail)
+            ? string.Empty
+            : progress.Detail;
+    }
+
+    private static int ClampPercent(int percent)
+    {
+        if (percent < 0)
+        {
+            return 0;
+        }
+        if (percent > 100)
+        {
+            return 100;
+        }
+        return percent;
+    }
+
+    private static InstallResult Install(string gameDirectory, string serverHost, bool writeRegistryKeys, RegistryCdKeyOption registryCdKey, bool installMaps, Action<MapPackProgress> mapProgress)
     {
         EnsureSelectedGameDirectory(gameDirectory);
         RegistryWriteResult registryWriteResult = null;
@@ -436,6 +566,9 @@ internal static class HWClientSetup
         BackupNetTweak(gameDirectory);
         WriteNetTweak(gameDirectory, serverHost);
         WriteFileBytes(Path.Combine(gameDirectory, "kver.kp"), EmbeddedKver, "kver.kp");
+        MapPackInstallResult mapPackResult = installMaps
+            ? InstallMapPack(gameDirectory, mapProgress)
+            : null;
 
         return new InstallResult
         {
@@ -443,7 +576,70 @@ internal static class HWClientSetup
             GameDirectory = Path.GetFullPath(gameDirectory),
             ServerHost = serverHost,
             RegistryWrite = registryWriteResult,
+            MapPack = mapPackResult,
         };
+    }
+
+    private static MapPackInstallResult InstallMapPack(string gameDirectory, Action<MapPackProgress> progress)
+    {
+        string normalizedGameDirectory = Path.GetFullPath(gameDirectory);
+        string destinationDirectory = Path.Combine(normalizedGameDirectory, "MultiPlayer");
+        string tempRoot = Path.Combine(Path.GetTempPath(), "RetailWONMaps-" + Guid.NewGuid().ToString("N"));
+        string archivePath = Path.Combine(tempRoot, "maps.zip");
+        string extractedPath = Path.Combine(tempRoot, "extracted");
+
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            ReportMapPackProgress(progress, "Preparing community maps", 0, "Creating temporary download folder.");
+            MapPackInstaller.DownloadArchive(MapPackInstaller.RepositoryArchiveUrl, archivePath, progress);
+            ReportMapPackProgress(progress, "Extracting community maps", 0, "Unpacking downloaded archive.");
+            Directory.CreateDirectory(extractedPath);
+            ZipFile.ExtractToDirectory(archivePath, extractedPath);
+            return MapPackInstaller.CopyMapsFromExtractedArchive(
+                extractedPath,
+                CurrentGame.MapPackSourceDirectoryName,
+                normalizedGameDirectory,
+                progress);
+        }
+        catch (Exception ex)
+        {
+            ReportMapPackProgress(progress, "Community maps failed", 100, ex.Message);
+            return new MapPackInstallResult
+            {
+                Attempted = true,
+                Succeeded = false,
+                ErrorMessage = ex.Message,
+                DestinationDirectory = destinationDirectory,
+            };
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                {
+                    Directory.Delete(tempRoot, true);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static void ReportMapPackProgress(Action<MapPackProgress> progress, string stage, int percent, string detail)
+    {
+        if (progress == null)
+        {
+            return;
+        }
+        progress(new MapPackProgress
+        {
+            Stage = stage,
+            Percent = percent,
+            Detail = detail,
+        });
     }
 
     private static void Uninstall(string gameDirectory)
@@ -1436,6 +1632,26 @@ internal static class HWClientSetup
         return "Writes " + selectedCdKey.DisplayCdKey + " to the Sierra and WON registry entries for stock " + CurrentGame.DisplayName + " login.";
     }
 
+    private static RegistryCdKeyAction PickDefaultRegistryCdKeyAction(ExistingInstallState state)
+    {
+        return RegistryCdKeyActionPolicy.PickDefaultAction(ToRegistryCdKeyState(state));
+    }
+
+    private static RegistryCdKeyState ToRegistryCdKeyState(ExistingInstallState state)
+    {
+        if (state == null)
+        {
+            return null;
+        }
+        return new RegistryCdKeyState
+        {
+            HasAnyRegistryCdKey = state.HasAnyRegistryCdKey,
+            RegistryOwnedByInstaller = state.RegistryOwnedByInstaller,
+            RegistryUsesLegacySharedDefault = state.RegistryUsesLegacySharedDefault,
+            SierraCdKeyDisplay = state.SierraCdKeyDisplay,
+        };
+    }
+
     private static string BuildExistingRegistryPrompt(ExistingInstallState existingState, RegistryCdKeyOption selectedCdKey)
     {
         StringBuilder prompt = new StringBuilder();
@@ -1541,6 +1757,11 @@ internal static class HWClientSetup
             builder.AppendFormat("CD key: {0}", result.RegistryWrite.DisplayCdKey);
             builder.AppendLine();
         }
+        if (result.MapPack != null && result.MapPack.Attempted)
+        {
+            builder.Append(result.MapPack.BuildSummaryLine());
+            builder.AppendLine();
+        }
 
         builder.AppendLine();
         builder.Append("Launch the game normally to play online.");
@@ -1563,6 +1784,12 @@ internal static class HWClientSetup
             if (result.RegistryWrite != null)
             {
                 builder.AppendFormat("  CD key: {0}", result.RegistryWrite.DisplayCdKey);
+                builder.AppendLine();
+            }
+            if (result.MapPack != null && result.MapPack.Attempted)
+            {
+                builder.Append("  ");
+                builder.Append(result.MapPack.BuildSummaryLine());
                 builder.AppendLine();
             }
             builder.AppendLine();
@@ -1599,11 +1826,16 @@ internal static class HWClientSetup
         using (Label customLabel = new Label())
         using (TextBox customTextBox = new TextBox())
         using (GroupBox registryGroup = new GroupBox())
-        using (CheckBox registryCheckBox = new CheckBox())
+        using (Label detectedKeyLabel = new Label())
+        using (RadioButton keepExistingKeyRadio = new RadioButton())
+        using (RadioButton replaceKeyRadio = new RadioButton())
         using (Label selectedKeyLabel = new Label())
         using (TextBox cdKeyTextBox = new TextBox())
         using (Button generateKeyButton = new Button())
         using (Label registryHelpLabel = new Label())
+        using (GroupBox optionalContentGroup = new GroupBox())
+        using (CheckBox installMapsCheckBox = new CheckBox())
+        using (Label mapsHelpLabel = new Label())
         using (Button installButton = new Button())
         using (Button cancelButton = new Button())
         {
@@ -1615,11 +1847,14 @@ internal static class HWClientSetup
                 : Path.GetFullPath(initialGameDirectory);
             RegistryCdKeyOption selectedCdKey = defaultCdKey ?? GetDefaultRegistryCdKey();
             ExistingInstallState selectedInstallState = existingState;
+            RegistryCdKeyAction selectedRegistryAction = defaultWriteRegistryKeys
+                ? RegistryCdKeyAction.WriteGenerated
+                : RegistryCdKeyAction.KeepExisting;
 
             form.Text = CurrentGame.WindowTitle;
             form.FormBorderStyle = FormBorderStyle.FixedDialog;
             form.StartPosition = FormStartPosition.CenterScreen;
-            form.ClientSize = new Size(480, 470);
+            form.ClientSize = new Size(520, 610);
             form.MinimizeBox = false;
             form.MaximizeBox = false;
             form.Font = SystemFonts.MessageBoxFont;
@@ -1628,13 +1863,13 @@ internal static class HWClientSetup
 
             // --- Summary ---
             summaryLabel.Location = new Point(15, 12);
-            summaryLabel.Size = new Size(450, 52);
+            summaryLabel.Size = new Size(490, 52);
             summaryLabel.Text = BuildInstallSummaryText(existingState);
 
             // --- Install path group ---
             installGroup.Text = "Install Folder";
             installGroup.Location = new Point(12, 68);
-            installGroup.Size = new Size(452, 84);
+            installGroup.Size = new Size(496, 84);
 
             installPathLabel.AutoSize = true;
             installPathLabel.Location = new Point(10, 22);
@@ -1642,16 +1877,16 @@ internal static class HWClientSetup
 
             installPathTextBox.Location = new Point(12, 40);
             installPathTextBox.ReadOnly = true;
-            installPathTextBox.Size = new Size(328, 23);
+            installPathTextBox.Size = new Size(372, 23);
             installPathTextBox.TabIndex = 0;
 
-            changePathButton.Location = new Point(346, 39);
+            changePathButton.Location = new Point(390, 39);
             changePathButton.Size = new Size(92, 25);
             changePathButton.Text = "Change...";
             changePathButton.TabIndex = 1;
 
             installHelpLabel.Location = new Point(12, 64);
-            installHelpLabel.Size = new Size(426, 16);
+            installHelpLabel.Size = new Size(470, 16);
             installHelpLabel.ForeColor = SystemColors.GrayText;
             installHelpLabel.Text = "Use Change... if this is not the copy of " + CurrentGame.DisplayName + " you want to patch.";
 
@@ -1663,7 +1898,7 @@ internal static class HWClientSetup
             // --- Server group ---
             serverGroup.Text = "Server";
             serverGroup.Location = new Point(12, 160);
-            serverGroup.Size = new Size(452, 108);
+            serverGroup.Size = new Size(496, 108);
 
             presetLabel.AutoSize = true;
             presetLabel.Location = new Point(10, 22);
@@ -1671,7 +1906,7 @@ internal static class HWClientSetup
 
             presetCombo.DropDownStyle = ComboBoxStyle.DropDownList;
             presetCombo.Location = new Point(12, 40);
-            presetCombo.Size = new Size(426, 23);
+            presetCombo.Size = new Size(470, 23);
             presetCombo.TabIndex = 0;
             presetCombo.Items.Add(CurrentGame.DefaultServerHost);
             presetCombo.Items.Add(CustomHostOptionLabel);
@@ -1681,7 +1916,7 @@ internal static class HWClientSetup
             customLabel.Text = "Custom host or IP:";
 
             customTextBox.Location = new Point(130, 69);
-            customTextBox.Size = new Size(308, 23);
+            customTextBox.Size = new Size(352, 23);
             customTextBox.TabIndex = 1;
 
             serverGroup.Controls.Add(presetLabel);
@@ -1692,50 +1927,79 @@ internal static class HWClientSetup
             // --- Registry / CD key group ---
             registryGroup.Text = "CD Key";
             registryGroup.Location = new Point(12, 276);
-            registryGroup.Size = new Size(452, 148);
+            registryGroup.Size = new Size(496, 178);
 
-            registryCheckBox.AutoSize = true;
-            registryCheckBox.Location = new Point(12, 22);
-            registryCheckBox.Text = "Write " + CurrentGame.DisplayName + " CD key to the registry";
-            registryCheckBox.Checked = defaultWriteRegistryKeys;
-            registryCheckBox.TabIndex = 2;
+            detectedKeyLabel.Location = new Point(12, 22);
+            detectedKeyLabel.Size = new Size(470, 36);
+
+            keepExistingKeyRadio.AutoSize = true;
+            keepExistingKeyRadio.Location = new Point(15, 62);
+            keepExistingKeyRadio.Text = "Keep detected CD key";
+            keepExistingKeyRadio.Checked = selectedRegistryAction == RegistryCdKeyAction.KeepExisting;
+            keepExistingKeyRadio.TabIndex = 2;
+
+            replaceKeyRadio.AutoSize = true;
+            replaceKeyRadio.Location = new Point(15, 87);
+            replaceKeyRadio.Text = "Replace with generated key";
+            replaceKeyRadio.Checked = selectedRegistryAction == RegistryCdKeyAction.WriteGenerated;
+            replaceKeyRadio.TabIndex = 3;
 
             selectedKeyLabel.AutoSize = true;
-            selectedKeyLabel.Location = new Point(12, 52);
-            selectedKeyLabel.Text = "Key:";
+            selectedKeyLabel.Location = new Point(36, 116);
+            selectedKeyLabel.Text = "New key:";
 
-            cdKeyTextBox.Location = new Point(46, 49);
+            cdKeyTextBox.Location = new Point(95, 113);
             cdKeyTextBox.ReadOnly = true;
-            cdKeyTextBox.Size = new Size(290, 23);
-            cdKeyTextBox.TabIndex = 3;
+            cdKeyTextBox.Size = new Size(270, 23);
+            cdKeyTextBox.TabIndex = 4;
             cdKeyTextBox.Font = new Font("Consolas", 9.5f);
 
-            generateKeyButton.Location = new Point(345, 48);
-            generateKeyButton.Size = new Size(95, 25);
+            generateKeyButton.Location = new Point(373, 112);
+            generateKeyButton.Size = new Size(100, 25);
             generateKeyButton.Text = "Randomize";
-            generateKeyButton.TabIndex = 4;
+            generateKeyButton.TabIndex = 5;
 
-            registryHelpLabel.Location = new Point(12, 82);
-            registryHelpLabel.Size = new Size(428, 56);
+            registryHelpLabel.Location = new Point(15, 144);
+            registryHelpLabel.Size = new Size(460, 28);
             registryHelpLabel.ForeColor = SystemColors.GrayText;
 
-            registryGroup.Controls.Add(registryCheckBox);
+            registryGroup.Controls.Add(detectedKeyLabel);
+            registryGroup.Controls.Add(keepExistingKeyRadio);
+            registryGroup.Controls.Add(replaceKeyRadio);
             registryGroup.Controls.Add(selectedKeyLabel);
             registryGroup.Controls.Add(cdKeyTextBox);
             registryGroup.Controls.Add(generateKeyButton);
             registryGroup.Controls.Add(registryHelpLabel);
 
+            // --- Optional content group ---
+            optionalContentGroup.Text = "Optional Content";
+            optionalContentGroup.Location = new Point(12, 462);
+            optionalContentGroup.Size = new Size(496, 72);
+
+            installMapsCheckBox.AutoSize = true;
+            installMapsCheckBox.Location = new Point(12, 22);
+            installMapsCheckBox.Text = "Download and install community map pack";
+            installMapsCheckBox.TabIndex = 6;
+
+            mapsHelpLabel.Location = new Point(34, 44);
+            mapsHelpLabel.Size = new Size(448, 20);
+            mapsHelpLabel.ForeColor = SystemColors.GrayText;
+            mapsHelpLabel.Text = "Adds maps from FlashZ/Homeworld_Map_Collection to the MultiPlayer folder.";
+
+            optionalContentGroup.Controls.Add(installMapsCheckBox);
+            optionalContentGroup.Controls.Add(mapsHelpLabel);
+
             // --- Buttons ---
             installButton.Text = "Install";
             installButton.Size = new Size(84, 30);
-            installButton.Location = new Point(290, 430);
-            installButton.TabIndex = 6;
+            installButton.Location = new Point(334, 568);
+            installButton.TabIndex = 7;
 
             cancelButton.Text = "Cancel";
             cancelButton.Size = new Size(84, 30);
-            cancelButton.Location = new Point(380, 430);
+            cancelButton.Location = new Point(424, 568);
             cancelButton.DialogResult = DialogResult.Cancel;
-            cancelButton.TabIndex = 7;
+            cancelButton.TabIndex = 8;
 
             // --- Sync state ---
             EventHandler syncSelection = delegate
@@ -1744,17 +2008,37 @@ internal static class HWClientSetup
                     presetCombo.SelectedItem as string,
                     CustomHostOptionLabel,
                     StringComparison.OrdinalIgnoreCase);
-                bool installRegistryKey = registryCheckBox.Checked;
+                RegistryCdKeyState registryState = ToRegistryCdKeyState(selectedInstallState);
+                bool hasExistingRegistryKey = registryState != null && registryState.HasAnyRegistryCdKey;
+                keepExistingKeyRadio.Enabled = hasExistingRegistryKey;
+                if (!hasExistingRegistryKey && !replaceKeyRadio.Checked)
+                {
+                    replaceKeyRadio.Checked = true;
+                }
+                selectedRegistryAction = keepExistingKeyRadio.Checked && hasExistingRegistryKey
+                    ? RegistryCdKeyAction.KeepExisting
+                    : RegistryCdKeyAction.WriteGenerated;
                 summaryLabel.Text = BuildInstallSummaryText(selectedInstallState);
                 installPathTextBox.Text = selectedGameDirectory;
                 customTextBox.Enabled = useCustom;
                 customLabel.Enabled = useCustom;
-                selectedKeyLabel.Enabled = installRegistryKey;
-                cdKeyTextBox.Enabled = installRegistryKey;
-                generateKeyButton.Enabled = installRegistryKey;
-                registryHelpLabel.Enabled = installRegistryKey;
+                detectedKeyLabel.Text = RegistryCdKeyActionPolicy.BuildDetectedKeyText(registryState);
+                keepExistingKeyRadio.Text = hasExistingRegistryKey
+                    ? "Keep detected CD key"
+                    : "Keep existing CD key";
+                replaceKeyRadio.Text = hasExistingRegistryKey
+                    ? "Replace with generated key"
+                    : "Generate a new key";
+                selectedKeyLabel.Enabled = selectedRegistryAction == RegistryCdKeyAction.WriteGenerated;
+                cdKeyTextBox.Enabled = selectedRegistryAction == RegistryCdKeyAction.WriteGenerated;
+                generateKeyButton.Enabled = selectedRegistryAction == RegistryCdKeyAction.WriteGenerated;
+                registryHelpLabel.Enabled = true;
                 cdKeyTextBox.Text = selectedCdKey.DisplayCdKey;
-                registryHelpLabel.Text = BuildRegistryHelpText(installRegistryKey, selectedCdKey, selectedInstallState);
+                registryHelpLabel.Text = RegistryCdKeyActionPolicy.BuildChoiceHelpText(
+                    selectedRegistryAction,
+                    selectedCdKey.DisplayCdKey,
+                    registryState,
+                    CurrentGame.DisplayName);
             };
 
             if (string.Equals(initialValue, CurrentGame.DefaultServerHost, StringComparison.OrdinalIgnoreCase))
@@ -1770,7 +2054,8 @@ internal static class HWClientSetup
             syncSelection(null, EventArgs.Empty);
 
             presetCombo.SelectedIndexChanged += syncSelection;
-            registryCheckBox.CheckedChanged += syncSelection;
+            keepExistingKeyRadio.CheckedChanged += syncSelection;
+            replaceKeyRadio.CheckedChanged += syncSelection;
             changePathButton.Click += delegate
             {
                 try
@@ -1783,6 +2068,9 @@ internal static class HWClientSetup
                     {
                         selectedGameDirectory = Path.GetFullPath(pickedPath);
                         selectedInstallState = DetectExistingInstallState(selectedGameDirectory);
+                        RegistryCdKeyAction pathDefaultAction = PickDefaultRegistryCdKeyAction(selectedInstallState);
+                        keepExistingKeyRadio.Checked = pathDefaultAction == RegistryCdKeyAction.KeepExisting;
+                        replaceKeyRadio.Checked = pathDefaultAction == RegistryCdKeyAction.WriteGenerated;
                         syncSelection(null, EventArgs.Empty);
                     }
                 }
@@ -1844,21 +2132,6 @@ internal static class HWClientSetup
                     return;
                 }
 
-                if (registryCheckBox.Checked && selectedInstallState.HasAnyRegistryCdKey && !selectedInstallState.ShouldRefreshRegistryKeyByDefault)
-                {
-                    DialogResult overwriteResult = MessageBox.Show(
-                        form,
-                        BuildExistingRegistryPrompt(selectedInstallState, selectedCdKey),
-                        CurrentGame.WindowTitle,
-                        MessageBoxButtons.YesNo,
-                        MessageBoxIcon.Warning);
-
-                    if (overwriteResult == DialogResult.No)
-                    {
-                        registryCheckBox.Checked = false;
-                    }
-                }
-
                 form.DialogResult = DialogResult.OK;
                 form.Close();
             };
@@ -1887,8 +2160,9 @@ internal static class HWClientSetup
             {
                 GameDirectory = selectedGameDirectory,
                 ServerHost = serverHost,
-                WriteRegistryKeys = registryCheckBox.Checked,
+                RegistryCdKeyAction = selectedRegistryAction,
                 RegistryCdKey = selectedCdKey,
+                InstallMaps = installMapsCheckBox.Checked,
             };
         }
     }
@@ -1980,8 +2254,14 @@ internal static class HWClientSetup
     {
         public string GameDirectory { get; set; }
         public string ServerHost { get; set; }
-        public bool WriteRegistryKeys { get; set; }
+        public RegistryCdKeyAction RegistryCdKeyAction { get; set; }
         public RegistryCdKeyOption RegistryCdKey { get; set; }
+        public bool InstallMaps { get; set; }
+
+        public bool WriteRegistryKeys
+        {
+            get { return RegistryCdKeyAction == RegistryCdKeyAction.WriteGenerated; }
+        }
     }
 
     private sealed class RegistryCdKeyOption
@@ -2063,5 +2343,6 @@ internal static class HWClientSetup
         public string GameDirectory { get; set; }
         public string ServerHost { get; set; }
         public RegistryWriteResult RegistryWrite { get; set; }
+        public MapPackInstallResult MapPack { get; set; }
     }
 }

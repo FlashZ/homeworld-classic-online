@@ -655,113 +655,237 @@ class AdminDashboardServer:
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>WON Admin</title>
+  <link rel="icon" href="data:,">
   <style>
     :root {
-      --bg-0:#09090b;--bg-1:#111113;--bg-2:#1a1a1e;--bg-3:#252529;
-      --border:#2e2e33;--border-active:#3e3e44;
-      --text-0:#fafafa;--text-1:#a1a1aa;--text-2:#71717a;
-      --accent:#3b82f6;--accent-hover:#2563eb;
-      --success:#22c55e;--warning:#eab308;--danger:#ef4444;--danger-hover:#dc2626;
+      --bg-app:#0b0f14;--bg-shell:#101720;--bg-panel:#151d27;--bg-panel-2:#1b2430;--bg-panel-3:#223044;
+      --line:#263241;--line-strong:#314255;--line-soft:rgba(255,255,255,.04);
+      --text-hi:#f3f7fb;--text-mid:#9fb0c3;--text-low:#64748b;
+      --accent:#4cc9f0;--accent-strong:#38bdf8;--accent-glow:rgba(76,201,240,.18);
+      --success:#22c55e;--success-soft:rgba(34,197,94,.14);
+      --warning:#f59e0b;--warning-soft:rgba(245,158,11,.14);
+      --danger:#ef4444;--danger-soft:rgba(239,68,68,.14);
+      --shadow-lg:0 18px 40px rgba(0,0,0,.32);
     }
     *{box-sizing:border-box;margin:0;padding:0;}
-    body{font-family:Inter,-apple-system,system-ui,sans-serif;background:var(--bg-1);color:var(--text-0);display:flex;height:100vh;overflow:hidden;}
-    .sidebar{width:220px;background:var(--bg-0);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0;}
-    .brand{padding:20px 16px 16px;font-size:15px;font-weight:700;letter-spacing:-.3px;color:var(--text-0);border-bottom:1px solid var(--border);}
-    .brand span{color:var(--accent);font-weight:800;}
-    .sidebar nav{flex:1;padding:8px;overflow-y:auto;}
-    .nav-item{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;cursor:pointer;font-size:13px;color:var(--text-1);transition:all .15s;border:none;background:none;width:100%;text-align:left;}
-    .nav-item:hover{background:var(--bg-2);color:var(--text-0);}
-    .nav-item.active{background:var(--bg-3);color:var(--text-0);font-weight:600;}
+    body{
+      font-family:"Segoe UI Variable Display","Aptos","Trebuchet MS",sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(76,201,240,.08), transparent 26%),
+        radial-gradient(circle at top right, rgba(56,189,248,.05), transparent 24%),
+        linear-gradient(180deg, #0b0f14 0%, #0e131b 100%);
+      color:var(--text-hi);display:flex;height:100vh;overflow:hidden;
+    }
+    .sidebar-scrim{
+      display:none;position:fixed;inset:0;background:rgba(7,10,15,.68);backdrop-filter:blur(3px);z-index:20;
+    }
+    .sidebar{
+      width:260px;background:linear-gradient(180deg, rgba(16,23,32,.98) 0%, rgba(13,18,26,.98) 100%);
+      border-right:1px solid var(--line);display:flex;flex-direction:column;flex-shrink:0;position:relative;z-index:30;
+      box-shadow:var(--shadow-lg);
+    }
+    .brand-block{padding:18px 18px 16px;border-bottom:1px solid var(--line);}
+    .brand-eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--text-low);margin-bottom:8px;}
+    .brand{font-size:24px;font-weight:800;letter-spacing:-.04em;color:var(--text-hi);}
+    .brand span{color:var(--accent);font-weight:900;}
+    .sidebar nav{flex:1;padding:12px 10px 10px;overflow-y:auto;}
+    .nav-item{
+      display:flex;align-items:center;gap:12px;padding:11px 13px;border-radius:12px;cursor:pointer;font-size:14px;color:var(--text-mid);
+      transition:all .16s ease;border:1px solid transparent;background:none;width:100%;text-align:left;
+    }
+    .nav-item:hover{background:rgba(255,255,255,.04);border-color:var(--line);color:var(--text-hi);}
+    .nav-item.active{
+      background:linear-gradient(180deg, rgba(34,48,68,.88) 0%, rgba(27,36,48,.92) 100%);
+      color:var(--text-hi);font-weight:700;border-color:var(--line-strong);box-shadow:0 0 0 1px rgba(255,255,255,.02) inset;
+    }
     .nav-item svg{width:16px;height:16px;flex-shrink:0;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}
-    .nav-badge{margin-left:auto;background:var(--bg-3);color:var(--text-1);font-size:11px;padding:1px 6px;border-radius:99px;min-width:18px;text-align:center;}
-    .nav-item.active .nav-badge{background:var(--accent);color:#fff;}
-    .sidebar-footer{padding:12px 16px;border-top:1px solid var(--border);font-size:11px;color:var(--text-2);}
+    .nav-badge{
+      margin-left:auto;background:rgba(255,255,255,.06);color:var(--text-mid);font-size:11px;padding:2px 7px;border-radius:999px;min-width:20px;text-align:center;
+    }
+    .nav-item.active .nav-badge{background:var(--accent);color:#06202b;}
+    .sidebar-footer{padding:14px 18px;border-top:1px solid var(--line);font-size:11px;color:var(--text-low);line-height:1.5;}
     .sidebar-footer .status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;}
-    .sidebar-footer .status-dot.ok{background:var(--success);}
-    .sidebar-footer .status-dot.err{background:var(--danger);}
+    .sidebar-footer .status-dot.ok{background:var(--success);box-shadow:0 0 14px rgba(34,197,94,.5);}
+    .sidebar-footer .status-dot.err{background:var(--danger);box-shadow:0 0 14px rgba(239,68,68,.45);}
     .main-wrap{flex:1;display:flex;flex-direction:column;overflow:hidden;}
-    .topbar{padding:14px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;background:var(--bg-1);flex-shrink:0;}
-    .topbar h1{font-size:16px;font-weight:600;}
-    .topbar .meta{font-size:12px;color:var(--text-2);}
-    #content{flex:1;overflow-y:auto;padding:20px 24px 32px;}
-    .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px;}
-    .stat-card{background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:16px;}
-    .stat-card .label{font-size:12px;color:var(--text-2);margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px;}
-    .stat-card .value{font-size:28px;font-weight:700;line-height:1.2;}
-    .stat-card .value.accent{color:var(--accent);}
-    .stat-card .value.success{color:var(--success);}
-    .stat-card .value.warning{color:var(--warning);}
-    .card{background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px;}
-    .card h2{font-size:14px;font-weight:600;margin-bottom:12px;display:flex;align-items:center;gap:8px;}
-    .card h3{font-size:13px;font-weight:600;margin:12px 0 8px;color:var(--text-1);}
+    .topbar{
+      padding:16px 24px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;
+      background:rgba(11,15,20,.82);backdrop-filter:blur(16px);flex-shrink:0;gap:16px;
+    }
+    .topbar-main{display:flex;align-items:center;gap:14px;min-width:0;}
+    .topbar-label{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--text-low);margin-bottom:4px;}
+    .topbar h1{font-size:30px;line-height:1;font-weight:800;letter-spacing:-.045em;}
+    .topbar-meta{text-align:right;display:flex;align-items:center;gap:10px;}
+    .meta-stack{display:flex;flex-direction:column;gap:4px;align-items:flex-end;}
+    .topbar-status{font-size:12px;color:var(--text-mid);font-weight:600;}
+    .topbar .meta{font-size:12px;color:var(--text-low);}
+    .shell-toggle{
+      display:none;align-items:center;justify-content:center;gap:3px;flex-direction:column;
+      width:42px;height:42px;border-radius:12px;border:1px solid var(--line);background:rgba(255,255,255,.03);cursor:pointer;
+    }
+    .shell-toggle span{display:block;width:16px;height:2px;background:var(--text-hi);border-radius:999px;}
+    #content{flex:1;overflow-y:auto;padding:24px 24px 40px;}
+    .ops-summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:16px;}
+    .summary-card{
+      background:linear-gradient(180deg, rgba(27,36,48,.9) 0%, rgba(21,29,39,.94) 100%);
+      border:1px solid var(--line);border-radius:18px;padding:18px 18px 16px;box-shadow:var(--shadow-lg);
+    }
+    .summary-card .label{font-size:11px;color:var(--text-low);margin-bottom:10px;text-transform:uppercase;letter-spacing:.16em;}
+    .summary-card .value{font-size:38px;font-weight:800;line-height:1;letter-spacing:-.05em;}
+    .summary-card .hint{margin-top:8px;font-size:12px;color:var(--text-mid);}
+    .value-live{color:var(--accent);}
+    .value-ok{color:var(--success);}
+    .value-warn{color:var(--warning);}
+    .card{
+      background:linear-gradient(180deg, rgba(21,29,39,.94) 0%, rgba(18,25,34,.96) 100%);
+      border:1px solid var(--line);border-radius:20px;padding:20px;margin-bottom:14px;box-shadow:var(--shadow-lg);
+    }
+    .card h2{font-size:18px;font-weight:800;letter-spacing:-.03em;margin-bottom:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+    .card h3{font-size:13px;font-weight:700;margin:14px 0 10px;color:var(--text-mid);letter-spacing:.05em;text-transform:uppercase;}
     .card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;}
-    .kv{display:grid;grid-template-columns:140px minmax(0,1fr);gap:4px 12px;font-size:13px;}
-    .kv .k{color:var(--text-2);}
-    .kv .v{color:var(--text-0);word-break:break-all;}
+    .utility-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr);gap:14px;align-items:start;}
+    .kv{display:grid;grid-template-columns:150px minmax(0,1fr);gap:6px 14px;font-size:13px;align-items:start;}
+    .kv .k{color:var(--text-low);}
+    .kv .v{color:var(--text-hi);word-break:normal;overflow-wrap:anywhere;}
     .badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;}
-    .badge-join{background:rgba(34,197,94,.15);color:var(--success);}
-    .badge-leave{background:rgba(239,68,68,.15);color:var(--danger);}
-    .badge-chat{background:rgba(59,130,246,.15);color:var(--accent);}
-    .badge-default{background:var(--bg-3);color:var(--text-1);}
-    .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;background:var(--bg-3);color:var(--text-1);margin-left:6px;}
-    .table-wrap{width:100%;overflow-x:auto;}
+    .badge-join{background:var(--success-soft);color:var(--success);}
+    .badge-leave{background:var(--danger-soft);color:var(--danger);}
+    .badge-chat{background:var(--accent-glow);color:var(--accent);}
+    .badge-default{background:rgba(255,255,255,.06);color:var(--text-mid);}
+    .pill{display:inline-block;padding:4px 10px;border-radius:999px;font-size:11px;background:rgba(255,255,255,.06);color:var(--text-mid);margin-left:6px;border:1px solid transparent;}
+    .pill-ok{background:var(--success-soft);color:var(--success);border-color:rgba(34,197,94,.2);}
+    .pill-warn{background:var(--warning-soft);color:var(--warning);border-color:rgba(245,158,11,.2);}
+    .pill-danger{background:var(--danger-soft);color:var(--danger);border-color:rgba(239,68,68,.2);}
+    .eyebrow{display:inline-block;font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--text-low);margin-bottom:10px;}
+    .hero-card{padding:22px;}
+    .hero-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px;flex-wrap:wrap;}
+    .hero-copy{max-width:760px;color:var(--text-mid);font-size:14px;line-height:1.6;}
+    .hero-meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+    .alert-pill{
+      display:inline-flex;align-items:center;gap:8px;padding:7px 11px;border-radius:999px;border:1px solid var(--line);font-size:12px;font-weight:700;
+      background:rgba(255,255,255,.03);color:var(--text-mid);
+    }
+    .alert-pill.warn{background:var(--warning-soft);border-color:rgba(245,158,11,.22);color:var(--warning);}
+    .alert-pill.ok{background:var(--success-soft);border-color:rgba(34,197,94,.2);color:var(--success);}
+    .alert-pill.live{background:var(--accent-glow);border-color:rgba(76,201,240,.24);color:var(--accent);}
+    .overview-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(320px,1fr);gap:14px;margin-bottom:14px;align-items:start;}
+    .status-strip{display:grid;grid-template-columns:1fr;gap:12px;align-content:start;}
+    .status-panel{
+      padding:16px;border-radius:16px;background:rgba(255,255,255,.03);border:1px solid var(--line);min-width:0;
+    }
+    .status-panel h3{margin:0 0 12px;font-size:12px;}
+    .status-panel .kv{grid-template-columns:112px minmax(0,1fr);}
+    .runtime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;}
+    .runtime-card{padding:18px;border-radius:18px;background:rgba(255,255,255,.03);border:1px solid var(--line);}
+    .runtime-card .runtime-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:14px;}
+    .runtime-card .runtime-title{font-size:22px;font-weight:800;letter-spacing:-.03em;}
+    .runtime-card .kv{grid-template-columns:124px minmax(0,1fr);}
+    .metric-stack{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px;}
+    .metric-inline{padding:10px 0;border-top:1px solid var(--line-soft);}
+    .metric-inline .k{display:block;font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:var(--text-low);margin-bottom:6px;}
+    .metric-inline .v{display:block;font-size:20px;font-weight:700;letter-spacing:-.03em;}
+    .table-wrap{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.02);}
     table{width:100%;border-collapse:collapse;font-size:13px;}
-    th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);color:var(--text-2);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.3px;}
-    td{padding:7px 10px;border-bottom:1px solid var(--border);vertical-align:top;word-break:break-word;color:var(--text-0);}
-    tr:hover td{background:var(--bg-3);}
-    .mono{font-family:Consolas,"Courier New",monospace;font-size:12px;}
-    .muted{color:var(--text-2);}
-    pre{margin:8px 0 0;padding:14px;background:var(--bg-0);border:1px solid var(--border);border-radius:6px;overflow:auto;font-size:12px;line-height:1.5;max-height:65vh;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-1);font-family:Consolas,"Courier New",monospace;}
+    th{text-align:left;padding:11px 12px;border-bottom:1px solid var(--line);color:var(--text-low);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.14em;background:rgba(255,255,255,.02);}
+    td{padding:11px 12px;border-bottom:1px solid var(--line-soft);vertical-align:top;word-break:break-word;color:var(--text-hi);}
+    tr:hover td{background:rgba(255,255,255,.03);}
+    .mono{font-family:Consolas,"Cascadia Mono","Courier New",monospace;font-size:12px;}
+    .muted{color:var(--text-low);}
+    pre{margin:8px 0 0;padding:14px;background:#0c131b;border:1px solid var(--line);border-radius:14px;overflow:auto;font-size:12px;line-height:1.5;max-height:65vh;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--text-mid);font-family:Consolas,"Cascadia Mono","Courier New",monospace;}
     .log-error{color:var(--danger);}
     .log-warn{color:var(--warning);}
-    .log-info{color:var(--text-1);}
-    .btn{display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--border);background:var(--bg-3);color:var(--text-0);transition:all .15s;}
-    .btn:hover{background:var(--border-active);border-color:var(--border-active);}
+    .log-info{color:var(--text-mid);}
+    .btn{display:inline-flex;align-items:center;gap:5px;padding:7px 12px;border-radius:10px;font-size:12px;font-weight:700;cursor:pointer;border:1px solid var(--line);background:rgba(255,255,255,.04);color:var(--text-hi);transition:all .15s;}
+    .btn:hover{background:rgba(255,255,255,.08);border-color:var(--line-strong);}
     .btn-danger{border-color:var(--danger);color:var(--danger);background:transparent;}
     .btn-danger:hover{background:var(--danger);color:#fff;}
-    .btn-accent{border-color:var(--accent);color:#fff;background:var(--accent);}
-    .btn-accent:hover{background:var(--accent-hover);}
+    .btn-accent{border-color:var(--accent-strong);color:#03131b;background:linear-gradient(180deg, var(--accent) 0%, var(--accent-strong) 100%);}
+    .btn-accent:hover{background:linear-gradient(180deg, #68d8f6 0%, #4cc9f0 100%);}
     .btn-sm{padding:3px 8px;font-size:11px;}
     .action-bar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap;}
-    .action-bar input[type=text]{flex:1;min-width:200px;padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-0);color:var(--text-0);font-size:13px;outline:none;}
+    .action-bar input[type=text]{flex:1;min-width:200px;padding:8px 11px;border-radius:10px;border:1px solid var(--line);background:#0d141d;color:var(--text-hi);font-size:13px;outline:none;}
     .action-bar input[type=text]:focus{border-color:var(--accent);}
-    .action-bar select{padding:6px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-0);color:var(--text-0);font-size:13px;outline:none;}
+    .action-bar select{padding:8px 11px;border-radius:10px;border:1px solid var(--line);background:#0d141d;color:var(--text-hi);font-size:13px;outline:none;}
     details{margin-top:8px;}
-    details summary{cursor:pointer;font-weight:600;font-size:13px;color:var(--text-1);padding:6px 0;}
-    details summary:hover{color:var(--text-0);}
+    details summary{cursor:pointer;font-weight:700;font-size:13px;color:var(--text-mid);padding:9px 0;}
+    details summary:hover{color:var(--text-hi);}
     details[open] summary{margin-bottom:8px;}
     .hw-strong{font-weight:700;color:var(--accent);}
     .db-tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px;}
-    .db-tab{padding:4px 10px;border-radius:6px;font-size:12px;cursor:pointer;background:var(--bg-0);color:var(--text-2);border:1px solid transparent;}
-    .db-tab:hover{color:var(--text-0);}
-    .db-tab.active{background:var(--bg-3);color:var(--text-0);border-color:var(--border);}
+    .db-tab{padding:6px 10px;border-radius:10px;font-size:12px;cursor:pointer;background:#0d141d;color:var(--text-low);border:1px solid transparent;}
+    .db-tab:hover{color:var(--text-hi);}
+    .db-tab.active{background:rgba(255,255,255,.05);color:var(--text-hi);border-color:var(--line);}
+    .health-badge{display:inline-flex;align-items:center;gap:7px;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;border:1px solid transparent;}
+    .health-ok{background:var(--success-soft);color:var(--success);border-color:rgba(34,197,94,.22);}
+    .health-watch{background:var(--accent-glow);color:var(--accent);border-color:rgba(76,201,240,.2);}
+    .health-warn{background:var(--warning-soft);color:var(--warning);border-color:rgba(245,158,11,.2);}
+    .health-badge .dot{display:inline-block;width:7px;height:7px;border-radius:999px;background:currentColor;box-shadow:0 0 14px currentColor;}
+    .section-note{margin:0 0 14px;color:var(--text-mid);font-size:14px;line-height:1.6;}
+    .row-stack{display:flex;flex-direction:column;gap:4px;}
+    .detail-panel{padding:14px 16px;border-radius:16px;background:rgba(255,255,255,.03);border:1px solid var(--line);margin-top:10px;}
+    .detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;}
+    .room-shell{padding:18px;border-radius:18px;background:rgba(255,255,255,.03);border:1px solid var(--line);margin-top:14px;}
     #modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center;}
     #modal-overlay.show{display:flex;}
-    .modal-box{background:var(--bg-2);border:1px solid var(--border);border-radius:10px;padding:20px;width:420px;max-width:90vw;}
+    .modal-box{background:var(--bg-panel);border:1px solid var(--line);border-radius:18px;padding:20px;width:420px;max-width:90vw;}
     .modal-box h3{font-size:15px;margin-bottom:12px;}
-    .modal-box p{font-size:13px;color:var(--text-1);margin-bottom:16px;line-height:1.5;}
+    .modal-box p{font-size:13px;color:var(--text-mid);margin-bottom:16px;line-height:1.5;}
     .modal-box .modal-actions{display:flex;gap:8px;justify-content:flex-end;}
-    .modal-box input[type=text],.modal-box input[type=password]{width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg-0);color:var(--text-0);font-size:13px;margin-bottom:12px;outline:none;}
+    .modal-box input[type=text],.modal-box input[type=password]{width:100%;padding:8px 10px;border-radius:10px;border:1px solid var(--line);background:#0d141d;color:var(--text-hi);font-size:13px;margin-bottom:12px;outline:none;}
     .modal-box input:focus{border-color:var(--accent);}
     #toast-container{position:fixed;bottom:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:8px;}
-    .toast{padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;animation:toastin .25s ease;min-width:200px;}
+    .toast{padding:10px 16px;border-radius:12px;font-size:13px;font-weight:700;animation:toastin .25s ease;min-width:200px;}
     .toast-success{background:#14532d;color:var(--success);border:1px solid #166534;}
     .toast-error{background:#450a0a;color:var(--danger);border:1px solid #7f1d1d;}
     @keyframes toastin{from{opacity:0;transform:translateY(10px);}to{opacity:1;transform:translateY(0);}}
-    @media(max-width:760px){.sidebar{display:none;}.card-grid{grid-template-columns:1fr;}}
+    @media(max-width:1180px){.overview-grid,.utility-grid{grid-template-columns:1fr;}}
+    @media(max-width:920px){
+      .shell-toggle{display:inline-flex;}
+      .sidebar{
+        position:fixed;left:0;top:0;bottom:0;transform:translateX(-105%);transition:transform .2s ease;
+        width:min(86vw,320px);
+      }
+      body.nav-open .sidebar{transform:translateX(0);}
+      body.nav-open .sidebar-scrim{display:block;}
+      .topbar{padding:14px 16px;}
+      .topbar h1{font-size:24px;}
+      #content{padding:16px 16px 28px;}
+    }
+    @media(max-width:760px){
+      .card-grid,.runtime-grid,.ops-summary-grid,.status-strip,.metric-stack{grid-template-columns:1fr;}
+      .topbar-meta{display:none;}
+      .kv{grid-template-columns:1fr;}
+      .summary-card .value{font-size:32px;}
+    }
   </style>
 </head>
 <body>
+  <div class="sidebar-scrim" id="sidebar-scrim"></div>
   <aside class="sidebar">
-    <div class="brand"><span>WON</span> Admin</div>
+    <div class="brand-block">
+      <div class="brand-eyebrow">WON Relay Console</div>
+      <div class="brand"><span>WON</span> Admin</div>
+    </div>
     <nav id="nav"></nav>
     <div class="sidebar-footer" id="sidebar-footer">Loading...</div>
   </aside>
   <div class="main-wrap">
     <header class="topbar">
-      <h1 id="page-title">Overview</h1>
-      <div class="meta" id="topbar-meta">Loading...</div>
+      <div class="topbar-main">
+        <button class="shell-toggle" id="shell-toggle" aria-label="Open navigation"><span></span><span></span><span></span></button>
+        <div>
+          <div class="topbar-label">Operations Console</div>
+          <h1 id="page-title">Overview</h1>
+        </div>
+      </div>
+      <div class="topbar-meta">
+        <div class="meta-stack">
+          <div class="topbar-status" id="topbar-status">Loading status...</div>
+          <div class="meta" id="topbar-meta">Loading...</div>
+        </div>
+      </div>
     </header>
     <main id="content"></main>
   </div>
@@ -772,7 +896,10 @@ class AdminDashboardServer:
     const nav = document.getElementById("nav");
     const pageTitle = document.getElementById("page-title");
     const topbarMeta = document.getElementById("topbar-meta");
+    const topbarStatus = document.getElementById("topbar-status");
     const sidebarFooter = document.getElementById("sidebar-footer");
+    const sidebarScrim = document.getElementById("sidebar-scrim");
+    const shellToggle = document.getElementById("shell-toggle");
     const modalOverlay = document.getElementById("modal-overlay");
     const modalBox = document.getElementById("modal-box");
     const toastContainer = document.getElementById("toast-container");
@@ -814,6 +941,25 @@ class AdminDashboardServer:
     function nameList(vs){return(vs||[]).map(v=>hwMarkup(v)).join(", ");}
     function kindBadge(k){const m={join:"badge-join",rejoin:"badge-join",leave:"badge-leave",chat:"badge-chat",broadcast:"badge-chat"};return `<span class="badge ${m[k]||"badge-default"}">${esc(k)}</span>`;}
     function shortHex(hex,maxChars=24){const s=String(hex||"").trim();if(!s)return "";return s.length>maxChars?`${s.slice(0,maxChars)}...`:s;}
+    function slowPeerSummary(row){
+      const slowEvents=Number((row&&row.slow_peer_data_events)||0);
+      const slowestMs=Number((row&&row.slowest_peer_data_send_ms)||0);
+      if(!slowEvents&&!slowestMs)return '<span class="muted">-</span>';
+      return `${esc(slowEvents)} / ${esc(slowestMs)}ms`;
+    }
+    function slowPeerLast(row){
+      const lastMs=Number((row&&row.last_slow_peer_data_send_ms)||0);
+      const sinceRaw=row&&row.seconds_since_last_slow_peer_data;
+      const since=sinceRaw==null?"":age(sinceRaw);
+      if(!lastMs)return '<span class="muted">-</span>';
+      return `${esc(lastMs)}ms${since?` <span class="muted">${esc(since)} ago</span>`:""}`;
+    }
+    function writeBufferSummary(row){
+      const size=Number((row&&row.write_buffer_size)||0);
+      const high=Number((row&&row.write_buffer_high_water)||0);
+      if(!size)return '<span class="muted">-</span>';
+      return `${esc(formatBytes(size))}${high?` <span class="muted">/ ${esc(formatBytes(high))} high</span>`:""}`;
+    }
     function displayRoomName(snapshot,roomName,roomPort,isGameRoom=false){
       const gw=snapshot.gateway||{};
       const basePort=Number(gw.routing_port||0);
@@ -1131,6 +1277,18 @@ class AdminDashboardServer:
       if(hasActiveSelection())return true;
       return false;
     }
+    function setNavOpen(open){
+      document.body.classList.toggle("nav-open", !!open);
+    }
+    shellToggle?.addEventListener("click",()=>setNavOpen(true));
+    sidebarScrim?.addEventListener("click",()=>setNavOpen(false));
+    window.addEventListener("resize",()=>{if(window.innerWidth>920)setNavOpen(false);});
+    function formatBytes(value){
+      const num=Math.max(0,Number(value||0));
+      if(num<1024)return `${Math.round(num)} B`;
+      if(num<1024*1024)return `${(num/1024).toFixed(num<10240?1:0)} KB`;
+      return `${(num/(1024*1024)).toFixed(1)} MB`;
+    }
     function repoSummary(repo){
       if(!repo||!repo.available)return '<span class="muted">Git metadata unavailable.</span>';
       let label="Up to date",color="var(--success)";
@@ -1142,6 +1300,54 @@ class AdminDashboardServer:
       const dirty=repo.dirty?` <span class="pill">dirty</span>`:"";
       return `<span style="color:${color};font-weight:600;">${esc(label)}</span>${dirty}`;
     }
+    function dashboardAlerts(snapshot, overallMetrics=null){
+      const gw=snapshot.gateway||{};
+      const rt=gw.routing_manager||{};
+      const metrics=overallMetrics||productMetrics(snapshot).overall;
+      const rooms=rt.servers||[];
+      const slowCount=rooms.reduce((sum,room)=>sum+Number(room.slow_peer_data_events||0),0);
+      const bufferCount=rooms.filter(room=>Number(room.largest_write_buffer_size||0)>0).length;
+      const items=[];
+      if(slowCount>0)items.push({tone:"warn",label:"Slow Delivery Alerts",value:`${slowCount} events`});
+      if(bufferCount>0)items.push({tone:"warn",label:"Queued Writes",value:`${bufferCount} rooms`});
+      if(Number(metrics.reconnecting||0)>0)items.push({tone:"warn",label:"Reconnect Holds",value:String(metrics.reconnecting)});
+      if(gw.auth_keys_loaded===false)items.push({tone:"danger",label:"Auth Keys",value:"Missing"});
+      if((snapshot.repo||{}).update_available)items.push({tone:"warn",label:"GitHub Update",value:"Available"});
+      if(!items.length)items.push({tone:"ok",label:"Transport Health",value:"Stable"});
+      return {slowCount,items};
+    }
+    function renderAlertPill(alert){
+      const tone=String(alert&&alert.tone||"ok").toLowerCase();
+      const mapped=tone==="danger"?"warn":tone;
+      return `<span class="alert-pill ${esc(mapped)}"><strong>${esc(alert.label||"")}</strong><span>${esc(alert.value||"")}</span></span>`;
+    }
+    function summaryMetricCard(label,value,tone="live",hint=""){
+      return `<div class="summary-card">
+        <div class="label">${esc(label)}</div>
+        <div class="value value-${esc(tone)}">${esc(value)}</div>
+        ${hint?`<div class="hint">${esc(hint)}</div>`:""}
+      </div>`;
+    }
+    function connectionHealth(row){
+      const slowEvents=Number((row&&row.slow_peer_data_events)||0);
+      const bufferSize=Number((row&&row.write_buffer_size)||0);
+      const highWater=Number((row&&row.write_buffer_high_water)||0);
+      if(highWater>0&&bufferSize>=highWater)return {label:"Backpressure",tone:"warn"};
+      if(bufferSize>0)return {label:"Queued Writes",tone:"watch"};
+      if(slowEvents>=3)return {label:"Transport Warning",tone:"warn"};
+      if(slowEvents>0)return {label:"Watch",tone:"watch"};
+      return {label:"Stable",tone:"ok"};
+    }
+    function healthBadge(health){
+      const tone=String(health&&health.tone||"ok");
+      return `<span class="health-badge health-${esc(tone)}"><span class="dot"></span>${esc(health&&health.label||"Stable")}</span>`;
+    }
+    function roomHealth(room){
+      const slowEvents=Number((room&&room.slow_peer_data_events)||0);
+      const bufferSize=Number((room&&room.largest_write_buffer_size)||0);
+      if(bufferSize>0)return {label:"Queued Writes",tone:"warn"};
+      return slowEvents>0?{label:"Transport Warning",tone:"warn"}:{label:"Stable",tone:"ok"};
+    }
 
     function renderNav(snapshot){
       const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const act=gw.activity||[];const logs=snapshot.logs||[];
@@ -1150,7 +1356,7 @@ class AdminDashboardServer:
         const badge=counts[p.id]!=null?`<span class="nav-badge">${counts[p.id]}</span>`:"";
         return `<button class="nav-item${activePage===p.id?" active":""}" data-page="${p.id}"><svg viewBox="0 0 24 24">${p.icon}</svg>${esc(p.label)}${badge}</button>`;
       }).join("");
-      nav.querySelectorAll("[data-page]").forEach(btn=>{btn.addEventListener("click",()=>{activePage=btn.dataset.page;renderAll(lastSnapshot);});});
+      nav.querySelectorAll("[data-page]").forEach(btn=>{btn.addEventListener("click",()=>{activePage=btn.dataset.page;setNavOpen(false);renderAll(lastSnapshot);});});
     }
 
     function renderSidebarFooter(snapshot){
@@ -1163,8 +1369,11 @@ class AdminDashboardServer:
 
     function renderTopbar(snapshot){
       const p=pages.find(x=>x.id===activePage);
+      const metrics=productMetrics(snapshot);
+      const alerts=dashboardAlerts(snapshot,metrics.overall);
       pageTitle.textContent=p?p.label:"Dashboard";
       topbarMeta.textContent="Last refresh: "+new Date((snapshot.generated_at||0)*1000).toLocaleTimeString();
+      topbarStatus.textContent=alerts.slowCount>0?`${alerts.slowCount} slow-delivery events in view`:`${metrics.overall.liveGames} live games · transport stable`;
     }
 
     function renderOverview(snapshot){
@@ -1172,53 +1381,96 @@ class AdminDashboardServer:
       const metrics=productMetrics(snapshot);
       const gameStats=metrics.overall;
       const banned=gw.banned_ips||[];
+      const alerts=dashboardAlerts(snapshot,gameStats);
       const productCards=metrics.keys.map(product=>{
         const bucket=metrics.byProduct[product];
         const info=bucket.info||{};
-        return `<div class="card">
-          <h2>${productBadge(product)}${esc(info.community_name||product)}</h2>
-          <div class="kv">
+        return `<article class="runtime-card">
+          <div class="runtime-head">
+            <div>
+              ${productBadge(product)}
+              <div class="runtime-title">${esc(info.community_name||product)}</div>
+            </div>
+            <div class="hero-meta">
+              <span class="pill ${bucket.gameRooms?'pill-ok':''}">${esc(bucket.gameRooms)} game rooms</span>
+              <span class="pill">${esc(bucket.playersOnline)} online</span>
+            </div>
+          </div>
+          <div class="kv" style="margin-bottom:12px;">
             <div class="k">Directory Root</div><div class="v">${esc(info.directory_root||"")}</div>
-            <div class="k">Routing Port</div><div class="v">${esc(info.routing_port||0)}</div>
+            <div class="k">Routing Range</div><div class="v">${esc(info.routing_port||0)} - ${esc(info.routing_max_port||info.routing_port||0)}</div>
             <div class="k">Backend</div><div class="v">${esc(info.backend_host||"")}:${esc(info.backend_port||0)}</div>
             <div class="k">Version</div><div class="v">${esc(info.version_str||"")}</div>
             <div class="k">Valid Versions</div><div class="v">${(info.valid_versions||[]).map(v=>`<span class="pill" style="margin-left:0;margin-right:4px;">${esc(v)}</span>`).join("")||'<span class="muted">n/a</span>'}</div>
-            <div class="k">Players Online</div><div class="v">${esc(bucket.playersOnline)}</div>
-            <div class="k">Players In Game</div><div class="v">${esc(bucket.playersInGame)}</div>
-            <div class="k">Players In Lobby</div><div class="v">${esc(bucket.playersInLobby)}</div>
-            <div class="k">Reconnect Holds</div><div class="v">${esc(bucket.reconnecting)}</div>
-            <div class="k">Active Rooms</div><div class="v">${esc(bucket.activeRooms)}</div>
-            <div class="k">Game Rooms</div><div class="v">${esc(bucket.gameRooms)}</div>
-            <div class="k">Live Games</div><div class="v">${esc(bucket.liveGames)}</div>
-            <div class="k">Unique IPs</div><div class="v">${esc(bucket.uniqueIps)}</div>
-            <div class="k">IPs Seen</div><div class="v">${esc(bucket.totalIpsSeen)}</div>
-            <div class="k">Peer Data Msgs</div><div class="v">${esc(bucket.peerMsgs)}</div>
-            <div class="k">Peer Data Bytes</div><div class="v">${esc(bucket.peerBytes)}</div>
-            <div class="k">Game Obj Bytes</div><div class="v">${esc(bucket.gameObjectBytes)}</div>
-            <div class="k">Joins / Leaves</div><div class="v">${esc(bucket.joins)} / ${esc(bucket.leaves)}</div>
-            <div class="k">Chat / Broadcasts</div><div class="v">${esc(bucket.chats)} / ${esc(bucket.broadcasts)}</div>
           </div>
-        </div>`;
+          <div class="metric-stack">
+            <div class="metric-inline"><span class="k">Players In Game</span><span class="v">${esc(bucket.playersInGame)}</span></div>
+            <div class="metric-inline"><span class="k">Players In Lobby</span><span class="v">${esc(bucket.playersInLobby)}</span></div>
+            <div class="metric-inline"><span class="k">Unique IPs</span><span class="v">${esc(bucket.uniqueIps)}</span></div>
+            <div class="metric-inline"><span class="k">Reconnect Holds</span><span class="v">${esc(bucket.reconnecting)}</span></div>
+            <div class="metric-inline"><span class="k">Peer Data Bytes</span><span class="v">${esc(formatBytes(bucket.peerBytes))}</span></div>
+            <div class="metric-inline"><span class="k">Game Obj Bytes</span><span class="v">${esc(formatBytes(bucket.gameObjectBytes))}</span></div>
+          </div>
+        </article>`;
       }).join("");
       return `
-        <div class="stat-grid">
-          <div class="stat-card"><div class="label">Players Online</div><div class="value accent">${esc(gameStats.playersOnline)}</div></div>
-          <div class="stat-card"><div class="label">Players In Game</div><div class="value success">${esc(gameStats.playersInGame)}</div></div>
-          <div class="stat-card"><div class="label">Players In Lobby</div><div class="value">${esc(gameStats.playersInLobby)}</div></div>
-          <div class="stat-card"><div class="label">Reconnecting</div><div class="value warning">${esc(gameStats.reconnecting)}</div></div>
-          <div class="stat-card"><div class="label">Active Rooms</div><div class="value">${esc(gameStats.activeRooms||rt.room_count||0)}</div></div>
-          <div class="stat-card"><div class="label">Game Rooms</div><div class="value">${esc(gameStats.gameRooms)}</div></div>
-          <div class="stat-card"><div class="label">Live Games</div><div class="value success">${esc(gameStats.liveGames)}</div></div>
-          <div class="stat-card"><div class="label">Unique IPs</div><div class="value">${esc(gameStats.uniqueIps||rt.current_unique_ip_count||0)}</div></div>
-          <div class="stat-card"><div class="label">Peer Data</div><div class="value">${esc(gameStats.peerBytes)}<span style="font-size:13px;color:var(--text-2);margin-left:6px;">bytes</span></div></div>
-          <div class="stat-card"><div class="label">Game Obj Bytes</div><div class="value">${esc(gameStats.gameObjectBytes)}<span style="font-size:13px;color:var(--text-2);margin-left:6px;">bytes</span></div></div>
-        </div>
-        ${productCards?`<div class="card">
+        <section class="ops-summary-grid">
+          ${summaryMetricCard("Players Online", gameStats.playersOnline, "live", `${gameStats.playersInLobby} in lobby`)}
+          ${summaryMetricCard("Players In Game", gameStats.playersInGame, "ok", `${gameStats.activeRooms||rt.room_count||0} active rooms`)}
+          ${summaryMetricCard("Live Games", gameStats.liveGames, "ok", `${gameStats.gameRooms} game rooms`)}
+          ${summaryMetricCard("Reconnect Holds", gameStats.reconnecting, gameStats.reconnecting?"warn":"ok", gameStats.reconnecting?"needs operator attention":"none queued")}
+          ${summaryMetricCard("Slow Delivery Alerts", alerts.slowCount, alerts.slowCount?"warn":"ok", alerts.slowCount?"transport degradation detected":"transport stable")}
+          ${summaryMetricCard("Peer Data", formatBytes(gameStats.peerBytes), "live", `${gameStats.peerMsgs} messages routed`)}
+        </section>
+        <section class="card hero-card">
+          <div class="hero-heading">
+            <div>
+              <span class="eyebrow">Operations Summary</span>
+              <h2>Transport Health</h2>
+              <p class="hero-copy">Live match transport, reconnect state, and runtime health are surfaced first so operators can spot pressure before digging into raw routing details.</p>
+            </div>
+            <div class="hero-meta">${alerts.items.map(renderAlertPill).join("")}</div>
+          </div>
+          <div class="overview-grid">
+            <div class="status-panel">
+              <h3>Connection Health</h3>
+              <div class="kv">
+                <div class="k">Unique IPs</div><div class="v">${esc(gameStats.uniqueIps||rt.current_unique_ip_count||0)}</div>
+                <div class="k">Active Rooms</div><div class="v">${esc(gameStats.activeRooms||rt.room_count||0)}</div>
+                <div class="k">Game Obj Bytes</div><div class="v">${esc(formatBytes(gameStats.gameObjectBytes))}</div>
+                <div class="k">Live Game Objects</div><div class="v">${esc(gameStats.liveGameObjects)}</div>
+                <div class="k">Rooms Opened</div><div class="v">${esc(am.room_open_count||0)}</div>
+                <div class="k">Peer Sessions</div><div class="v">${esc(gw.peer_session_count)}</div>
+              </div>
+            </div>
+            <div class="status-strip">
+              <div class="status-panel">
+                <h3>Auth And Update Status</h3>
+                <div class="kv">
+                  <div class="k">Auth Keys</div><div class="v">${gw.auth_keys_loaded?'<span class="pill pill-ok">Loaded</span>':'<span class="pill pill-danger">Missing</span>'}</div>
+                  <div class="k">GitHub</div><div class="v">${repoSummary(repo)}</div>
+                  <div class="k">Version</div><div class="v">${esc(gw.version_str)}</div>
+                </div>
+              </div>
+              <div class="status-panel">
+                <h3>Chat And Activity</h3>
+                <div class="kv">
+                  <div class="k">Joins / Leaves</div><div class="v">${esc(gameStats.joins||am.join_count||0)} / ${esc(gameStats.leaves||am.leave_count||0)}</div>
+                  <div class="k">Chat / Broadcasts</div><div class="v">${esc(gameStats.chats||am.chat_count||0)} / ${esc(gameStats.broadcasts||0)}</div>
+                  <div class="k">Last Refresh</div><div class="v">${esc(new Date((snapshot.generated_at||0)*1000).toLocaleTimeString())}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+        ${productCards?`<section class="card">
+          <span class="eyebrow">Runtime Status</span>
           <h2>Per-Product Live Status</h2>
-          <div class="card-grid">${productCards}</div>
-        </div>`:""}
-        <div class="card-grid">
+          <div class="runtime-grid">${productCards}</div>
+        </section>`:""}
+        <section class="utility-grid">
           <div class="card">
+            <span class="eyebrow">Infrastructure</span>
             <h2>Server Info</h2>
             <div class="kv">
               <div class="k">Product</div><div class="v">${esc(gw.product||"")}${gw.community_name?` <span class="muted">(${esc(gw.community_name)})</span>`:""}</div>
@@ -1236,6 +1488,7 @@ class AdminDashboardServer:
             </div>
           </div>
           <div class="card">
+            <span class="eyebrow">Maintenance</span>
             <h2>Activity Counters</h2>
             <div class="kv">
               <div class="k">Joins</div><div class="v">${esc(gameStats.joins||am.join_count||0)}</div>
@@ -1255,39 +1508,37 @@ class AdminDashboardServer:
               <div class="k">Non-empty</div><div class="v">${esc(db.nonempty_table_count||0)}</div>
               <div class="k">Total Rows</div><div class="v">${esc(db.total_rows||0)}</div>
             </div>
+          </div></section>
+        <section class="card">
+          <span class="eyebrow">Operator Utilities</span>
+          <h2>GitHub Updates</h2>
+          <div class="action-bar">
+            <button class="btn" data-action="github-check">Check GitHub</button>
+            <button class="btn ${repo.can_update?'btn-accent':''}" data-action="github-update">Update From GitHub</button>
           </div>
-          <div class="card">
-            <h2>GitHub Updates</h2>
-            <div class="action-bar">
-              <button class="btn" data-action="github-check">Check GitHub</button>
-              <button class="btn ${repo.can_update?'btn-accent':''}" data-action="github-update">Update From GitHub</button>
-            </div>
-            <div class="kv">
-              <div class="k">Status</div><div class="v">${repoSummary(repo)}</div>
-              <div class="k">Branch</div><div class="v">${esc(repo.branch||"")}</div>
-              <div class="k">Upstream</div><div class="v">${esc(repo.upstream||"")}</div>
-              <div class="k">Local Commit</div><div class="v">${esc(repo.local_label||repo.local_short||"")}</div>
-              <div class="k">GitHub Commit</div><div class="v">${esc(repo.remote_label||repo.remote_short||"")}</div>
-              <div class="k">Local Describe</div><div class="v">${esc(repo.local_version||"")}</div>
-              <div class="k">GitHub Describe</div><div class="v">${esc(repo.remote_version||"")}</div>
-              <div class="k">Ahead / Behind</div><div class="v">${esc(repo.ahead||0)} / ${esc(repo.behind||0)}</div>
-              <div class="k">Last Checked</div><div class="v">${repo.last_checked_at?esc(new Date(repo.last_checked_at*1000).toLocaleString()):"Never"}</div>
-              <div class="k">Last Updated</div><div class="v">${repo.last_update_at?esc(new Date(repo.last_update_at*1000).toLocaleString()):"Never"}</div>
-              <div class="k">Remote</div><div class="v">${esc(repo.remote_url||"")}</div>
-            </div>
-            ${repo.last_error?`<p class="muted" style="margin-top:12px;color:var(--danger);">${esc(repo.last_error)}</p>`:""}
-            ${repo.last_update_message?`<p class="muted" style="margin-top:12px;">${esc(repo.last_update_message)}</p>`:""}
-            ${repo.restart_required?`<p class="muted" style="margin-top:8px;color:var(--warning);">Restart the gateway service to apply the updated code.</p>`:""}
+          <div class="kv">
+            <div class="k">Status</div><div class="v">${repoSummary(repo)}</div>
+            <div class="k">Branch</div><div class="v">${esc(repo.branch||"")}</div>
+            <div class="k">Upstream</div><div class="v">${esc(repo.upstream||"")}</div>
+            <div class="k">Local Commit</div><div class="v">${esc(repo.local_label||repo.local_short||"")}</div>
+            <div class="k">GitHub Commit</div><div class="v">${esc(repo.remote_label||repo.remote_short||"")}</div>
+            <div class="k">Ahead / Behind</div><div class="v">${esc(repo.ahead||0)} / ${esc(repo.behind||0)}</div>
+            <div class="k">Last Checked</div><div class="v">${repo.last_checked_at?esc(new Date(repo.last_checked_at*1000).toLocaleString()):"Never"}</div>
+            <div class="k">Remote</div><div class="v">${esc(repo.remote_url||"")}</div>
           </div>
-        </div>
+          ${repo.last_error?`<p class="muted" style="margin-top:12px;color:var(--danger);">${esc(repo.last_error)}</p>`:""}
+          ${repo.last_update_message?`<p class="muted" style="margin-top:12px;">${esc(repo.last_update_message)}</p>`:""}
+          ${repo.restart_required?`<p class="muted" style="margin-top:8px;color:var(--warning);">Restart the gateway service to apply the updated code.</p>`:""}
+        </section>
         ${banned.length?`
-        <div class="card">
+        <section class="card">
+          <span class="eyebrow">Access Control</span>
           <h2>Banned IPs <span class="pill">${banned.length}</span></h2>
           <div class="table-wrap"><table>
             <thead><tr><th>IP</th><th>Reason</th><th style="width:80px">Action</th></tr></thead>
             <tbody>${banned.map(b=>`<tr><td class="mono">${esc(b.ip)}</td><td>${esc(b.reason)}</td><td><button class="btn btn-sm" data-action="unban-ip" data-ip="${esc(b.ip)}">Unban</button></td></tr>`).join("")}</tbody>
           </table></div>
-        </div>`:""}`;
+        </section>`:""}`;
     }
 
     function renderPlayers(snapshot){
@@ -1303,39 +1554,70 @@ class AdminDashboardServer:
         const info=snapshotProductInfo(snapshot,product);
         const bucket=metrics.byProduct[product];
         const rows=grouped[product]||[];
-        return `<div class="card"><h2>${productBadge(product)}${esc(info.community_name||product)} <span class="pill">${rows.length}</span></h2>
-          <p class="muted" style="margin-bottom:12px;">${esc(bucket.playersInGame)} in game, ${esc(bucket.playersInLobby)} in lobby, ${esc(bucket.uniqueIps)} unique IPs.</p>
+        return `<section class="card">
+          <span class="eyebrow">Roster</span>
+          <h2>${productBadge(product)}${esc(info.community_name||product)} <span class="pill">${rows.length}</span></h2>
+          <p class="section-note">${esc(bucket.playersInGame)} in game, ${esc(bucket.playersInLobby)} in lobby, ${esc(bucket.uniqueIps)} unique IPs. Connection Health highlights transport drag while Player Activity keeps recent operator context visible.</p>
           ${rows.length?`<div class="table-wrap"><table>
-            <thead><tr><th>Player</th><th>State</th><th>IP</th><th>Room</th><th>Chat</th><th>Connected</th><th>Idle</th><th style="width:120px">Actions</th></tr></thead>
+            <thead><tr><th>Player</th><th>State</th><th>Room</th><th>Connection Health</th><th>Player Activity</th><th style="width:140px">Actions</th></tr></thead>
             <tbody>${rows.map(p=>{
               const isGameRoom=!!metrics.roomStateByKey.get(`${product}:${Number(p.room_port||0)}`);
+              const health=connectionHealth(p);
               return `<tr>
-                <td>${hwMarkup(p.client_name)}</td>
+                <td>
+                  <div class="row-stack">
+                    <strong>${hwMarkup(p.client_name)}</strong>
+                    <span class="mono muted">${esc(p.client_ip)}</span>
+                  </div>
+                </td>
                 <td>${isGameRoom?'<span class="badge badge-join">game</span>':'<span class="badge badge-default">lobby</span>'}</td>
-                <td class="mono">${esc(p.client_ip)}</td>
-                <td>${esc(displayRoomName(snapshot,p.room_name,p.room_port,isGameRoom))} <span class="muted">:${esc(p.room_port)}</span></td>
-                <td>${esc(p.chat_count)}</td>
-                <td>${age(p.connected_seconds)}</td>
-                <td>${age(p.idle_seconds)}</td>
+                <td>
+                  <div class="row-stack">
+                    <span>${esc(displayRoomName(snapshot,p.room_name,p.room_port,isGameRoom))}</span>
+                    <span class="muted">:${esc(p.room_port)}</span>
+                  </div>
+                </td>
+                <td>
+                  <div class="row-stack">
+                    ${healthBadge(health)}
+                    <span class="muted">${slowPeerSummary(p)}</span>
+                  </div>
+                </td>
+                <td>
+                  <div class="row-stack">
+                    <span>${age(p.connected_seconds)} connected</span>
+                    <span class="muted">${age(p.idle_seconds)} idle · ${esc(p.chat_count)} chats · ${esc(p.last_activity_kind||"none")}</span>
+                  </div>
+                </td>
                 <td><button class="btn btn-danger btn-sm" data-action="kick" data-room-port="${esc(p.room_port)}" data-client-id="${esc(p.client_id)}">Kick</button> <button class="btn btn-danger btn-sm" data-action="ban-ip" data-ip="${esc(p.client_ip)}">Ban</button></td>
               </tr>`;
             }).join("")}</tbody>
           </table></div>`:'<p class="muted">No live players connected for this product.</p>'}
           ${rows.map(p=>{
             const isGameRoom=!!metrics.roomStateByKey.get(`${product}:${Number(p.room_port||0)}`);
-            return `<details><summary>${hwMarkup(p.client_name)} <span class="muted">${esc(p.client_ip)} &middot; ${esc(displayRoomName(snapshot,p.room_name,p.room_port,isGameRoom))}:${esc(p.room_port)}</span></summary>
-              <div class="kv" style="padding:8px 0;">
-                <div class="k">Product</div><div class="v">${esc(product)}</div>
-                <div class="k">Client ID</div><div class="v">${esc(p.client_id)}</div>
-                <div class="k">Name</div><div class="v">${hwPlain(p.client_name)}</div>
-                <div class="k">State</div><div class="v">${isGameRoom?"In Game":"Lobby"}</div>
-                <div class="k">Subscriptions</div><div class="v">${esc(p.subscription_count)}</div>
-                <div class="k">Peer Data Msgs</div><div class="v">${esc(p.peer_data_messages)}</div>
-                <div class="k">Peer Data Bytes</div><div class="v">${esc(p.peer_data_bytes)}</div>
-                <div class="k">Last Activity</div><div class="v">${esc(p.last_activity_kind)}</div>
+            const health=connectionHealth(p);
+            return `<details class="detail-panel"><summary>${hwMarkup(p.client_name)} <span class="muted">${esc(p.client_ip)} &middot; ${esc(displayRoomName(snapshot,p.room_name,p.room_port,isGameRoom))}:${esc(p.room_port)}</span></summary>
+              <div class="detail-grid">
+                <div class="kv">
+                  <div class="k">Product</div><div class="v">${esc(product)}</div>
+                  <div class="k">Client ID</div><div class="v">${esc(p.client_id)}</div>
+                  <div class="k">State</div><div class="v">${isGameRoom?"In Game":"Lobby"}</div>
+                  <div class="k">Connection Health</div><div class="v">${healthBadge(health)}</div>
+                  <div class="k">Player Activity</div><div class="v">${esc(p.last_activity_kind||"")}</div>
+                  <div class="k">Subscriptions</div><div class="v">${esc(p.subscription_count)}</div>
+                </div>
+                <div class="kv">
+                  <div class="k">Peer Data Msgs</div><div class="v">${esc(p.peer_data_messages)}</div>
+                  <div class="k">Peer Data Bytes</div><div class="v">${esc(formatBytes(p.peer_data_bytes||0))}</div>
+                  <div class="k">Slow Send Events</div><div class="v">${esc(p.slow_peer_data_events||0)}</div>
+                  <div class="k">Slowest Send</div><div class="v">${Number(p.slowest_peer_data_send_ms||0)>0?`${esc(p.slowest_peer_data_send_ms)}ms`:'-'}</div>
+                  <div class="k">Last Slow Send</div><div class="v">${slowPeerLast(p)}</div>
+                  <div class="k">Write Buffer</div><div class="v">${writeBufferSummary(p)}</div>
+                  <div class="k">Idle</div><div class="v">${age(p.idle_seconds)}</div>
+                </div>
               </div></details>`;
           }).join("")}
-        </div>`;
+        </section>`;
       }).join("");
     }
 
@@ -1352,9 +1634,10 @@ class AdminDashboardServer:
         const info=snapshotProductInfo(snapshot,product);
         const bucket=metrics.byProduct[product];
         const rooms=grouped[product]||[];
-        return `<div class="card">
+        return `<section class="card">
+          <span class="eyebrow">Room Index</span>
           <h2>${productBadge(product)}${esc(info.community_name||product)} Rooms <span class="pill">${rooms.length}</span></h2>
-          <p class="muted" style="margin-bottom:12px;">${esc(bucket.activeRooms)} active rooms, ${esc(bucket.gameRooms)} active game rooms, ${esc(bucket.reconnecting)} reconnect holds.</p>
+          <p class="section-note">${esc(bucket.activeRooms)} active rooms, ${esc(bucket.gameRooms)} active game rooms, ${esc(bucket.reconnecting)} reconnect holds. Room Health highlights the rooms most likely to need operator attention first.</p>
           ${rooms.length?rooms.map(room=>{
             const isGameRoom=!!room.is_game_room||Number(room.active_game_count||0)>0;
             const roomName=displayRoomName(snapshot,room.room_name,room.listen_port,isGameRoom);
@@ -1362,30 +1645,58 @@ class AdminDashboardServer:
             const peerBytes=Number(room.peer_data_bytes||0);
             const gameBytes=(room.games||[]).reduce((sum,g)=>sum+Number(g.data_len||0),0);
             const activeGames=Number(room.active_game_count||0);
-            return `<div class="card" style="margin-bottom:12px;">
-              <h2>${esc(roomName)} <span class="muted" style="font-weight:400;font-size:12px;">:${esc(room.listen_port)}</span> <span class="pill">${esc(room.player_count)} players</span> <span class="pill">${esc(activeGames)} games</span></h2>
-              <div class="kv">
-                <div class="k">Description</div><div class="v">${esc(room.room_description)}</div>
-                <div class="k">Path</div><div class="v">${esc(room.room_path)}</div>
-                <div class="k">Room Type</div><div class="v">${isGameRoom?(room.published?"Game / Published":"Game Routing"):"Lobby / Published"}</div>
-                <div class="k">Published</div><div class="v">${esc(room.published)}</div>
-                <div class="k">Password Set</div><div class="v">${esc(room.room_password_set)}</div>
-                <div class="k">Flags</div><div class="v">0x${Number(room.room_flags||0).toString(16)}</div>
-                <div class="k">Peer Data Msgs</div><div class="v">${esc(peerMsgs)}</div>
-                <div class="k">Peer Data Bytes</div><div class="v">${esc(peerBytes)}</div>
-                <div class="k">Game/Object Bytes</div><div class="v">${esc(gameBytes)}</div>
+            const health=roomHealth(room);
+            return `<article class="room-shell">
+              <div class="hero-heading">
+                <div>
+                  <h2>${esc(roomName)} <span class="muted" style="font-weight:500;font-size:13px;">:${esc(room.listen_port)}</span></h2>
+                  <p class="section-note">${esc(room.room_description||"No description")} · ${isGameRoom?(room.published?"Game / Published":"Game Routing"):"Lobby / Published"}</p>
+                </div>
+                <div class="hero-meta">
+                  <span class="pill">${esc(room.player_count)} players</span>
+                  <span class="pill">${esc(activeGames)} games</span>
+                  ${healthBadge(health)}
+                </div>
               </div>
-              ${(room.players||[]).length?`<h3>Players</h3><div class="table-wrap"><table>
-                <thead><tr><th>Name</th><th>IP</th><th>Chat</th><th>Idle</th><th style="width:60px">Action</th></tr></thead>
-                <tbody>${room.players.map(p=>`<tr><td>${hwMarkup(p.client_name)}</td><td class="mono">${esc(p.client_ip)}</td><td>${esc(p.chat_count)}</td><td>${age(p.idle_seconds)}</td><td><button class="btn btn-danger btn-sm" data-action="kick" data-room-port="${esc(room.listen_port)}" data-client-id="${esc(p.client_id)}">Kick</button></td></tr>`).join("")}</tbody>
-              </table></div>`:'<p class="muted" style="margin-top:8px;">No players in this room.</p>'}
+              <div class="detail-grid">
+                <div class="status-panel">
+                  <h3>Room Health</h3>
+                  <div class="kv">
+                    <div class="k">Path</div><div class="v">${esc(room.room_path)}</div>
+                    <div class="k">Published</div><div class="v">${esc(room.published)}</div>
+                    <div class="k">Password Set</div><div class="v">${esc(room.room_password_set)}</div>
+                    <div class="k">Flags</div><div class="v">0x${Number(room.room_flags||0).toString(16)}</div>
+                    <div class="k">Peer Data Msgs</div><div class="v">${esc(peerMsgs)}</div>
+                    <div class="k">Peer Data Bytes</div><div class="v">${esc(formatBytes(peerBytes))}</div>
+                    <div class="k">Slow Send Events</div><div class="v">${esc(room.slow_peer_data_events||0)}</div>
+                    <div class="k">Slowest Send</div><div class="v">${Number(room.slowest_peer_data_send_ms||0)>0?`${esc(room.slowest_peer_data_send_ms)}ms`:'-'}</div>
+                    <div class="k">Largest Write Buffer</div><div class="v">${esc(formatBytes(room.largest_write_buffer_size||0))}</div>
+                    <div class="k">Game/Object Bytes</div><div class="v">${esc(formatBytes(gameBytes))}</div>
+                  </div>
+                </div>
+                <div class="status-panel">
+                  <h3>Roster Summary</h3>
+                  ${(room.players||[]).length?`<div class="table-wrap"><table>
+                    <thead><tr><th>Name</th><th>Connection Health</th><th>Player Activity</th><th style="width:60px">Action</th></tr></thead>
+                    <tbody>${room.players.map(p=>{
+                      const playerHealth=connectionHealth(p);
+                      return `<tr>
+                        <td><div class="row-stack"><strong>${hwMarkup(p.client_name)}</strong><span class="mono muted">${esc(p.client_ip)}</span></div></td>
+                        <td><div class="row-stack">${healthBadge(playerHealth)}<span class="muted">${slowPeerSummary(p)}</span></div></td>
+                        <td><div class="row-stack"><span>${age(p.idle_seconds)} idle</span><span class="muted">${esc(p.chat_count)} chats</span></div></td>
+                        <td><button class="btn btn-danger btn-sm" data-action="kick" data-room-port="${esc(room.listen_port)}" data-client-id="${esc(p.client_id)}">Kick</button></td>
+                      </tr>`;
+                    }).join("")}</tbody>
+                  </table></div>`:'<p class="muted">No players in this room.</p>'}
+                </div>
+              </div>
               ${(room.games||[]).length?`<h3>Live Game Objects</h3><div class="table-wrap"><table>
                 <thead><tr><th>Name</th><th>Owner</th><th>Link</th><th>Data</th><th>Life</th><th>Preview</th></tr></thead>
                 <tbody>${room.games.map(g=>`<tr><td>${esc(g.name)}</td><td>${hwMarkup(g.owner_name||String(g.owner_id))}</td><td>${esc(g.link_id)}</td><td>${esc(g.data_len)} bytes</td><td>${esc(g.lifespan)}</td><td class="mono">${esc(shortHex(g.data_preview_hex,32))}</td></tr>`).join("")}</tbody>
               </table></div>`:`<p class="muted" style="margin-top:8px;">${isGameRoom?"No live game objects.":"No published games."}</p>`}
-            </div>`;
+            </article>`;
           }).join(""):'<p class="muted">No routing rooms for this product.</p>'}
-        </div>`;
+        </section>`;
       }).join("");
     }
 

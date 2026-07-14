@@ -7,6 +7,8 @@ on:
     paths:
       - "installer/**"
       - "keys/kver.kp"
+      - "generate_cdkeys.py"
+      - "won_crypto.py"
       - ".github/workflows/installer-release.yml"
       - ".github/scripts/**"
   workflow_dispatch:
@@ -187,6 +189,32 @@ jobs:
             -VirusTotalPermalink $env:VT_PERMALINK
           "verify_path=$verifyPath" >> $env:GITHUB_OUTPUT
 
+      - name: Build Linux helper bundle
+        id: linux_bundle
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $bundleRoot = Join-Path "installer" "RetailWONSetup-linux-$tag"
+          $zipPath = "installer/RetailWONSetup-linux-$tag.zip"
+
+          if (Test-Path $bundleRoot) {
+            Remove-Item $bundleRoot -Recurse -Force
+          }
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+
+          New-Item -ItemType Directory -Force -Path (Join-Path $bundleRoot "installer") | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $bundleRoot "keys") | Out-Null
+
+          Copy-Item "installer/install-linux.sh" (Join-Path $bundleRoot "installer/install-linux.sh")
+          Copy-Item "generate_cdkeys.py" (Join-Path $bundleRoot "generate_cdkeys.py")
+          Copy-Item "won_crypto.py" (Join-Path $bundleRoot "won_crypto.py")
+          Copy-Item "keys/kver.kp" (Join-Path $bundleRoot "keys/kver.kp")
+
+          Compress-Archive -Path (Join-Path $bundleRoot "*") -DestinationPath $zipPath -Force
+          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
@@ -196,6 +224,7 @@ jobs:
             installer/${{ steps.version.outputs.output_name }}.sha256
             installer/${{ steps.version.outputs.output_name }}.VERIFY.txt
             installer/${{ steps.version.outputs.output_name }}.virustotal.json
+            ${{ steps.linux_bundle.outputs.zip_path }}
           if-no-files-found: error
 
       - name: Generate release notes from installer commits
@@ -275,10 +304,13 @@ jobs:
             ${{ steps.notes.outputs.security }}
 
             Download `${{ steps.version.outputs.output_name }}` below, run as Administrator, and follow the prompts. If SmartScreen appears, use the bundled `.sha256` and `.VERIFY.txt` files to confirm the hash before running it.
+
+            For Linux/Wine/Proton, download `RetailWONSetup-linux-${{ steps.version.outputs.tag }}.zip`, extract it, and run `installer/install-linux.sh`.
           files: |
             installer/${{ steps.version.outputs.output_name }}
             installer/${{ steps.version.outputs.output_name }}.sha256
             installer/${{ steps.version.outputs.output_name }}.VERIFY.txt
+            ${{ steps.linux_bundle.outputs.zip_path }}
           fail_on_unmatched_files: true
           overwrite_files: true
           make_latest: true
