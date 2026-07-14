@@ -1,6 +1,9 @@
 services:
   backend:
     build: .
+    # Run tini as PID 1 so orphaned child processes (e.g. git helpers spawned
+    # by the dashboard repo monitor) are reaped instead of piling up as zombies.
+    init: true
     restart: unless-stopped
     command:
       - /bin/sh
@@ -59,6 +62,9 @@ services:
 
   backend-cataclysm:
     build: .
+    # Run tini as PID 1 so orphaned child processes (e.g. git helpers spawned
+    # by the dashboard repo monitor) are reaped instead of piling up as zombies.
+    init: true
     restart: unless-stopped
     command:
       - /bin/sh
@@ -111,6 +117,9 @@ services:
 
   gateway:
     build: .
+    # Run tini as PID 1 so orphaned child processes (e.g. git helpers spawned
+    # by the dashboard repo monitor) are reaped instead of piling up as zombies.
+    init: true
     restart: unless-stopped
     command:
       - /bin/sh
