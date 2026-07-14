@@ -1006,10 +1006,12 @@ def test_gateway_live_feed_emits_match_lifecycle_and_packet_events() -> None:
     assert peer_packet["payload_preview_hex"] == "aabb"
     assert peer_packet["payload_base64"] == "qrs="
     assert peer_packet["recipient_count"] == 1
+    assert peer_packet["gateway_input_sequence"] == 1
 
     match_finished = next(event for event in events if event["event"] == "match_finished")
     assert match_finished["room_port"] == 15102
     assert match_finished["duration_seconds"] >= 0
+    assert match_finished["input_sequence_final"] == 1
 
 
 def test_gateway_live_feed_finishes_match_when_room_refresh_shows_pending_reconnects_only() -> None:
