@@ -46,6 +46,37 @@ Health probes are also available on the admin port:
 - `/health`
 - `/ready`
 
+### Admin login behind a reverse proxy (forward-auth)
+
+By default the dashboard is guarded only by `ADMIN_TOKEN` (passed as `?token=`,
+an `X-Admin-Token` header, or a `Bearer` token) and is published on loopback
+only. To harden it and to share access with other people, put an
+authenticating reverse proxy in front of the admin port and let it inject the
+signed-in username as a header. This works with anything that can do
+forward-auth or header injection — pick whatever is lightest for your setup:
+
+- **Tailscale** (`tailscale serve` / tsnet) — identity is the tailnet user
+- **Cloudflare Access** (free) — injects `Cf-Access-Authenticated-User-Email`
+- **Authelia**, **oauth2-proxy**, **tinyauth**, **Pocket ID** — self-hosted
+- **Authentik** proxy provider — if you already run it
+
+Set these (see `.env.example`):
+
+| Variable | Meaning |
+|----------|---------|
+| `ADMIN_FORWARD_USER_HEADER` | Header the proxy sets with the username (e.g. `X-Forwarded-User`). Enables forward-auth. |
+| `ADMIN_FORWARD_SECRET` | Shared secret the proxy must also send, so headers can't be spoofed. **Strongly recommended.** |
+| `ADMIN_FORWARD_SECRET_HEADER` | Header carrying that secret (default `x-admin-proxy-secret`). |
+| `ADMIN_FORWARD_GROUPS_HEADER` | Optional header with the user's groups (e.g. `X-Forwarded-Groups`). |
+| `ADMIN_ALLOWED_GROUPS` | Optional comma-separated group allowlist; empty allows any authenticated proxy user. |
+
+Behind the proxy, the browser's session cookie authenticates every request, so
+the SSE live feed and API calls work without a token in the URL. Keep
+`ADMIN_TOKEN` set as a break-glass credential for the SSH tunnel and API
+scripts — it keeps working alongside forward-auth. Configure your proxy to send
+`ADMIN_FORWARD_SECRET` on every request and to strip any client-supplied copy of
+the identity and secret headers, and keep the admin port bound to loopback.
+
 ### Ports to expose
 
 | Port | Purpose |

@@ -210,6 +210,13 @@ services:
           --db-path "$$DB_PATH" \
           --keys-dir "$$KEYS_DIR" \
           --log "${LOG_LEVEL:-INFO}"
+    environment:
+      # Optional reverse-proxy / forward-auth login (read as argparse defaults).
+      ADMIN_FORWARD_USER_HEADER: "${ADMIN_FORWARD_USER_HEADER:-}"
+      ADMIN_FORWARD_SECRET: "${ADMIN_FORWARD_SECRET:-}"
+      ADMIN_FORWARD_SECRET_HEADER: "${ADMIN_FORWARD_SECRET_HEADER:-x-admin-proxy-secret}"
+      ADMIN_FORWARD_GROUPS_HEADER: "${ADMIN_FORWARD_GROUPS_HEADER:-}"
+      ADMIN_ALLOWED_GROUPS: "${ADMIN_ALLOWED_GROUPS:-}"
     depends_on:
       backend:
         condition: service_healthy
