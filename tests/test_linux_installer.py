@@ -28,6 +28,8 @@ def _bash() -> str:
 
 
 def _bash_path(path: Path) -> str:
+    if os.name != "nt":
+        return str(path)
     result = subprocess.run(
         [_bash(), "-lc", "cygpath -u " + shlex.quote(str(path))],
         text=True,

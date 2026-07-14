@@ -784,6 +784,7 @@ class BinaryGatewayServer:
             "level_path": level_path,
             "metadata_source": "peer_packet",
         }
+        return payload
 
     def _remember_inferred_room_metadata(self, room_port: int, payload: bytes) -> None:
         inferred = self._infer_room_metadata_from_payload(payload)
