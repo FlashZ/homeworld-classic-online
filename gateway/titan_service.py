@@ -775,7 +775,7 @@ class BinaryGatewayServer:
         lobby_title = str(setup_titles.get("lobby_title") or "").strip()
         map_title = str(setup_titles.get("map_title") or "").strip()
         map_code = str(setup_titles.get("map_code") or display_name).strip()
-        return {
+        payload: Dict[str, object] = {
             "display_name": lobby_title or map_title or display_name,
             "game_name": map_code or display_name,
             "map_name": map_title or display_name,
@@ -784,6 +784,7 @@ class BinaryGatewayServer:
             "level_path": level_path,
             "metadata_source": "peer_packet",
         }
+        return payload
 
     def _remember_inferred_room_metadata(self, room_port: int, payload: bytes) -> None:
         inferred = self._infer_room_metadata_from_payload(payload)
@@ -1043,7 +1044,7 @@ class BinaryGatewayServer:
         games = snapshot.get("games", []) or []
         first_game = games[0] if games and isinstance(games[0], dict) else {}
         room_title = self._preferred_room_title(snapshot, fallback=state.get("room_name"))
-        return {
+        payload: Dict[str, object] = {
             "match_id": state["match_id"],
             "room_port": int(room_port),
             "room_name": room_title,
@@ -1061,12 +1062,17 @@ class BinaryGatewayServer:
             "game_name": str(first_game.get("name") or ""),
             "owner_name": str(first_game.get("owner_name") or ""),
         }
+        hint_state = self._match_hint_state.get(int(room_port))
+        if isinstance(hint_state, dict):
+            payload["input_sequence_final"] = int(hint_state.get("input_sequence") or 0)
+        return payload
 
     def _ensure_match_hint_state(self, room_port: int, match_id: str) -> Dict[str, object]:
         state = self._match_hint_state.setdefault(
             int(room_port),
             {
                 "match_id": str(match_id),
+                "input_sequence": 0,
                 "last_checkpoint_emitted_at": 0.0,
                 "slot_manifest": {},
                 "launch_config": {},
@@ -1083,6 +1089,18 @@ class BinaryGatewayServer:
         )
         state["match_id"] = str(match_id)
         return state
+
+    def _next_match_input_sequence(self, room_port: int, match_id: str) -> int:
+        """Assign a stable gateway order to every raw lockstep payload.
+
+        Frame numbers are game-time order, but multiple packets can share a
+        frame. This sequence preserves the routing order needed by a native
+        replay runner and is attached before publishing the live event.
+        """
+        state = self._ensure_match_hint_state(int(room_port), str(match_id))
+        sequence = int(state.get("input_sequence") or 0) + 1
+        state["input_sequence"] = sequence
+        return sequence
 
     @staticmethod
     def _hint_player_identity_key(player_name: object) -> str:
@@ -1449,6 +1467,7 @@ class BinaryGatewayServer:
             },
             "survivor_hint": self._survivor_hint_from_presence(dict(hint_state.get("presence") or {})),
             "packet_hints": self._drain_match_packet_hints(int(room_port), clear=False),
+            "input_sequence_final": int(hint_state.get("input_sequence") or 0),
             "evidence": list(evidence or []),
         }
         return self._publish_live_feed_event("match_resolution_hint", payload)
@@ -1817,6 +1836,11 @@ class BinaryGatewayServer:
         room_snapshot = self._routing_room_snapshot(room_port)
         match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=False)
         raw_payload = bytes(payload or b"")
+        input_sequence = (
+            self._next_match_input_sequence(int(room_port), str(match_id))
+            if match_id
+            else 0
+        )
         games = room_snapshot.get("games", []) or []
         first_game = games[0] if games and isinstance(games[0], dict) else {}
         room_title = self._preferred_room_title(room_snapshot)
@@ -1835,6 +1859,7 @@ class BinaryGatewayServer:
             "payload_preview_hex": self._live_payload_preview_hex(raw_payload),
             "payload_base64": base64.b64encode(raw_payload).decode("ascii"),
             "fingerprint": self._live_payload_fingerprint(raw_payload),
+            "gateway_input_sequence": input_sequence,
         }
         if room_snapshot.get("level_path"):
             event_payload["level_path"] = str(room_snapshot.get("level_path") or "")
