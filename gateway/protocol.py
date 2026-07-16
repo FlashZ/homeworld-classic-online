@@ -1554,23 +1554,41 @@ class GatewayEventBus:
 class GatewayLiveFeedBus:
     """Broadcast pub/sub for server-side live match and packet observers."""
 
+    # A regular Homeworld match emits tens of thousands of routed payloads.
+    # The former 1,024-event queue silently dropped lockstep packets whenever
+    # the stats archive briefly fell behind, making an otherwise healthy
+    # replay permanently non-deterministic.  Keep enough headroom for an
+    # entire busy match; consumers still receive an explicit loss signal if
+    # they exceed it.
+    DEFAULT_SUBSCRIBER_CAPACITY = 262_144
+
     def __init__(self) -> None:
         self._subs: list[asyncio.Queue] = []
+        self._dropped_by_subscriber: dict[int, int] = {}
 
-    def subscribe(self, maxsize: int = 1024) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+    def subscribe(self, maxsize: int | None = None) -> asyncio.Queue:
+        capacity = self.DEFAULT_SUBSCRIBER_CAPACITY if maxsize is None else max(0, int(maxsize))
+        q: asyncio.Queue = asyncio.Queue(maxsize=capacity)
         self._subs.append(q)
+        self._dropped_by_subscriber[id(q)] = 0
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subs = [existing for existing in self._subs if existing is not q]
+        self._dropped_by_subscriber.pop(id(q), None)
 
     def publish(self, event: Dict[str, object]) -> None:
         for q in list(self._subs):
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
-                pass
+                # Never make a dropped event invisible.  The SSE layer emits
+                # this marker before any subsequent event, allowing the stats
+                # side to fail the capture rather than fabricate a result.
+                self._dropped_by_subscriber[id(q)] = self._dropped_by_subscriber.get(id(q), 0) + 1
+
+    def dropped_for(self, q: asyncio.Queue) -> int:
+        return int(self._dropped_by_subscriber.get(id(q), 0))
 
     @property
     def subscriber_count(self) -> int:
