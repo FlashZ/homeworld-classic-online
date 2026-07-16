@@ -2384,6 +2384,22 @@ class AdminDashboardServer:
                 writer.write(self._sse_frame("ready", hello))
                 await writer.drain()
                 while True:
+                    live_feed_bus = getattr(self.gateway, "live_feed_bus", None)
+                    dropped_for = getattr(live_feed_bus, "dropped_for", None)
+                    dropped = int(dropped_for(queue)) if callable(dropped_for) else 0
+                    if dropped:
+                        # Do not claim a continuous stream after the bounded
+                        # buffer has overflowed.  A client that sees this is
+                        # required to reject the affected replay input.
+                        overflow = {
+                            "event": "live_feed_overflow",
+                            "ts": time.time(),
+                            "dropped_events": dropped,
+                            "authority": "capture_integrity",
+                        }
+                        writer.write(self._sse_frame("live_feed_overflow", overflow))
+                        await writer.drain()
+                        return
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=15.0)
                     except asyncio.TimeoutError:

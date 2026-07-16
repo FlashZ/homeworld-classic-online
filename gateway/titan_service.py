@@ -752,7 +752,7 @@ class BinaryGatewayServer:
         self._activity_counts.clear()
         self._ip_activity.clear()
 
-    def subscribe_live_feed(self, maxsize: int = 1024) -> asyncio.Queue:
+    def subscribe_live_feed(self, maxsize: int | None = None) -> asyncio.Queue:
         return self.live_feed_bus.subscribe(maxsize=maxsize)
 
     def unsubscribe_live_feed(self, queue: asyncio.Queue) -> None:
@@ -3713,7 +3713,7 @@ class SharedBinaryGatewayServer:
     def clear_activity(self) -> None:
         self.default_runtime.clear_activity()
 
-    def subscribe_live_feed(self, maxsize: int = 1024) -> asyncio.Queue:
+    def subscribe_live_feed(self, maxsize: int | None = None) -> asyncio.Queue:
         return self.live_feed_bus.subscribe(maxsize=maxsize)
 
     def unsubscribe_live_feed(self, queue: asyncio.Queue) -> None:
