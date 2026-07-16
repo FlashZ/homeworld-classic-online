@@ -812,6 +812,18 @@ class BinaryGatewayServer:
             # is logged loudly instead of being mistaken for a complete feed.
             LOGGER.error("Replay journal write failed for %s: %s", match_id, exc)
 
+    def read_replay_journal(self, match_id: str) -> bytes | None:
+        if self.replay_journal_dir is None:
+            return None
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(match_id or "")).strip("_")
+        if not safe:
+            return None
+        path = self.replay_journal_dir / self.product_profile.key / safe / "events.jsonl"
+        try:
+            return path.read_bytes() if path.is_file() else None
+        except OSError:
+            return None
+
     @staticmethod
     def _infer_room_metadata_from_payload(payload: bytes) -> Dict[str, object] | None:
         if not payload:

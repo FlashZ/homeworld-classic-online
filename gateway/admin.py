@@ -2357,6 +2357,14 @@ class AdminDashboardServer:
         elif parsed.path == "/api/stats":
             body = json.dumps(self.gateway.stats_snapshot(), indent=2).encode("utf-8")
             writer.write(self._http_response(body, "application/json; charset=utf-8"))
+        elif parsed.path == "/api/replay-journal":
+            match_id = str(query.get("match_id", [""])[0] or "")
+            read_journal = getattr(self.gateway, "read_replay_journal", None)
+            body = read_journal(match_id) if callable(read_journal) else None
+            if body is None:
+                writer.write(self._http_response(b"journal not found", "text/plain; charset=utf-8", "404 Not Found"))
+            else:
+                writer.write(self._http_response(body, "application/x-ndjson; charset=utf-8"))
         elif parsed.path == "/api/live-feed":
             subscribe = getattr(self.gateway, "subscribe_live_feed", None)
             unsubscribe = getattr(self.gateway, "unsubscribe_live_feed", None)
