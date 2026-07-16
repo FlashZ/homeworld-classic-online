@@ -7,6 +7,7 @@ from collections import deque
 import contextlib
 from dataclasses import dataclass, field
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -270,7 +271,8 @@ class BinaryGatewayServer:
                  product_profile: ProductProfile = HOMEWORLD_PRODUCT_PROFILE,
                  user_id_start: int = 1000,
                  peer_session_id_min: int = 1,
-                 peer_session_id_max: int = MAX_PEER_SESSION_ID):
+                 peer_session_id_max: int = MAX_PEER_SESSION_ID,
+                 replay_journal_dir: str = ""):
         self.backend_host = backend_host
         self.backend_port = backend_port
         self.backend_shared_secret = backend_shared_secret.strip()
@@ -323,6 +325,7 @@ class BinaryGatewayServer:
         self._inferred_room_metadata: Dict[int, Dict[str, object]] = {}
         self._pending_match_slot_manifests: Dict[int, Dict[str, object]] = {}
         self._pending_match_launch_configs: Dict[int, Dict[str, object]] = {}
+        self.replay_journal_dir = Path(replay_journal_dir) if replay_journal_dir else None
         self.started_at = time.time()
         if keys_dir:
             self._load_keys(keys_dir)
@@ -752,7 +755,7 @@ class BinaryGatewayServer:
         self._activity_counts.clear()
         self._ip_activity.clear()
 
-    def subscribe_live_feed(self, maxsize: int = 1024) -> asyncio.Queue:
+    def subscribe_live_feed(self, maxsize: int | None = None) -> asyncio.Queue:
         return self.live_feed_bus.subscribe(maxsize=maxsize)
 
     def unsubscribe_live_feed(self, queue: asyncio.Queue) -> None:
@@ -786,8 +789,40 @@ class BinaryGatewayServer:
             "product": self.product_profile.key,
         }
         event.update(payload)
+        self._append_replay_journal(event)
         self.live_feed_bus.publish(event)
         return event
+
+    def _append_replay_journal(self, event: Dict[str, object]) -> None:
+        """Durably retain every match event before fan-out can lose a client."""
+        match_id = str(event.get("match_id") or "").strip()
+        if self.replay_journal_dir is None or not match_id:
+            return
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", match_id).strip("_") or "match"
+        path = self.replay_journal_dir / self.product_profile.key / safe / "events.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            # A journal write failure makes deterministic capture unsafe; it
+            # is logged loudly instead of being mistaken for a complete feed.
+            LOGGER.error("Replay journal write failed for %s: %s", match_id, exc)
+
+    def read_replay_journal(self, match_id: str) -> bytes | None:
+        if self.replay_journal_dir is None:
+            return None
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(match_id or "")).strip("_")
+        if not safe:
+            return None
+        path = self.replay_journal_dir / self.product_profile.key / safe / "events.jsonl"
+        try:
+            return path.read_bytes() if path.is_file() else None
+        except OSError:
+            return None
 
     @staticmethod
     def _infer_room_metadata_from_payload(payload: bytes) -> Dict[str, object] | None:
@@ -3713,7 +3748,7 @@ class SharedBinaryGatewayServer:
     def clear_activity(self) -> None:
         self.default_runtime.clear_activity()
 
-    def subscribe_live_feed(self, maxsize: int = 1024) -> asyncio.Queue:
+    def subscribe_live_feed(self, maxsize: int | None = None) -> asyncio.Queue:
         return self.live_feed_bus.subscribe(maxsize=maxsize)
 
     def unsubscribe_live_feed(self, queue: asyncio.Queue) -> None:
@@ -4547,6 +4582,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 user_id_start=int(runtime_config["user_id_start"]),
                 peer_session_id_min=int(runtime_config["peer_session_id_min"]),
                 peer_session_id_max=int(runtime_config["peer_session_id_max"]),
+                replay_journal_dir=str(args.replay_journal_dir or ""),
             )
             LOGGER.info(
                 "Shared-edge runtime: %s root=%s versions=%r backend=%s:%s routing=%d-%d",
@@ -4602,6 +4638,7 @@ async def main_async(args: argparse.Namespace) -> None:
             backend_shared_secret=args.backend_shared_secret,
             backend_timeout_s=args.backend_timeout,
             product_profile=product_profile,
+            replay_journal_dir=str(args.replay_journal_dir or ""),
         )
         LOGGER.info(
             "Gateway product profile: %s (root=%s versions=%s)",
@@ -4777,6 +4814,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Bind host for the local admin dashboard (127.0.0.1 keeps it local-only)")
     p.add_argument("--admin-port", type=int, default=8080,
                    help="Port for the local admin dashboard (set to 0 to disable)")
+    p.add_argument("--replay-journal-dir", default=os.environ.get("REPLAY_JOURNAL_DIR", "/data/replay-journal"),
+                   help="Durable gateway-owned match event journal; empty disables journaling.")
     p.add_argument(
         "--admin-token",
         default=os.environ.get("ADMIN_TOKEN", ""),
