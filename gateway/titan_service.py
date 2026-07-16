@@ -40,6 +40,13 @@ _PRINTABLE_UTF16LE_RE = re.compile(rb"(?:(?:[ -~]\x00)){4,}")
 _MAP_CODE_TEXT_RE = re.compile(r"^pkwar[0-9a-z%._-]+$", re.IGNORECASE)
 _HUMAN_TITLE_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 &'(),_.:+!-]{2,63}$")
 _HW_WRAPPED_PREFIX = b"\x03\xe2\x60"
+# A TitanPacketMsg carrying TITANMSGTYPE_GAMEISSTARTING.  Its final bytes are
+# the in-memory CaptainGameInfo structure used to initialise every client.
+# Retaining those exact bytes lets the source game's packet-player reproduce
+# the map, rules, colours, races, and roster without asking any client to
+# write a result file.
+_HW_GAME_START_PREFIX = b"\x03\xe2\x40"
+_HOMEWORLD_CAPTAIN_GAME_INFO_SIZE = 584
 _CHECKPOINT_HEARTBEAT_SECONDS = 12.0
 _HW_COMMAND_PACKET_TYPES = {0xCCCC, 0x5555, 0xE555}
 _HW_DROPPED_VERIFY = 0xFE389BCA
@@ -149,6 +156,28 @@ def _find_hw_packet_offset(payload: bytes) -> int | None:
         if packet_type in _HW_COMMAND_PACKET_TYPES and len(payload) >= offset + 24:
             return offset
     return None
+
+
+def _extract_native_replay_bootstrap(payload: bytes) -> bytes | None:
+    """Return the exact CaptainGameInfo emitted at Homeworld game start.
+
+    ``TitanPacketMsg`` places its variable-length game-name before the blob,
+    while ``CaptainGameInfo`` is the final field.  We deliberately retain the
+    opaque structure instead of reserializing it: the native source player
+    requires the original ABI bytes.
+    """
+    raw = bytes(payload or b"")
+    if not raw.startswith(_HW_GAME_START_PREFIX):
+        return None
+    if len(raw) < len(_HW_GAME_START_PREFIX) + _HOMEWORLD_CAPTAIN_GAME_INFO_SIZE:
+        return None
+    candidate = raw[-_HOMEWORLD_CAPTAIN_GAME_INFO_SIZE:]
+    # CaptainGameInfo.numPlayers is an unsigned short at byte 198 in the
+    # 32-bit Homeworld ABI.  Reject a coincidental prefix/oversized payload.
+    player_count = int.from_bytes(candidate[198:200], "little")
+    if not 1 <= player_count <= 8:
+        return None
+    return candidate
 
 
 def _selection_size(num_ships: int) -> int:
@@ -1836,6 +1865,7 @@ class BinaryGatewayServer:
         room_snapshot = self._routing_room_snapshot(room_port)
         match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=False)
         raw_payload = bytes(payload or b"")
+        native_replay_bootstrap = _extract_native_replay_bootstrap(raw_payload)
         input_sequence = (
             self._next_match_input_sequence(int(room_port), str(match_id))
             if match_id
@@ -1861,6 +1891,16 @@ class BinaryGatewayServer:
             "fingerprint": self._live_payload_fingerprint(raw_payload),
             "gateway_input_sequence": input_sequence,
         }
+        if native_replay_bootstrap is not None:
+            # This is an input to the native replay, not a decoded or inferred
+            # setting.  The regular payload is retained too so the artifact is
+            # independently verifiable.
+            event_payload["native_replay_bootstrap"] = {
+                "format": "homeworld_captain_game_info_x86",
+                "payload_base64": base64.b64encode(native_replay_bootstrap).decode("ascii"),
+                "payload_sha256": self._live_payload_fingerprint(native_replay_bootstrap),
+                "payload_len": len(native_replay_bootstrap),
+            }
         if room_snapshot.get("level_path"):
             event_payload["level_path"] = str(room_snapshot.get("level_path") or "")
         if match_id:
