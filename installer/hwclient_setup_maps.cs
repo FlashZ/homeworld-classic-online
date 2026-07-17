@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
 
 internal sealed class MapPackProgress
 {
@@ -46,7 +47,10 @@ internal sealed class MapPackInstallResult
 
 internal static class MapPackInstaller
 {
-    public const string RepositoryArchiveUrl = "https://github.com/FlashZ/Homeworld_Map_Collection/archive/refs/heads/main.zip";
+    // Keep installer releases reproducible: this is a reviewed map-pack commit,
+    // not the moving contents of the repository's main branch.
+    public const string RepositoryArchiveUrl = "https://github.com/FlashZ/Homeworld_Map_Collection/archive/df266b9ca8caab4c1fe3c7e27fe93bce4dcf1210.zip";
+    public const string RepositoryArchiveSha256 = "b61a92cd468fdfb7e32a4e0cc365d3e12d79dd46a6779d38d6168a8cb52ba069";
     public const string HomeworldSourceDirectoryName = "HW1_maps";
     public const string CataclysmSourceDirectoryName = "CATA_maps";
     private const SecurityProtocolType Tls12 = (SecurityProtocolType)3072;
@@ -126,7 +130,7 @@ internal static class MapPackInstaller
         };
     }
 
-    public static void DownloadArchive(string url, string destinationPath, Action<MapPackProgress> progress)
+    public static void DownloadArchive(string url, string destinationPath, string expectedSha256, Action<MapPackProgress> progress)
     {
         try
         {
@@ -153,6 +157,32 @@ internal static class MapPackInstaller
                 }
             };
             client.DownloadFile(new Uri(url), destinationPath);
+        }
+
+        VerifyArchiveSha256(destinationPath, expectedSha256);
+    }
+
+    private static void VerifyArchiveSha256(string archivePath, string expectedSha256)
+    {
+        if (string.IsNullOrWhiteSpace(expectedSha256))
+        {
+            throw new ArgumentException("Expected map archive SHA-256 is required.", "expectedSha256");
+        }
+
+        string actualSha256;
+        using (SHA256 sha256 = SHA256.Create())
+        using (FileStream archive = File.OpenRead(archivePath))
+        {
+            actualSha256 = BitConverter.ToString(sha256.ComputeHash(archive))
+                .Replace("-", string.Empty)
+                .ToLowerInvariant();
+        }
+
+        if (!string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Downloaded map archive failed SHA-256 verification. Expected "
+                + expectedSha256 + ", got " + actualSha256 + ".");
         }
     }
 

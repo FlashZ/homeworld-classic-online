@@ -592,7 +592,11 @@ internal static class HWClientSetup
         {
             Directory.CreateDirectory(tempRoot);
             ReportMapPackProgress(progress, "Preparing community maps", 0, "Creating temporary download folder.");
-            MapPackInstaller.DownloadArchive(MapPackInstaller.RepositoryArchiveUrl, archivePath, progress);
+            MapPackInstaller.DownloadArchive(
+                MapPackInstaller.RepositoryArchiveUrl,
+                archivePath,
+                MapPackInstaller.RepositoryArchiveSha256,
+                progress);
             ReportMapPackProgress(progress, "Extracting community maps", 0, "Unpacking downloaded archive.");
             Directory.CreateDirectory(extractedPath);
             ZipFile.ExtractToDirectory(archivePath, extractedPath);
