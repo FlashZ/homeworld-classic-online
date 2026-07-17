@@ -13,6 +13,7 @@ from typing import Dict, Optional, Tuple
 
 from .protocol import *
 from . import protocol as _protocol
+from connection_limits import ConnectionLimiter
 from .product_profile import (
     CATACLYSM_PRODUCT_PROFILE,
     HOMEWORLD_PRODUCT_PROFILE,
@@ -141,12 +142,14 @@ class SilencerRoutingServer:
         listen_port: Optional[int] = None,
         publish_in_directory: bool = True,
         product_profile: ProductProfile = HOMEWORLD_PRODUCT_PROFILE,
+        connection_limiter: Optional[ConnectionLimiter] = None,
     ) -> None:
         # Shared across all concurrent connections (mirrors StaticConflict global).
         self.gateway = gateway
         self.listen_port = listen_port
         self._publish_in_directory = publish_in_directory
         self.product_profile = product_profile
+        self.connection_limiter = connection_limiter
         self._published = False
         self._room_allocated = False
         self._room_allocated_at = 0.0
@@ -1456,7 +1459,7 @@ class SilencerRoutingServer:
             await writer.drain()
             LOGGER.info("Routing(native): Auth1Peer Challenge1 sent to %s:%s", *peer)
 
-            payload = await _routing_recv(reader)
+            payload = await _routing_recv_with_idle_timeout(reader)
             svc, msg, challenge2_body = won_crypto.parse_tmessage(payload)
             LOGGER.info(
                 "Routing(native): Auth1Peer next message from %s:%s (svc=%d msg=%d, %d bytes)",
@@ -2439,8 +2442,16 @@ class SilencerRoutingServer:
                              writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername", ("?", 0))
         LOGGER.info("Routing-%s connection from %s:%s", self.listen_port, *peer)
+        client_ip = str(peer[0]) if isinstance(peer, tuple) and peer else None
+        admitted = self.connection_limiter is None or self.connection_limiter.acquire(client_ip)
+        if not admitted:
+            LOGGER.warning("Routing-%s connection limit reached for %s", self.listen_port, client_ip)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
         try:
-            payload = await _routing_recv(reader)
+            payload = await _routing_recv_with_idle_timeout(reader)
             if self._is_native_auth_request(payload):
                 await self._handle_native_client(reader, writer, payload)
             else:
@@ -2452,6 +2463,8 @@ class SilencerRoutingServer:
         except Exception as exc:
             LOGGER.error("Routing: error from %s:%s: %s", *peer, exc)
         finally:
+            if self.connection_limiter is not None:
+                self.connection_limiter.release(client_ip)
             writer.close()
             with contextlib.suppress(ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
                 await writer.wait_closed()
@@ -2479,6 +2492,10 @@ class RoutingServerManager:
         self._servers: Dict[int, SilencerRoutingServer] = {}
         self._next_port = base_port
         self._lock = asyncio.Lock()
+        self.connection_limiter = ConnectionLimiter(
+            max_connections=512,
+            max_per_ip=12,
+        )
 
     async def _start_listener_locked(
         self,
@@ -2494,6 +2511,7 @@ class RoutingServerManager:
             listen_port=port,
             publish_in_directory=publish_in_directory,
             product_profile=self.product_profile,
+            connection_limiter=self.connection_limiter,
         )
         listener = await asyncio.start_server(routing_srv.handle_client, self.host, port)
         routing_srv.start_background_tasks()

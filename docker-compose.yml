@@ -1,7 +1,17 @@
 services:
   backend:
     build: .
+    init: true
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 256m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     command:
       - /bin/sh
       - -ec
@@ -59,7 +69,17 @@ services:
 
   backend-cataclysm:
     build: .
+    init: true
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 256m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     command:
       - /bin/sh
       - -ec
@@ -111,7 +131,17 @@ services:
 
   gateway:
     build: .
+    init: true
     restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 512m
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
     command:
       - /bin/sh
       - -ec
