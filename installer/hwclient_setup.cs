@@ -1578,22 +1578,24 @@ internal static class HWClientSetup
         StringBuilder summary = new StringBuilder();
         summary.Append("Configures ");
         summary.Append(CurrentGame.DisplayName);
-        summary.Append(" for online play: writes NetTweak.script and kver.kp to your game folder, and optionally sets up a CD key in the registry.");
+        summary.Append(" for online play.");
+        summary.AppendLine();
+        summary.Append("Writes NetTweak.script and kver.kp; CD key setup is optional.");
 
         if (existingState.HasAnyRegistryCdKey)
         {
             summary.AppendLine();
             if (existingState.RegistryOwnedByInstaller)
             {
-                summary.Append("An installer-managed CD key was detected and will be refreshed with a new random key by default.");
+                summary.Append("Installer key detected; a new random key will be used.");
             }
             else if (existingState.RegistryUsesLegacySharedDefault)
             {
-                summary.Append("A legacy shared installer CD key was detected and will be refreshed with a new random key by default.");
+                summary.Append("Shared installer key detected; a new random key will be used.");
             }
             else
             {
-                summary.Append("An existing CD key was detected and will be preserved unless you opt in below.");
+                summary.Append("Existing player CD key detected; it will be kept.");
             }
         }
 
@@ -1840,6 +1842,8 @@ internal static class HWClientSetup
         using (GroupBox optionalContentGroup = new GroupBox())
         using (CheckBox installMapsCheckBox = new CheckBox())
         using (Label mapsHelpLabel = new Label())
+        using (Label attributionLabel = new Label())
+        using (Label contactLabel = new Label())
         using (Button installButton = new Button())
         using (Button cancelButton = new Button())
         {
@@ -1993,6 +1997,17 @@ internal static class HWClientSetup
             optionalContentGroup.Controls.Add(installMapsCheckBox);
             optionalContentGroup.Controls.Add(mapsHelpLabel);
 
+            // --- Attribution ---
+            attributionLabel.AutoSize = true;
+            attributionLabel.Location = new Point(12, 602);
+            attributionLabel.ForeColor = SystemColors.GrayText;
+            attributionLabel.Text = "Created by Nick Kerr-Bell (Zero|SF)";
+
+            contactLabel.AutoSize = true;
+            contactLabel.Location = new Point(12, 622);
+            contactLabel.ForeColor = SystemColors.GrayText;
+            contactLabel.Text = "nick@kerrbell.dev";
+
             // --- Buttons ---
             installButton.Text = "Install";
             installButton.Size = new Size(84, 30);
@@ -2145,6 +2160,8 @@ internal static class HWClientSetup
             form.Controls.Add(serverGroup);
             form.Controls.Add(registryGroup);
             form.Controls.Add(optionalContentGroup);
+            form.Controls.Add(attributionLabel);
+            form.Controls.Add(contactLabel);
             form.Controls.Add(installButton);
             form.Controls.Add(cancelButton);
 
