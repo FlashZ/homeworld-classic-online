@@ -10,6 +10,9 @@ WORKFLOW = ROOT / ".github" / "workflows" / "installer-release.yml"
 def test_installer_release_packages_linux_helper_bundle() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
 
+    assert (ROOT / "generate_cdkeys.py").is_file()
+    assert (ROOT / "won_crypto.py").is_file()
+    assert (ROOT / "keys" / "kver.kp").is_file()
     assert "RetailWONSetup-linux-$tag" in text
     assert "installer/install-linux.sh" in text
     assert "generate_cdkeys.py" in text
