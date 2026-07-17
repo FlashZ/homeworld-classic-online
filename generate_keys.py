@@ -31,7 +31,12 @@ if str(_package_parent) not in sys.path:
 
 from cryptography.hazmat.primitives.asymmetric import dsa
 
-from won_oss_server.won_crypto import encode_private_key, encode_public_key
+try:
+    # Nested package layout used by older deployments.
+    from won_oss_server.won_crypto import encode_private_key, encode_public_key
+except ModuleNotFoundError:
+    # Standalone repository layout used by GitHub Actions and current clones.
+    from won_crypto import encode_private_key, encode_public_key
 
 
 def generate_keys(keys_dir: str) -> None:
