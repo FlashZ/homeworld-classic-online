@@ -5,6 +5,7 @@ import hashlib
 from pathlib import Path
 import sqlite3
 import struct
+import subprocess
 
 import titan_binary_gateway
 from gateway import admin as admin_module
@@ -274,6 +275,43 @@ def test_git_repo_monitor_snapshot_exposes_commit_first_labels(tmp_path: Path) -
     assert "remote_label" in snapshot
     assert snapshot["local_label"] == ""
     assert snapshot["remote_label"] == ""
+
+
+def test_git_repo_monitor_read_only_check_uses_ls_remote_without_fetch(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, ...]] = []
+    local_commit = "a" * 40
+    remote_commit = "b" * 40
+
+    def fake_run(_self: object, *args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        stdout = {
+            ("rev-parse", "--is-inside-work-tree"): "true\n",
+            ("rev-parse", "--show-toplevel"): f"{tmp_path}\n",
+            ("rev-parse", "--abbrev-ref", "HEAD"): "main\n",
+            ("rev-parse", "HEAD"): f"{local_commit}\n",
+            ("remote", "get-url", "gateway-updates"): "https://github.com/FlashZ/homeworld-classic-online.git\n",
+            ("status", "--porcelain"): "",
+            ("ls-remote", "--exit-code", "gateway-updates", "refs/heads/main"): (
+                f"{remote_commit}\trefs/heads/main\n"
+            ),
+        }.get(args)
+        if stdout is None:
+            return subprocess.CompletedProcess(args, 1, "", "unsupported command")
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(titan_binary_gateway.GitRepoMonitor, "_run_git", fake_run)
+    monitor = titan_binary_gateway.GitRepoMonitor(
+        str(tmp_path), remote_name="gateway-updates", read_only_check=True
+    )
+
+    snapshot = asyncio.run(monitor.force_refresh())
+
+    assert snapshot["remote_url"] == "https://github.com/FlashZ/homeworld-classic-online.git"
+    assert snapshot["remote_commit"] == remote_commit
+    assert snapshot["update_available"] is True
+    assert snapshot["can_update"] is False
+    assert snapshot["read_only_check"] is True
+    assert not any(command and command[0] == "fetch" for command in calls)
 
 
 def test_admin_snapshot_includes_product_scoped_databases(tmp_path: Path) -> None:

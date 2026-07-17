@@ -22,10 +22,12 @@ class GitRepoMonitor:
         repo_path: str,
         remote_name: str = "origin",
         check_interval_s: int = REPO_CHECK_INTERVAL_SECONDS,
+        read_only_check: bool = False,
     ) -> None:
         self.repo_path = Path(repo_path).resolve()
         self.remote_name = str(remote_name or "origin").strip() or "origin"
         self.check_interval_s = max(60, int(check_interval_s or REPO_CHECK_INTERVAL_SECONDS))
+        self.read_only_check = bool(read_only_check)
         self._lock = asyncio.Lock()
         self._refresh_task: Optional[asyncio.Task] = None
         self._startup_task: Optional[asyncio.Task] = None
@@ -60,6 +62,7 @@ class GitRepoMonitor:
         )
 
     def _finalize_snapshot(self, snapshot: Dict[str, object]) -> Dict[str, object]:
+        snapshot["read_only_check"] = self.read_only_check
         snapshot["check_interval_seconds"] = self.check_interval_s
         snapshot["last_update_at"] = float(self._last_update_at)
         snapshot["last_update_message"] = self._last_update_message
@@ -118,6 +121,18 @@ class GitRepoMonitor:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"git {' '.join(args)} failed")
         return result.stdout.strip()
 
+    def _remote_ref_hash(self, branch: str) -> str:
+        """Return a branch tip without writing FETCH_HEAD or refs locally."""
+        ref = f"refs/heads/{branch}" if branch and branch != "HEAD" else "HEAD"
+        result = self._run_git("ls-remote", "--exit-code", self.remote_name, ref, timeout=60.0)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git ls-remote failed")
+        line = next((line for line in result.stdout.splitlines() if line.strip()), "")
+        commit = line.split("\t", 1)[0].strip()
+        if not commit:
+            raise RuntimeError(f"remote branch not found: {ref}")
+        return commit
+
     def _collect_snapshot_sync(self, fetch_remote: bool = True) -> Dict[str, object]:
         snapshot: Dict[str, object] = {
             "available": False,
@@ -163,6 +178,26 @@ class GitRepoMonitor:
 
             status_lines = self._git_text("status", "--porcelain").splitlines()
             snapshot["dirty"] = bool(status_lines)
+
+            if self.read_only_check:
+                # Immutable production containers must not run `git fetch`: it
+                # updates .git/FETCH_HEAD. Query the configured remote directly
+                # instead, which is enough to identify whether a new deploy is
+                # available without modifying the running image.
+                snapshot["upstream"] = f"{self.remote_name}/{snapshot['branch']}"
+                snapshot["remote_commit"] = self._remote_ref_hash(str(snapshot["branch"]))
+                snapshot["remote_short"] = str(snapshot["remote_commit"])[:12]
+                snapshot["remote_label"] = str(snapshot["remote_short"])
+                if snapshot["remote_commit"] == snapshot["local_commit"]:
+                    snapshot["status"] = "up_to_date"
+                else:
+                    snapshot["status"] = "update_available"
+                    snapshot["behind"] = 1
+                    snapshot["update_available"] = True
+                # Applying an update is deliberately host-managed, not a write
+                # into the live, read-only container filesystem.
+                snapshot["can_update"] = False
+                return self._finalize_snapshot(snapshot)
 
             fetch_error = ""
             if fetch_remote and snapshot["remote_url"]:
@@ -229,6 +264,12 @@ class GitRepoMonitor:
 
     def _update_from_upstream_sync(self) -> Dict[str, object]:
         before = self._collect_snapshot_sync(fetch_remote=True)
+        if self.read_only_check:
+            return {
+                "ok": False,
+                "error": "This deployment is read-only. Deploy updates from the VPS host.",
+                "git": before,
+            }
         if not before.get("available"):
             return {"ok": False, "error": before.get("last_error") or "git repo unavailable", "git": before}
         if before.get("last_error"):

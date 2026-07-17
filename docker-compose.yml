@@ -247,6 +247,10 @@ services:
           --keys-dir "$$KEYS_DIR" \
           --log "${LOG_LEVEL:-INFO}"
     environment:
+      # The dashboard reads the deployment remote without running git fetch in
+      # this read-only production container. Host-side deploys perform writes.
+      WON_REPO_REMOTE: "${WON_REPO_REMOTE:-gateway-updates}"
+      WON_REPO_READ_ONLY_CHECK: "${WON_REPO_READ_ONLY_CHECK:-1}"
       # Optional reverse-proxy / forward-auth login (read as argparse defaults).
       ADMIN_FORWARD_USER_HEADER: "${ADMIN_FORWARD_USER_HEADER:-}"
       ADMIN_FORWARD_SECRET: "${ADMIN_FORWARD_SECRET:-}"

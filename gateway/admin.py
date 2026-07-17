@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import secrets
@@ -133,7 +134,11 @@ class AdminDashboardServer:
         self.web_auth_public_base_url = web_auth_public_base_url.strip()
         self.web_auth_bridge = getattr(gateway, "web_auth_bridge", None)
         repo_root = Path(__file__).resolve().parents[1]
-        self.repo_monitor = repo_monitor or GitRepoMonitor(str(repo_root))
+        self.repo_monitor = repo_monitor or GitRepoMonitor(
+            str(repo_root),
+            remote_name=os.environ.get("WON_REPO_REMOTE", "origin"),
+            read_only_check=os.environ.get("WON_REPO_READ_ONLY_CHECK", "").strip() == "1",
+        )
         self.started_at = time.time()
 
     def start_background_tasks(self) -> None:
@@ -1864,7 +1869,7 @@ class AdminDashboardServer:
           <h2>GitHub Updates</h2>
           <div class="action-bar">
             <button class="btn" data-action="github-check">Check GitHub</button>
-            <button class="btn ${repo.can_update?'btn-accent':''}" data-action="github-update">Update From GitHub</button>
+            ${repo.read_only_check?"":`<button class="btn ${repo.can_update?'btn-accent':''}" data-action="github-update" ${repo.can_update?"":"disabled"}>Update From GitHub</button>`}
           </div>
           <div class="kv">
             <div class="k">Status</div><div class="v">${repoSummary(repo)}</div>
@@ -1877,6 +1882,7 @@ class AdminDashboardServer:
             <div class="k">Remote</div><div class="v">${esc(repo.remote_url||"")}</div>
           </div>
           ${repo.last_error?`<p class="muted" style="margin-top:12px;color:var(--danger);">${esc(repo.last_error)}</p>`:""}
+          ${repo.read_only_check?`<p class="muted" style="margin-top:12px;">This hardened deployment checks GitHub without writing to the running container. Deploy updates from the VPS host.</p>`:""}
           ${repo.last_update_message?`<p class="muted" style="margin-top:12px;">${esc(repo.last_update_message)}</p>`:""}
           ${repo.restart_required?`<p class="muted" style="margin-top:8px;color:var(--warning);">Restart the gateway service to apply the updated code.</p>`:""}
         </section>
