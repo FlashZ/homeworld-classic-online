@@ -10,7 +10,10 @@ WINE_PREFIX="${WINEPREFIX:-}"
 SERVER=""
 WINE_BIN="${WON_INSTALLER_WINE:-wine}"
 PYTHON_BIN="${WON_INSTALLER_PYTHON:-python3}"
-MAP_ARCHIVE_URL="https://github.com/FlashZ/Homeworld_Map_Collection/archive/refs/heads/main.zip"
+# Pin the optional map pack to a reviewed commit. Do not use a moving branch URL
+# here: installer releases need to download the same map contents over time.
+MAP_ARCHIVE_URL="https://github.com/FlashZ/Homeworld_Map_Collection/archive/df266b9ca8caab4c1fe3c7e27fe93bce4dcf1210.zip"
+MAP_ARCHIVE_SHA256="b61a92cd468fdfb7e32a4e0cc365d3e12d79dd46a6779d38d6168a8cb52ba069"
 INSTALL_MAPS=0
 SKIP_REGISTRY=0
 NON_INTERACTIVE=0
@@ -276,6 +279,26 @@ download_maps() {
   fi
 }
 
+verify_map_archive() {
+  local archive="$1"
+  local actual
+  actual="$("$PYTHON_BIN" - "$archive" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as source:
+    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+)"
+
+  if [[ "$actual" != "$MAP_ARCHIVE_SHA256" ]]; then
+    die "Downloaded map archive failed SHA-256 verification (expected $MAP_ARCHIVE_SHA256, got $actual)."
+  fi
+}
+
 install_maps() {
   local game="$1"
   local dir="$2"
@@ -293,6 +316,9 @@ install_maps() {
 
   echo "Downloading community maps..."
   download_maps "$archive"
+  if [[ -z "${WON_INSTALLER_MAP_ARCHIVE:-}" ]]; then
+    verify_map_archive "$archive"
+  fi
   "$PYTHON_BIN" - "$archive" "$temp_dir/extract" <<'PY'
 import sys
 import zipfile

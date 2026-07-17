@@ -10,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "installer" / "install-linux.sh"
+MAP_COMMIT = "df266b9ca8caab4c1fe3c7e27fe93bce4dcf1210"
+MAP_ARCHIVE_SHA256 = "b61a92cd468fdfb7e32a4e0cc365d3e12d79dd46a6779d38d6168a8cb52ba069"
 
 
 def _bash() -> str:
@@ -64,6 +66,16 @@ def test_help_mentions_wine_and_maps(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert "--wine-prefix" in result.stdout
     assert "--install-maps" in result.stdout
+
+
+def test_map_pack_download_is_pinned_to_a_reviewed_commit() -> None:
+    linux_helper = SCRIPT.read_text(encoding="utf-8")
+    windows_installer = (ROOT / "installer" / "hwclient_setup_maps.cs").read_text(encoding="utf-8")
+
+    for source in (linux_helper, windows_installer):
+        assert MAP_COMMIT in source
+        assert MAP_ARCHIVE_SHA256 in source
+        assert "refs/heads/main.zip" not in source
 
 
 def test_file_only_setup_writes_nettweak_and_kver(tmp_path: Path) -> None:

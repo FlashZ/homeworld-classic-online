@@ -7,6 +7,7 @@ from collections import deque
 import contextlib
 from dataclasses import dataclass, field
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ from .product_profile import (
     ProductProfile,
     product_profile_from_name,
 )
+from connection_limits import ConnectionLimiter
 
 globals().update({name: getattr(_protocol, name) for name in dir(_protocol) if name.startswith('_')})
 LOGGER = logging.getLogger(__name__)
@@ -40,6 +42,13 @@ _PRINTABLE_UTF16LE_RE = re.compile(rb"(?:(?:[ -~]\x00)){4,}")
 _MAP_CODE_TEXT_RE = re.compile(r"^pkwar[0-9a-z%._-]+$", re.IGNORECASE)
 _HUMAN_TITLE_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 &'(),_.:+!-]{2,63}$")
 _HW_WRAPPED_PREFIX = b"\x03\xe2\x60"
+# A TitanPacketMsg carrying TITANMSGTYPE_GAMEISSTARTING.  Its final bytes are
+# the in-memory CaptainGameInfo structure used to initialise every client.
+# Retaining those exact bytes lets the source game's packet-player reproduce
+# the map, rules, colours, races, and roster without asking any client to
+# write a result file.
+_HW_GAME_START_PREFIX = b"\x03\xe2\x40"
+_HOMEWORLD_CAPTAIN_GAME_INFO_SIZE = 584
 _CHECKPOINT_HEARTBEAT_SECONDS = 12.0
 _HW_COMMAND_PACKET_TYPES = {0xCCCC, 0x5555, 0xE555}
 _HW_DROPPED_VERIFY = 0xFE389BCA
@@ -151,6 +160,28 @@ def _find_hw_packet_offset(payload: bytes) -> int | None:
     return None
 
 
+def _extract_native_replay_bootstrap(payload: bytes) -> bytes | None:
+    """Return the exact CaptainGameInfo emitted at Homeworld game start.
+
+    ``TitanPacketMsg`` places its variable-length game-name before the blob,
+    while ``CaptainGameInfo`` is the final field.  We deliberately retain the
+    opaque structure instead of reserializing it: the native source player
+    requires the original ABI bytes.
+    """
+    raw = bytes(payload or b"")
+    if not raw.startswith(_HW_GAME_START_PREFIX):
+        return None
+    if len(raw) < len(_HW_GAME_START_PREFIX) + _HOMEWORLD_CAPTAIN_GAME_INFO_SIZE:
+        return None
+    candidate = raw[-_HOMEWORLD_CAPTAIN_GAME_INFO_SIZE:]
+    # CaptainGameInfo.numPlayers is an unsigned short at byte 198 in the
+    # 32-bit Homeworld ABI.  Reject a coincidental prefix/oversized payload.
+    player_count = int.from_bytes(candidate[198:200], "little")
+    if not 1 <= player_count <= 8:
+        return None
+    return candidate
+
+
 def _selection_size(num_ships: int) -> int:
     return 2 + max(0, int(num_ships or 0)) * 2
 
@@ -241,7 +272,8 @@ class BinaryGatewayServer:
                  product_profile: ProductProfile = HOMEWORLD_PRODUCT_PROFILE,
                  user_id_start: int = 1000,
                  peer_session_id_min: int = 1,
-                 peer_session_id_max: int = MAX_PEER_SESSION_ID):
+                 peer_session_id_max: int = MAX_PEER_SESSION_ID,
+                 replay_journal_dir: str = ""):
         self.backend_host = backend_host
         self.backend_port = backend_port
         self.backend_shared_secret = backend_shared_secret.strip()
@@ -275,6 +307,10 @@ class BinaryGatewayServer:
         self._native_login_claims: Dict[str, NativeLoginClaim] = {}
         self._native_login_claims_by_user_id: Dict[int, str] = {}
         self._native_login_locks: Dict[str, asyncio.Lock] = {}
+        self.connection_limiter = ConnectionLimiter(
+            max_connections=512,
+            max_per_ip=12,
+        )
         self._peer_session_id_min = max(1, int(peer_session_id_min))
         self._peer_session_id_max = max(
             self._peer_session_id_min,
@@ -294,6 +330,7 @@ class BinaryGatewayServer:
         self._inferred_room_metadata: Dict[int, Dict[str, object]] = {}
         self._pending_match_slot_manifests: Dict[int, Dict[str, object]] = {}
         self._pending_match_launch_configs: Dict[int, Dict[str, object]] = {}
+        self.replay_journal_dir = Path(replay_journal_dir) if replay_journal_dir else None
         self.started_at = time.time()
         if keys_dir:
             self._load_keys(keys_dir)
@@ -723,7 +760,7 @@ class BinaryGatewayServer:
         self._activity_counts.clear()
         self._ip_activity.clear()
 
-    def subscribe_live_feed(self, maxsize: int = 1024) -> asyncio.Queue:
+    def subscribe_live_feed(self, maxsize: int | None = None) -> asyncio.Queue:
         return self.live_feed_bus.subscribe(maxsize=maxsize)
 
     def unsubscribe_live_feed(self, queue: asyncio.Queue) -> None:
@@ -757,8 +794,40 @@ class BinaryGatewayServer:
             "product": self.product_profile.key,
         }
         event.update(payload)
+        self._append_replay_journal(event)
         self.live_feed_bus.publish(event)
         return event
+
+    def _append_replay_journal(self, event: Dict[str, object]) -> None:
+        """Durably retain every match event before fan-out can lose a client."""
+        match_id = str(event.get("match_id") or "").strip()
+        if self.replay_journal_dir is None or not match_id:
+            return
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", match_id).strip("_") or "match"
+        path = self.replay_journal_dir / self.product_profile.key / safe / "events.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True, separators=(",", ":")))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            # A journal write failure makes deterministic capture unsafe; it
+            # is logged loudly instead of being mistaken for a complete feed.
+            LOGGER.error("Replay journal write failed for %s: %s", match_id, exc)
+
+    def read_replay_journal(self, match_id: str) -> bytes | None:
+        if self.replay_journal_dir is None:
+            return None
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(match_id or "")).strip("_")
+        if not safe:
+            return None
+        path = self.replay_journal_dir / self.product_profile.key / safe / "events.jsonl"
+        try:
+            return path.read_bytes() if path.is_file() else None
+        except OSError:
+            return None
 
     @staticmethod
     def _infer_room_metadata_from_payload(payload: bytes) -> Dict[str, object] | None:
@@ -1836,6 +1905,7 @@ class BinaryGatewayServer:
         room_snapshot = self._routing_room_snapshot(room_port)
         match_id = self._sync_live_match_state(int(room_port), snapshot=room_snapshot, emit_update=False)
         raw_payload = bytes(payload or b"")
+        native_replay_bootstrap = _extract_native_replay_bootstrap(raw_payload)
         input_sequence = (
             self._next_match_input_sequence(int(room_port), str(match_id))
             if match_id
@@ -1861,6 +1931,16 @@ class BinaryGatewayServer:
             "fingerprint": self._live_payload_fingerprint(raw_payload),
             "gateway_input_sequence": input_sequence,
         }
+        if native_replay_bootstrap is not None:
+            # This is an input to the native replay, not a decoded or inferred
+            # setting.  The regular payload is retained too so the artifact is
+            # independently verifiable.
+            event_payload["native_replay_bootstrap"] = {
+                "format": "homeworld_captain_game_info_x86",
+                "payload_base64": base64.b64encode(native_replay_bootstrap).decode("ascii"),
+                "payload_sha256": self._live_payload_fingerprint(native_replay_bootstrap),
+                "payload_len": len(native_replay_bootstrap),
+            }
         if room_snapshot.get("level_path"):
             event_payload["level_path"] = str(room_snapshot.get("level_path") or "")
         if match_id:
@@ -3422,15 +3502,31 @@ class BinaryGatewayServer:
     async def handle_client(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter) -> None:
         """Dispatch incoming connections to Titan-native or custom handler."""
-        try:
-            first4 = await reader.readexactly(4)
-        except asyncio.IncompleteReadError:
+        peer = writer.get_extra_info("peername", ("?", 0))
+        client_ip = str(peer[0]) if isinstance(peer, tuple) and peer else None
+        if not self.connection_limiter.acquire(client_ip):
+            LOGGER.warning("Gateway connection limit reached for %s", client_ip)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
             return
-        is_titan, _ = _is_titan_native(first4)
-        if is_titan:
-            await self._handle_titan_native(reader, writer, first4)
-        else:
-            await self._handle_custom_protocol(reader, writer, first4)
+        try:
+            try:
+                first4 = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=TITAN_IDLE_TIMEOUT_SECONDS
+                )
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                return
+            is_titan, _ = _is_titan_native(first4)
+            if is_titan:
+                await self._handle_titan_native(reader, writer, first4)
+            else:
+                await self._handle_custom_protocol(reader, writer, first4)
+        finally:
+            self.connection_limiter.release(client_ip)
+            writer.close()
+            with contextlib.suppress(ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+                await writer.wait_closed()
 
 
 class SharedRoutingServerManager:
@@ -3605,6 +3701,10 @@ class SharedBinaryGatewayServer:
             else next(iter(self.runtimes))
         )
         self.default_runtime = self.runtimes[self.default_product_key]
+        self.connection_limiter = ConnectionLimiter(
+            max_connections=512,
+            max_per_ip=12,
+        )
         self.event_bus = self.default_runtime.event_bus
         shared_live_feed_bus = GatewayLiveFeedBus()
         for runtime in self.runtimes.values():
@@ -3711,7 +3811,7 @@ class SharedBinaryGatewayServer:
     def clear_activity(self) -> None:
         self.default_runtime.clear_activity()
 
-    def subscribe_live_feed(self, maxsize: int = 1024) -> asyncio.Queue:
+    def subscribe_live_feed(self, maxsize: int | None = None) -> asyncio.Queue:
         return self.live_feed_bus.subscribe(maxsize=maxsize)
 
     def unsubscribe_live_feed(self, queue: asyncio.Queue) -> None:
@@ -4023,15 +4123,31 @@ class SharedBinaryGatewayServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        try:
-            first4 = await reader.readexactly(4)
-        except asyncio.IncompleteReadError:
+        peer = writer.get_extra_info("peername", ("?", 0))
+        client_ip = str(peer[0]) if isinstance(peer, tuple) and peer else None
+        if not self.connection_limiter.acquire(client_ip):
+            LOGGER.warning("Shared gateway connection limit reached for %s", client_ip)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
             return
-        is_titan, _ = _is_titan_native(first4)
-        if is_titan:
-            await self._handle_titan_native(reader, writer, first4)
-        else:
-            await self.default_runtime._handle_custom_protocol(reader, writer, first4)
+        try:
+            try:
+                first4 = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=TITAN_IDLE_TIMEOUT_SECONDS
+                )
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                return
+            is_titan, _ = _is_titan_native(first4)
+            if is_titan:
+                await self._handle_titan_native(reader, writer, first4)
+            else:
+                await self.default_runtime._handle_custom_protocol(reader, writer, first4)
+        finally:
+            self.connection_limiter.release(client_ip)
+            writer.close()
+            with contextlib.suppress(ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+                await writer.wait_closed()
 
     def stats_snapshot(self) -> Dict[str, object]:
         routing_snapshot = self.routing_manager.dashboard_snapshot()
@@ -4545,6 +4661,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 user_id_start=int(runtime_config["user_id_start"]),
                 peer_session_id_min=int(runtime_config["peer_session_id_min"]),
                 peer_session_id_max=int(runtime_config["peer_session_id_max"]),
+                replay_journal_dir=str(args.replay_journal_dir or ""),
             )
             LOGGER.info(
                 "Shared-edge runtime: %s root=%s versions=%r backend=%s:%s routing=%d-%d",
@@ -4600,6 +4717,7 @@ async def main_async(args: argparse.Namespace) -> None:
             backend_shared_secret=args.backend_shared_secret,
             backend_timeout_s=args.backend_timeout,
             product_profile=product_profile,
+            replay_journal_dir=str(args.replay_journal_dir or ""),
         )
         LOGGER.info(
             "Gateway product profile: %s (root=%s versions=%s)",
@@ -4780,6 +4898,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Bind host for the local admin dashboard (127.0.0.1 keeps it local-only)")
     p.add_argument("--admin-port", type=int, default=8080,
                    help="Port for the local admin dashboard (set to 0 to disable)")
+    p.add_argument("--replay-journal-dir", default=os.environ.get("REPLAY_JOURNAL_DIR", "/data/replay-journal"),
+                   help="Durable gateway-owned match event journal; empty disables journaling.")
     p.add_argument(
         "--admin-token",
         default=os.environ.get("ADMIN_TOKEN", ""),

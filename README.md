@@ -1,63 +1,62 @@
 # Retail WON OSS Server
 
-[![Tests](https://github.com/FlashZ/won_oss_server/actions/workflows/tests.yml/badge.svg)](https://github.com/FlashZ/won_oss_server/actions/workflows/tests.yml)
+[![Tests](https://github.com/FlashZ/homeworld-classic-online/actions/workflows/tests.yml/badge.svg)](https://github.com/FlashZ/homeworld-classic-online/actions/workflows/tests.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![Homeworld 1.05](https://img.shields.io/badge/Homeworld-1.05-orange)](https://en.wikipedia.org/wiki/Homeworld)
 [![Cataclysm 1.0.0.1](https://img.shields.io/badge/Cataclysm-1.0.0.1-teal)](https://en.wikipedia.org/wiki/Homeworld:_Cataclysm)
 
-Open-source online bootstrap for the original retail **Homeworld** and **Homeworld: Cataclysm** clients.
+An open-source WON-compatible online service for the original retail **Homeworld** and **Homeworld: Cataclysm** clients.
 
-This project gives players a simple Windows installer and a Linux/Wine helper that point the retail games at a working WON-compatible server, install the required verifier key, and can write a matching retail-format CD key for online login.
+It includes a Windows installer and a Linux/Wine/Proton helper that configure the game, install the matching verifier key, and set up a retail-format CD key when needed.
 
-Homeworld Remastered Classic is not supported.
+## Play online
 
-## Note
+### Before you start
 
-This repo has also been a genuine test for me of how far AI can help with reverse engineering.
+- You need an installed copy of the original retail game: **Homeworld 1.05** or **Homeworld: Cataclysm 1.0.0.1**.
+- Homeworld Remastered Classic is not supported.
+- If you are playing on Windows, use the Windows installer below. You do not need Python or to run the server yourself.
 
-I was not trying to reproduce or copy the original server code. The idea was to work from retail clients, packet behavior, public assets, and live testing, and use AI to help piece together compatible server behavior from the outside in.
+### Windows (recommended)
 
-So alongside getting retail Homeworld and Cataclysm working online again, this project has also been me pushing on AI-assisted reverse engineering in a real practical setting.
+1. Go to [GitHub Releases](https://github.com/FlashZ/homeworld-classic-online/releases) and download the latest `RetailWONSetup-...exe` file.
+2. Right-click the file and choose **Run as administrator**.
+3. Select Homeworld, Cataclysm, or both, then confirm the game folder the installer found. Use **Change...** if it selected the wrong copy.
+4. Leave the default server selected to play on the community service. Only enter a custom server address when a private-server host has given you one.
+5. At the CD-key step, keep your detected key if you want to retain it. If no key is found, accept the generated key. Older shared installer keys are offered a fresh unique replacement.
+6. Choose whether to install the optional community multiplayer map pack, then finish and launch the game normally.
 
-This is also an unofficial fan project. It is not affiliated with, endorsed by, sponsored by, or connected to Relic Entertainment, Sierra, Gearbox Entertainment or Blackbird Interactive.
+The installer configures both games in one run when they are installed. It backs up an existing `NetTweak.script` before changing it.
 
-## For Players
+### Create an in-game account
 
-Download the latest installer from [GitHub Releases](https://github.com/FlashZ/won_oss_server/releases).
+Do this from the game's **Internet** screen after installing.
 
-### Windows quick install
+**Homeworld**
 
-1. Download `RetailWONSetup.exe`.
-2. Right-click it and choose `Run as administrator`.
-3. Let it detect your Homeworld and/or Cataclysm install.
-4. If you have both games installed, you can configure both in one run.
-5. Confirm the detected install folder for each game.
-6. Keep the detected CD key, or replace it with a generated one.
-7. Optionally install the community map pack.
-8. Finish the setup, then launch the game normally.
+1. Select **New Account**.
+2. Enter a username and password.
+3. Select **Create New Account**, then **Launch WON**.
 
-The installer can:
+**Cataclysm / Emergence**
 
-- auto-detect retail Homeworld and Cataclysm installs
-- show the folder it found before it changes anything
-- let you change that folder if it found the wrong copy
-- update `NetTweak.script` to point at your server
-- install the matching `kver.kp` verifier key
-- show detected CD keys and let you keep or replace them
-- optionally write a randomized retail CD key for the selected game
-- optionally download community multiplayer maps from `FlashZ/Homeworld_Map_Collection`
+1. Select **New Account**.
+2. Enter a username and password.
+3. When the optional details screen asks for email, country, and ZIP code, select **Cancel**.
+4. Select **Create New Account**, then **Launch WON**.
 
-No Python is required for the Windows installer.
+### Linux, Wine, or Proton
 
-### Linux / Wine / Proton
+Check [GitHub Releases](https://github.com/FlashZ/homeworld-classic-online/releases) for a `RetailWONSetup-linux-...zip` bundle first. If the latest release does not include one, use the Linux/Wine/Proton helper from the source repository:
 
-Linux players hosting or running the retail Windows games under Wine or Proton can use the release Linux helper bundle.
+```bash
+git clone https://github.com/FlashZ/homeworld-classic-online.git
+cd homeworld-classic-online
+```
 
-1. Download `RetailWONSetup-linux-....zip` from GitHub Releases.
-2. Extract it.
-3. Run the helper from the extracted folder:
+Then run this from the repository folder, changing the two paths for your installation:
 
 ```bash
 bash installer/install-linux.sh \
@@ -67,101 +66,54 @@ bash installer/install-linux.sh \
   --install-maps
 ```
 
-Use `--game cataclysm` for Homeworld: Cataclysm/Emergence. Pass `--server your.host.name` for a private server, `--skip-registry` to avoid Wine registry writes, or `--force-new-key` to replace a detected CD key. The helper writes a generated retail CD key by default when no existing key is found; if it detects one, interactive runs ask before replacing it and `--non-interactive` keeps it unless `--force-new-key` is set.
+Use `--game cataclysm` for Cataclysm/Emergence. The helper uses the community server by default; add `--server your.host.name` only for a private server. It requires `bash`, `python3`, and Wine (unless you pass `--skip-registry`). `curl` or `wget` is needed only when downloading the map pack.
 
-The Linux helper needs `bash`, `python3`, and either `curl` or `wget` when `--install-maps` downloads the map archive.
+## If something goes wrong
 
-### In Game (Homeworld)
+**The installer found the wrong folder**
 
-1. Click Internet.
-2. Click New Account
-3. Enter desired username and password
-4. Click Create New Account
-5. Launch WON
+Select **Change...** and choose the folder containing the game executable you actually launch.
 
-### In Game (Cataclysm/Emergence)
+**I want to switch from Homeworld to Cataclysm, or configure both**
 
-1. Click Internet.
-2. Click New Account
-3. Enter desired username and password
-4. Cancel on the details screen (it will ask for email, country, and zip code)
-5. Click Create New Account
-6. Launch WON
+Run the installer again and select the game or **Configure both**. Each game has separate online settings and CD-key formats.
 
-### Notable Bug Fix
+**I changed my CD key**
 
-- Fixes the classic Homeworld desync bug caused by shooting dust clouds with ion cannons
+Log in normally with your username and password. The server updates that account's CD-key binding after a successful login.
 
-### What the installer changes
+**Windows SmartScreen warned about the download**
 
-The installer only touches the files and registry values needed for online play:
-
-- `NetTweak.script`
-- `kver.kp`
-- the Sierra/WON CD key registry values for the selected game, if you leave CD key install enabled
-- community map folders under `MultiPlayer`, if you select the map pack
-
-If an older shared installer key is detected, the current installer now refreshes it to a new random key by default.
-
-### SmartScreen and hash checking
-
-GitHub releases include:
-
-- `RetailWONSetup-....exe`
-- `RetailWONSetup-....exe.sha256`
-- `RetailWONSetup-....exe.VERIFY.txt`
-- `RetailWONSetup-linux-....zip`
-
-If Windows SmartScreen appears, check the file hash first:
+Verify the download before running it. Each release includes a matching `.sha256` file and `VERIFY.txt`. In PowerShell, run the following with the actual installer filename and compare the result with the release checksum:
 
 ```powershell
-Get-FileHash .\RetailWONSetup-....exe -Algorithm SHA256
+Get-FileHash .\RetailWONSetup-...exe -Algorithm SHA256
 ```
 
-The SHA-256 value printed by PowerShell must match the release `.sha256` file and the bundled `VERIFY.txt`.
+**I need to undo the setup**
 
-### Troubleshooting
+Open an elevated Command Prompt in the download folder and run the installer with `--uninstall` (for example, `RetailWONSetup-...exe --uninstall`). This removes the installed `NetTweak.script`, `kver.kp`, and installer-managed CD-key values. The saved `NetTweak.script` backup remains in the game folder if one was created.
 
-`The installer found the wrong folder`
+## What the installer changes
 
-Use `Change...` on the install screen and point it at the exact game folder you actually launch from.
+For each selected game, it changes only the files and registry values required for online play:
 
-`I have both games installed`
+- `NetTweak.script` (with an existing file saved as a game-specific `.bak` file)
+- `kver.kp`
+- Sierra and WON CD-key registry values, if you choose to write a generated key
+- multiplayer map folders under `MultiPlayer`, if you choose the map pack
 
-Run the latest installer and choose `Configure both detected games`.
+## For server hosts
 
-`Homeworld works, but Cataclysm does not`
+The server supports a single Homeworld or Cataclysm service, or a shared public gateway with separate product backends. It includes Docker deployment, a live admin dashboard, and the WON-style Auth1, directory, routing, factory, and firewall services.
 
-Run the installer again and make sure Cataclysm was selected and patched too. The two games use different product settings and different CD key families.
+For Docker setup, self-hosting, shared-edge deployment, installer builds, and testing, see the [Server Setup Guide](docs/server-setup.md). Maintainers preparing a release should also read [Release Maintenance](docs/release-maintenance.md).
 
-`I updated my CD key and now login fails`
+## Project status and background
 
-Ask the server operator to clear your CD key binding for that game, then log in again so the account can bind to the new key.
+This is an unofficial fan project. It is not affiliated with, endorsed by, sponsored by, or connected to Relic Entertainment, Sierra, Gearbox Entertainment, or Blackbird Interactive.
 
-`Can I use this with Remastered Classic?`
-
-No. This project is for the original retail Homeworld family only, as Remastered Classic had the online option removed.
-
-## For Server Hosts
-
-If you are trying to run the server, Docker stack, shared-edge setup, admin dashboard, or rebuild the installer from source, use the server guide:
-
-- [Server Setup Guide](docs/server-setup.md)
-
-Additional technical docs:
-
-- [Cataclysm Bootstrap Notes](docs/cataclysm-bootstrap-notes.md)
-- [Unified Edge / Two Backend Architecture Notes](docs/unified-edge-two-backend-architecture.md)
-
-## What This Project Supports
-
-- retail Homeworld 1.05 bootstrap/install flow
-- retail Homeworld: Cataclysm 1.0.0.1 bootstrap/install flow
-- randomized retail-format CD key generation per game
-- optional community multiplayer map installation
-- Linux/Wine/Proton helper setup
-- WON-style Auth1, directory, routing, factory, and firewall services
-- an admin dashboard for live server monitoring
+The compatibility work is implemented from retail-client behaviour, packet observations, public assets, and live testing; it does not reproduce the original server code. The longer account of the AI-assisted reverse-engineering work is in [Rebuilding Retail WON with AI](docs/rebuilding-retail-won-with-ai.md).
 
 ## Support
 
@@ -171,4 +123,4 @@ If you want to support the project:
 
 ## License
 
-AGPL-3.0. See [LICENSE](LICENSE) if present in your checkout, or the badge link above.
+AGPL-3.0. See [LICENSE](LICENSE).

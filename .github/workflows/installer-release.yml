@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -42,6 +42,10 @@ jobs:
   build-and-release-installer:
     needs: test
     runs-on: windows-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
     env:
       HAS_CODESIGN_CERT: ${{ secrets.WINDOWS_CODESIGN_CERT_PFX_BASE64 != '' }}
       HAS_VT_KEY: ${{ secrets.VIRUSTOTAL_API_KEY != '' }}
@@ -215,6 +219,60 @@ jobs:
           Compress-Archive -Path (Join-Path $bundleRoot "*") -DestinationPath $zipPath -Force
           "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
 
+      - name: Generate release SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          file: installer/${{ steps.version.outputs.output_name }}
+          format: spdx-json
+          output-file: installer/${{ steps.version.outputs.output_name }}.sbom.spdx.json
+          artifact-name: ${{ steps.version.outputs.output_name }}.sbom.spdx.json
+          upload-artifact: false
+
+      - name: Generate Linux checksum and release manifest
+        id: release_artifacts
+        shell: pwsh
+        run: |
+          $linuxPath = "${{ steps.linux_bundle.outputs.zip_path }}"
+          $linuxName = Split-Path -Leaf $linuxPath
+          $linuxSha256 = (Get-FileHash $linuxPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $linuxShaPath = "$linuxPath.sha256"
+          "$linuxSha256 *$linuxName" | Set-Content -Path $linuxShaPath -NoNewline
+
+          $installerPath = Join-Path "installer" "${{ steps.version.outputs.output_name }}"
+          $sbomPath = "$installerPath.sbom.spdx.json"
+          $manifestPath = "$installerPath.release-manifest.json"
+          $sbomSha256 = (Get-FileHash $sbomPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            schema_version = 1
+            tag = "${{ steps.version.outputs.tag }}"
+            source_commit = $env:GITHUB_SHA
+            created_utc = (Get-Date).ToUniversalTime().ToString("o")
+            artifacts = @(
+              [ordered]@{ name = (Split-Path -Leaf $installerPath); sha256 = "${{ steps.hashes.outputs.sha256 }}" }
+              [ordered]@{ name = $linuxName; sha256 = $linuxSha256 }
+              [ordered]@{ name = (Split-Path -Leaf $sbomPath); sha256 = $sbomSha256 }
+            )
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath
+
+          "linux_sha256=$linuxSha256" >> $env:GITHUB_OUTPUT
+          "linux_sha_path=$linuxShaPath" >> $env:GITHUB_OUTPUT
+          "sbom_path=$sbomPath" >> $env:GITHUB_OUTPUT
+          "manifest_path=$manifestPath" >> $env:GITHUB_OUTPUT
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: |
+            installer/${{ steps.version.outputs.output_name }}
+            installer/${{ steps.version.outputs.output_name }}.sha256
+            installer/${{ steps.version.outputs.output_name }}.VERIFY.txt
+            installer/${{ steps.version.outputs.output_name }}.virustotal.json
+            ${{ steps.linux_bundle.outputs.zip_path }}
+            ${{ steps.release_artifacts.outputs.linux_sha_path }}
+            ${{ steps.release_artifacts.outputs.sbom_path }}
+            ${{ steps.release_artifacts.outputs.manifest_path }}
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
@@ -225,12 +283,16 @@ jobs:
             installer/${{ steps.version.outputs.output_name }}.VERIFY.txt
             installer/${{ steps.version.outputs.output_name }}.virustotal.json
             ${{ steps.linux_bundle.outputs.zip_path }}
+            ${{ steps.release_artifacts.outputs.linux_sha_path }}
+            ${{ steps.release_artifacts.outputs.sbom_path }}
+            ${{ steps.release_artifacts.outputs.manifest_path }}
           if-no-files-found: error
 
       - name: Generate release notes from installer commits
         id: notes
         env:
           INSTALLER_SHA256: ${{ steps.hashes.outputs.sha256 }}
+          LINUX_SHA256: ${{ steps.release_artifacts.outputs.linux_sha256 }}
           SIGNING_STATUS: ${{ steps.sign.outputs.status }}
           SIGNING_SUBJECT: ${{ steps.sign.outputs.subject }}
           VT_STATUS: ${{ steps.vt.outputs.status }}
@@ -250,6 +312,8 @@ jobs:
 
           $securityNotes = @()
           $securityNotes += "- SHA-256: ``$($env:INSTALLER_SHA256)``"
+          $securityNotes += "- Linux helper SHA-256: ``$($env:LINUX_SHA256)``"
+          $securityNotes += "- Build provenance: verify downloaded assets with ``gh attestation verify <file> --owner FlashZ``"
 
           if ($env:SIGNING_STATUS -eq "signed") {
             $securityNotes += "- Code signing: signed in CI (``$($env:SIGNING_SUBJECT)``)"
@@ -310,7 +374,11 @@ jobs:
             installer/${{ steps.version.outputs.output_name }}
             installer/${{ steps.version.outputs.output_name }}.sha256
             installer/${{ steps.version.outputs.output_name }}.VERIFY.txt
+            installer/${{ steps.version.outputs.output_name }}.virustotal.json
             ${{ steps.linux_bundle.outputs.zip_path }}
+            ${{ steps.release_artifacts.outputs.linux_sha_path }}
+            ${{ steps.release_artifacts.outputs.sbom_path }}
+            ${{ steps.release_artifacts.outputs.manifest_path }}
           fail_on_unmatched_files: true
           overwrite_files: true
           make_latest: true

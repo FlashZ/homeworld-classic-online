@@ -7,12 +7,36 @@ import time
 
 from product_profile import CATACLYSM_PRODUCT_PROFILE, HOMEWORLD_PRODUCT_PROFILE
 import titan_binary_gateway
+from gateway.titan_service import _extract_native_replay_bootstrap
+from gateway.protocol import GatewayLiveFeedBus
 
 
 def _build_hw_packet(packet_type: int, frame: int, commands: list[tuple[int, bytes]], *, sender: int = 0) -> bytes:
     header = struct.pack("<HHIHHffH", packet_type, sender, frame, frame, 0, 0.0, 0.0, len(commands)) + b"\x00\x00"
     encoded_commands = b"".join(struct.pack("<H", command_type) + body for command_type, body in commands)
     return header + encoded_commands
+
+
+def test_gateway_retains_the_exact_native_game_start_structure() -> None:
+    captain_game_info = bytearray(584)
+    captain_game_info[198:200] = (4).to_bytes(2, "little")
+    payload = b"\x03\xe2\x40" + "Fleet Battle".encode("utf-16le") + b"\x00\x00" + bytes(captain_game_info)
+
+    assert _extract_native_replay_bootstrap(payload) == bytes(captain_game_info)
+    assert _extract_native_replay_bootstrap(b"\x03\xe2\x60" + bytes(captain_game_info)) is None
+
+
+def test_live_feed_buffer_retains_a_full_busy_match_without_silent_loss() -> None:
+    bus = GatewayLiveFeedBus()
+    queue = bus.subscribe()
+
+    # A busy four-player game can burst well beyond the old 1,024-event
+    # subscriber queue while the stats archive flushes JSONL to disk.
+    for sequence in range(30_000):
+        bus.publish({"event": "peer_packet", "gateway_input_sequence": sequence + 1})
+
+    assert queue.qsize() == 30_000
+    assert bus.dropped_for(queue) == 0
 
 
 class _FakeRoutingManager:

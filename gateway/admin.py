@@ -3009,6 +3009,14 @@ class AdminDashboardServer:
                 self._accounts_page(acct_product, acct_q, acct_offset, acct_limit)
             ).encode("utf-8")
             writer.write(self._http_response(body, "application/json; charset=utf-8"))
+        elif parsed.path == "/api/replay-journal":
+            match_id = str(query.get("match_id", [""])[0] or "")
+            read_journal = getattr(self.gateway, "read_replay_journal", None)
+            body = read_journal(match_id) if callable(read_journal) else None
+            if body is None:
+                writer.write(self._http_response(b"journal not found", "text/plain; charset=utf-8", "404 Not Found"))
+            else:
+                writer.write(self._http_response(body, "application/x-ndjson; charset=utf-8"))
         elif parsed.path == "/api/live-feed":
             subscribe = getattr(self.gateway, "subscribe_live_feed", None)
             unsubscribe = getattr(self.gateway, "unsubscribe_live_feed", None)
@@ -3036,6 +3044,22 @@ class AdminDashboardServer:
                 writer.write(self._sse_frame("ready", hello))
                 await writer.drain()
                 while True:
+                    live_feed_bus = getattr(self.gateway, "live_feed_bus", None)
+                    dropped_for = getattr(live_feed_bus, "dropped_for", None)
+                    dropped = int(dropped_for(queue)) if callable(dropped_for) else 0
+                    if dropped:
+                        # Do not claim a continuous stream after the bounded
+                        # buffer has overflowed.  A client that sees this is
+                        # required to reject the affected replay input.
+                        overflow = {
+                            "event": "live_feed_overflow",
+                            "ts": time.time(),
+                            "dropped_events": dropped,
+                            "authority": "capture_integrity",
+                        }
+                        writer.write(self._sse_frame("live_feed_overflow", overflow))
+                        await writer.drain()
+                        return
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=15.0)
                     except asyncio.TimeoutError:

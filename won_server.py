@@ -26,6 +26,7 @@ from product_profile import (
     product_profile_from_name,
 )
 import won_crypto
+from connection_limits import ConnectionLimiter
 
 LOGGER = logging.getLogger("won_oss_server")
 
@@ -34,6 +35,12 @@ RATE_WINDOW_SECONDS = 5 * 60
 MAX_LOGIN_ATTEMPTS = 20
 NATIVE_KEY_WRITE_WINDOW_SECONDS = 10 * 60
 MAX_NATIVE_KEY_WRITES = 6
+PASSWORD_HASH_SCHEME = "pbkdf2_sha256"
+PASSWORD_HASH_ITERATIONS = 310_000
+PASSWORD_HASH_SALT_BYTES = 16
+BACKEND_MAX_CONNECTIONS = 128
+BACKEND_MAX_CONNECTIONS_PER_IP = 16
+BACKEND_IDLE_TIMEOUT_SECONDS = 60.0
 MAX_EVENTS_PER_PLAYER = 256
 _login_attempts: Dict[str, List[float]] = {}
 _native_key_write_attempts: Dict[str, List[float]] = {}
@@ -405,8 +412,66 @@ class WONLikeState:
         self._persist_events()
 
     @staticmethod
-    def _hash_password(password: str) -> str:
+    def _legacy_hash_password(password: str) -> str:
         return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _hash_password(cls, password: str) -> str:
+        """Store new passwords using a slow salted hash.
+
+        The retail protocol is unchanged: this only changes data at rest in
+        the server database.
+        """
+        salt = secrets.token_bytes(PASSWORD_HASH_SALT_BYTES)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+        )
+        return "$".join(
+            (
+                PASSWORD_HASH_SCHEME,
+                str(PASSWORD_HASH_ITERATIONS),
+                salt.hex(),
+                digest.hex(),
+            )
+        )
+
+    @classmethod
+    def _verify_password(cls, password: str, stored_hash: str) -> tuple[bool, bool]:
+        """Return ``(valid, upgrade_legacy_hash)`` for a stored password."""
+        value = str(stored_hash or "")
+        parts = value.split("$")
+        if len(parts) == 4 and parts[0] == PASSWORD_HASH_SCHEME:
+            try:
+                iterations = int(parts[1])
+                salt = bytes.fromhex(parts[2])
+                expected = bytes.fromhex(parts[3])
+            except (TypeError, ValueError):
+                return False, False
+            if iterations < 100_000 or not salt or not expected:
+                return False, False
+            actual = hashlib.pbkdf2_hmac(
+                "sha256", password.encode("utf-8"), salt, iterations
+            )
+            return secrets.compare_digest(actual, expected), False
+
+        # Existing installs used an unsalted SHA-256 value. Accept it once so
+        # active players do not need a password reset, then replace it after a
+        # successful login.
+        legacy = cls._legacy_hash_password(password)
+        return secrets.compare_digest(legacy, value), True
+
+    def _verify_and_upgrade_password(
+        self, username: str, password: str, stored_hash: str
+    ) -> bool:
+        valid, upgrade = self._verify_password(password, stored_hash)
+        if valid and upgrade:
+            self.store.conn.execute(
+                "UPDATE users SET password_hash=? WHERE username=?",
+                (self._hash_password(password), username),
+            )
+            self.store.conn.commit()
+            LOGGER.info("Upgraded legacy password hash for user=%r", username)
+        return valid
 
     @staticmethod
     def _normalize_native_key(value: str) -> str:
@@ -547,7 +612,7 @@ class WONLikeState:
         if row is None:
             self.create_user(username, password)
             row = cur.execute("SELECT password_hash FROM users WHERE username=?", (username,)).fetchone()
-        if self._hash_password(password) != row["password_hash"]:
+        if not self._verify_and_upgrade_password(username, password, row["password_hash"]):
             raise ValueError("invalid_credentials")
         token = f"tok_{secrets.token_hex(16)}"
         self.sessions[token] = SessionRecord(username=username, created_at=time.time())
@@ -613,7 +678,7 @@ class WONLikeState:
         if create_account:
             raise ValueError("username_taken")
 
-        if self._hash_password(password) != row["password_hash"]:
+        if not self._verify_and_upgrade_password(username, password, row["password_hash"]):
             raise ValueError("invalid_credentials")
         if account_active:
             raise ValueError("already_logged_in")
@@ -928,6 +993,10 @@ class WONLikeProtocolServer:
         self.state = state
         self.shared_secret = shared_secret.strip()
         self.managed_procs: Dict[str, asyncio.subprocess.Process] = {}
+        self.connection_limiter = ConnectionLimiter(
+            max_connections=BACKEND_MAX_CONNECTIONS,
+            max_per_ip=BACKEND_MAX_CONNECTIONS_PER_IP,
+        )
 
     @staticmethod
     def _client_ip(writer: asyncio.StreamWriter) -> Optional[str]:
@@ -958,9 +1027,17 @@ class WONLikeProtocolServer:
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client_ip = self._client_ip(writer)
+        if not self.connection_limiter.acquire(client_ip):
+            LOGGER.warning("Rejected backend connection from %s: connection limit", client_ip)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
         try:
             while True:
-                raw = await reader.readline()
+                raw = await asyncio.wait_for(
+                    reader.readline(), timeout=BACKEND_IDLE_TIMEOUT_SECONDS
+                )
                 if not raw:
                     break
                 self.state.metrics["requests"] += 1
@@ -980,7 +1057,10 @@ class WONLikeProtocolServer:
                     resp = {"ok": False, "error": str(exc)}
                 writer.write((json.dumps(resp) + "\n").encode("utf-8"))
                 await writer.drain()
+        except asyncio.TimeoutError:
+            LOGGER.debug("Backend connection idle timeout from %s", client_ip)
         finally:
+            self.connection_limiter.release(client_ip)
             writer.close()
             await writer.wait_closed()
 
