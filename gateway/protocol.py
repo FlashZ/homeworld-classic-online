@@ -87,7 +87,9 @@ TITAN_MAX_FRAME = 65536
 ROUTING_MAX_CHAT_CHARS = 220
 # Keep client connections alive during normal lobby/game play, but release
 # abandoned sockets rather than allowing a slow-connection resource drain.
-ROUTING_IDLE_TIMEOUT_SECONDS = 300.0
+# Set high enough that an AFK player idling in the lobby is not dropped from
+# their room mid-session; the reaper still frees genuinely abandoned sockets.
+ROUTING_IDLE_TIMEOUT_SECONDS = 3600.0
 TITAN_IDLE_TIMEOUT_SECONDS = 300.0
 ROUTING_RECONNECT_GRACE_SECONDS = 90.0
 ROOM_ALLOCATION_GRACE_SECONDS = 120.0
