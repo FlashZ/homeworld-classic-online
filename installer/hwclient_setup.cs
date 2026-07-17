@@ -12,7 +12,7 @@ using Microsoft.Win32;
 internal static class HWClientSetup
 {
     private const string CustomHostOptionLabel = "Custom host or IP";
-    private const string ConfigureBothOptionLabel = "Configure both detected games";
+    private const string ConfigureBothOptionLabel = "Configure both games";
     private const int DefaultGatewayPort = 15101;
     private const string WonCdKeysRegistryPath = @"SOFTWARE\WON\CDKeys";
     private const string SierraCdKeyValueName = "CDKey";
@@ -1083,19 +1083,19 @@ internal static class HWClientSetup
         }
 
         List<InstallTarget> detectedTargets = CollectDetectedInstallTargets(KnownGames);
-        if (detectedTargets.Count == 1)
-        {
-            return detectedTargets;
-        }
-
+        GameInstallConfig preferredGame = detectedTargets.Count == 1
+            ? detectedTargets[0].Game
+            : null;
         GameSelectionResult selection = PromptForGameSelection(
-            detectedTargets.Count > 0 ? detectedTargets.ConvertAll(target => target.Game).ToArray() : KnownGames,
-            allowConfigureBoth: !options.Uninstall);
+            KnownGames,
+            allowConfigureBoth: !options.Uninstall,
+            preferredGame: preferredGame,
+            preferBoth: detectedTargets.Count == KnownGames.Length);
 
         if (selection.ConfigureAll)
         {
             return ResolveMultipleInstallTargets(
-                detectedTargets.Count > 0 ? detectedTargets.ConvertAll(target => target.Game).ToArray() : KnownGames,
+                KnownGames,
                 options.Uninstall);
         }
 
@@ -1174,7 +1174,11 @@ internal static class HWClientSetup
         return null;
     }
 
-    private static GameSelectionResult PromptForGameSelection(IList<GameInstallConfig> options, bool allowConfigureBoth)
+    private static GameSelectionResult PromptForGameSelection(
+        IList<GameInstallConfig> options,
+        bool allowConfigureBoth,
+        GameInstallConfig preferredGame,
+        bool preferBoth)
     {
         if (options == null || options.Count == 0)
         {
@@ -1201,7 +1205,7 @@ internal static class HWClientSetup
             form.StartPosition = FormStartPosition.CenterScreen;
             form.MaximizeBox = false;
             form.MinimizeBox = false;
-            form.ClientSize = new Size(400, 170);
+            form.ClientSize = new Size(400, 184);
             form.Font = SystemFonts.MessageBoxFont;
             form.AcceptButton = okButton;
             form.CancelButton = cancelButton;
@@ -1213,13 +1217,13 @@ internal static class HWClientSetup
 
             summaryLabel.AutoSize = false;
             summaryLabel.Location = new Point(15, 38);
-            summaryLabel.Size = new Size(370, 34);
+            summaryLabel.Size = new Size(370, 42);
             summaryLabel.Text = allowConfigureBoth
-                ? "Choose one game to configure, or pick Configure both to walk through each detected install in sequence."
+                ? "Choose Homeworld, Cataclysm, or both. If a game is not detected, you can select its install folder next."
                 : "Choose which game to configure.";
 
             gameCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-            gameCombo.Location = new Point(15, 80);
+            gameCombo.Location = new Point(15, 88);
             gameCombo.Size = new Size(368, 24);
             gameCombo.TabIndex = 0;
             foreach (GameInstallConfig game in options)
@@ -1230,16 +1234,36 @@ internal static class HWClientSetup
             {
                 gameCombo.Items.Add(ConfigureBothOptionLabel);
             }
-            gameCombo.SelectedIndex = 0;
+            if (allowConfigureBoth && preferBoth)
+            {
+                gameCombo.SelectedIndex = options.Count;
+            }
+            else if (preferredGame != null)
+            {
+                int preferredIndex = 0;
+                for (int i = 0; i < options.Count; i += 1)
+                {
+                    if (string.Equals(options[i].Key, preferredGame.Key, StringComparison.OrdinalIgnoreCase))
+                    {
+                        preferredIndex = i;
+                        break;
+                    }
+                }
+                gameCombo.SelectedIndex = preferredIndex;
+            }
+            else
+            {
+                gameCombo.SelectedIndex = 0;
+            }
 
             okButton.Text = "Continue";
-            okButton.Location = new Point(204, 126);
+            okButton.Location = new Point(204, 140);
             okButton.Size = new Size(84, 28);
             okButton.DialogResult = DialogResult.OK;
             okButton.TabIndex = 1;
 
             cancelButton.Text = "Cancel";
-            cancelButton.Location = new Point(296, 126);
+            cancelButton.Location = new Point(296, 140);
             cancelButton.Size = new Size(84, 28);
             cancelButton.DialogResult = DialogResult.Cancel;
             cancelButton.TabIndex = 2;
