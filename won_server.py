@@ -137,7 +137,8 @@ class StateStore:
               password_hash TEXT NOT NULL,
               created_at REAL NOT NULL,
               native_cd_key TEXT,
-              native_login_key TEXT
+              native_login_key TEXT,
+              last_seen_at REAL NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS players (
               player_id TEXT PRIMARY KEY,
@@ -214,6 +215,8 @@ class StateStore:
             cur.execute("ALTER TABLE users ADD COLUMN native_cd_key TEXT")
         if "native_login_key" not in user_columns:
             cur.execute("ALTER TABLE users ADD COLUMN native_login_key TEXT")
+        if "last_seen_at" not in user_columns:
+            cur.execute("ALTER TABLE users ADD COLUMN last_seen_at REAL NOT NULL DEFAULT 0")
         if "created_at" not in session_columns:
             cur.execute("ALTER TABLE sessions ADD COLUMN created_at REAL")
         cur.execute(
@@ -488,8 +491,8 @@ class WONLikeState:
         cur = self.store.conn.cursor()
         cur.execute(
             """
-            INSERT INTO users(username,password_hash,created_at,native_cd_key,native_login_key)
-            VALUES(?,?,?,?,?)
+            INSERT INTO users(username,password_hash,created_at,native_cd_key,native_login_key,last_seen_at)
+            VALUES(?,?,?,?,?,?)
             """,
             (
                 username,
@@ -497,6 +500,7 @@ class WONLikeState:
                 time.time(),
                 self._normalize_native_key(native_cd_key),
                 native_login_key.strip(),
+                time.time(),
             ),
         )
         self.store.conn.commit()
@@ -614,6 +618,8 @@ class WONLikeState:
             row = cur.execute("SELECT password_hash FROM users WHERE username=?", (username,)).fetchone()
         if not self._verify_and_upgrade_password(username, password, row["password_hash"]):
             raise ValueError("invalid_credentials")
+        cur.execute("UPDATE users SET last_seen_at=? WHERE username=?", (time.time(), username))
+        self.store.conn.commit()
         token = f"tok_{secrets.token_hex(16)}"
         self.sessions[token] = SessionRecord(username=username, created_at=time.time())
         self._persist_sessions()
@@ -714,8 +720,8 @@ class WONLikeState:
             )
             binding_changed = True
 
-        if binding_changed:
-            self.store.conn.commit()
+        cur.execute("UPDATE users SET last_seen_at=? WHERE username=?", (time.time(), username))
+        self.store.conn.commit()
 
         return {
             "username": username,

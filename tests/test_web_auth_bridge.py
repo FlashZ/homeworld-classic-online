@@ -21,7 +21,14 @@ from gateway.admin import AdminDashboardServer, DASHBOARD_LOG_HANDLER
 from gateway import titan_service
 
 
-def _seed_user(db_path: Path, username: str, password_hash: str) -> None:
+def _seed_user(
+    db_path: Path,
+    username: str,
+    password_hash: str,
+    *,
+    native_cd_key: str = "",
+    last_seen_at: float = 0.0,
+) -> None:
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
@@ -30,13 +37,17 @@ def _seed_user(db_path: Path, username: str, password_hash: str) -> None:
             password_hash TEXT NOT NULL,
             created_at REAL NOT NULL,
             native_cd_key TEXT,
-            native_login_key TEXT
+            native_login_key TEXT,
+            last_seen_at REAL NOT NULL DEFAULT 0
         )
         """
     )
     conn.execute(
-        "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-        (username, password_hash, time.time()),
+        """
+        INSERT INTO users (username, password_hash, created_at, native_cd_key, last_seen_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (username, password_hash, time.time(), native_cd_key, last_seen_at),
     )
     conn.commit()
     conn.close()
@@ -48,12 +59,14 @@ def _make_bridge(
     default_product: str = "homeworld",
     shared_secret: str = "bridge-secret",
     code_ttl_seconds: float = 30.0,
+    cdkey_fingerprint_salt: str = "",
 ) -> GatewayWebAuthBridge:
     return GatewayWebAuthBridge(
         db_paths=db_paths,
         default_product=default_product,
         shared_secret=shared_secret,
         code_ttl_seconds=code_ttl_seconds,
+        cdkey_fingerprint_salt=cdkey_fingerprint_salt,
     )
 
 
@@ -141,6 +154,92 @@ def test_web_auth_authenticates_existing_user_and_consumes_code(tmp_path: Path) 
             product="homeworld",
             shared_secret="bridge-secret",
         )
+
+
+def test_web_auth_exchange_returns_salted_fingerprint_and_same_key_suggestions(tmp_path: Path) -> None:
+    homeworld_db = tmp_path / "homeworld.db"
+    cataclysm_db = tmp_path / "cataclysm.db"
+    bridge = _make_bridge(
+        {"homeworld": str(homeworld_db), "cataclysm": str(cataclysm_db)},
+        cdkey_fingerprint_salt="private-fingerprint-salt",
+    )
+    password_hash = bridge.hash_password("swordfish")
+    _seed_user(
+        homeworld_db,
+        "ZeroSF",
+        password_hash,
+        native_cd_key="NYX7-ZEC9-FYZ6-GUX8-4253",
+        last_seen_at=100.0,
+    )
+    _seed_user(
+        homeworld_db,
+        "ZeroAlt",
+        password_hash,
+        native_cd_key="NYX7ZEC9FYZ6GUX84253",
+        last_seen_at=300.0,
+    )
+    _seed_user(
+        homeworld_db,
+        "DifferentKey",
+        password_hash,
+        native_cd_key="PYL8GUD4BET3MEX96624",
+        last_seen_at=400.0,
+    )
+    _seed_user(
+        cataclysm_db,
+        "CataAlt",
+        password_hash,
+        native_cd_key="NYX7ZEC9FYZ6GUX84253",
+        last_seen_at=500.0,
+    )
+
+    started = bridge.start_login(
+        product="homeworld",
+        username="ZeroSF",
+        password="swordfish",
+        return_to="https://stats.example.test/auth/callback",
+    )
+    exchanged = bridge.exchange_code(
+        code=str(started["code"]),
+        product="homeworld",
+        shared_secret="bridge-secret",
+    )
+
+    assert exchanged["cdkey_fingerprint"].startswith("sha256:")
+    assert len(exchanged["cdkey_fingerprint"]) == len("sha256:") + 64
+    assert exchanged["linkable_accounts"] == [
+        {"product": "homeworld", "username": "ZeroAlt", "last_seen_at": 300.0}
+    ]
+    serialized = json.dumps(exchanged)
+    assert "NYX7" not in serialized
+    assert "CataAlt" not in serialized
+    assert "DifferentKey" not in serialized
+
+
+def test_web_auth_exchange_omits_link_hints_without_private_salt(tmp_path: Path) -> None:
+    db_path = tmp_path / "won_server.db"
+    bridge = _make_bridge({"homeworld": str(db_path)})
+    _seed_user(
+        db_path,
+        "ZeroSF",
+        bridge.hash_password("swordfish"),
+        native_cd_key="NYX7ZEC9FYZ6GUX84253",
+    )
+
+    started = bridge.start_login(
+        product="homeworld",
+        username="ZeroSF",
+        password="swordfish",
+        return_to="https://stats.example.test/auth/callback",
+    )
+    exchanged = bridge.exchange_code(
+        code=str(started["code"]),
+        product="homeworld",
+        shared_secret="bridge-secret",
+    )
+
+    assert exchanged["cdkey_fingerprint"] == ""
+    assert exchanged["linkable_accounts"] == []
 
 
 def test_web_auth_rejects_exchange_with_wrong_shared_secret(tmp_path: Path) -> None:
@@ -311,12 +410,15 @@ def test_gateway_parser_accepts_web_auth_cli_flags() -> None:
             "https://stats.example.test",
             "--web-auth-code-ttl-seconds",
             "300",
+            "--web-auth-cdkey-fingerprint-salt",
+            "fingerprint-salt",
         ]
     )
 
     assert args.web_auth_shared_secret == "bridge-secret"
     assert args.web_auth_public_base_url == "https://stats.example.test"
     assert args.web_auth_code_ttl_seconds == 300.0
+    assert args.web_auth_cdkey_fingerprint_salt == "fingerprint-salt"
 
 
 def test_main_async_attaches_web_auth_bridge_and_dashboard_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
