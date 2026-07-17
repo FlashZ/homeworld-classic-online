@@ -29,6 +29,7 @@ from .product_profile import (
     ProductProfile,
     product_profile_from_name,
 )
+from connection_limits import ConnectionLimiter
 
 globals().update({name: getattr(_protocol, name) for name in dir(_protocol) if name.startswith('_')})
 LOGGER = logging.getLogger(__name__)
@@ -306,6 +307,10 @@ class BinaryGatewayServer:
         self._native_login_claims: Dict[str, NativeLoginClaim] = {}
         self._native_login_claims_by_user_id: Dict[int, str] = {}
         self._native_login_locks: Dict[str, asyncio.Lock] = {}
+        self.connection_limiter = ConnectionLimiter(
+            max_connections=512,
+            max_per_ip=12,
+        )
         self._peer_session_id_min = max(1, int(peer_session_id_min))
         self._peer_session_id_max = max(
             self._peer_session_id_min,
@@ -3497,15 +3502,31 @@ class BinaryGatewayServer:
     async def handle_client(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter) -> None:
         """Dispatch incoming connections to Titan-native or custom handler."""
-        try:
-            first4 = await reader.readexactly(4)
-        except asyncio.IncompleteReadError:
+        peer = writer.get_extra_info("peername", ("?", 0))
+        client_ip = str(peer[0]) if isinstance(peer, tuple) and peer else None
+        if not self.connection_limiter.acquire(client_ip):
+            LOGGER.warning("Gateway connection limit reached for %s", client_ip)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
             return
-        is_titan, _ = _is_titan_native(first4)
-        if is_titan:
-            await self._handle_titan_native(reader, writer, first4)
-        else:
-            await self._handle_custom_protocol(reader, writer, first4)
+        try:
+            try:
+                first4 = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=TITAN_IDLE_TIMEOUT_SECONDS
+                )
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                return
+            is_titan, _ = _is_titan_native(first4)
+            if is_titan:
+                await self._handle_titan_native(reader, writer, first4)
+            else:
+                await self._handle_custom_protocol(reader, writer, first4)
+        finally:
+            self.connection_limiter.release(client_ip)
+            writer.close()
+            with contextlib.suppress(ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+                await writer.wait_closed()
 
 
 class SharedRoutingServerManager:
@@ -3680,6 +3701,10 @@ class SharedBinaryGatewayServer:
             else next(iter(self.runtimes))
         )
         self.default_runtime = self.runtimes[self.default_product_key]
+        self.connection_limiter = ConnectionLimiter(
+            max_connections=512,
+            max_per_ip=12,
+        )
         self.event_bus = self.default_runtime.event_bus
         shared_live_feed_bus = GatewayLiveFeedBus()
         for runtime in self.runtimes.values():
@@ -4098,15 +4123,31 @@ class SharedBinaryGatewayServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        try:
-            first4 = await reader.readexactly(4)
-        except asyncio.IncompleteReadError:
+        peer = writer.get_extra_info("peername", ("?", 0))
+        client_ip = str(peer[0]) if isinstance(peer, tuple) and peer else None
+        if not self.connection_limiter.acquire(client_ip):
+            LOGGER.warning("Shared gateway connection limit reached for %s", client_ip)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
             return
-        is_titan, _ = _is_titan_native(first4)
-        if is_titan:
-            await self._handle_titan_native(reader, writer, first4)
-        else:
-            await self.default_runtime._handle_custom_protocol(reader, writer, first4)
+        try:
+            try:
+                first4 = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=TITAN_IDLE_TIMEOUT_SECONDS
+                )
+            except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                return
+            is_titan, _ = _is_titan_native(first4)
+            if is_titan:
+                await self._handle_titan_native(reader, writer, first4)
+            else:
+                await self.default_runtime._handle_custom_protocol(reader, writer, first4)
+        finally:
+            self.connection_limiter.release(client_ip)
+            writer.close()
+            with contextlib.suppress(ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+                await writer.wait_closed()
 
     def stats_snapshot(self) -> Dict[str, object]:
         routing_snapshot = self.routing_manager.dashboard_snapshot()

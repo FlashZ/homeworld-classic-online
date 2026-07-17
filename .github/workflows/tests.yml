@@ -34,3 +34,65 @@ jobs:
 
       - name: Run pytest
         run: python -m pytest -q
+
+  windows-installer-build:
+    name: Windows installer build
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Build installer
+        env:
+          INSTALLER_VERSION: ci-${{ github.sha }}
+          INSTALLER_FILE_VERSION: 0.0.0.0
+          INSTALLER_ASSEMBLY_VERSION: 0.0.0.0
+          INSTALLER_OUTPUT_NAME: RetailWONSetup-ci.exe
+        shell: cmd
+        run: installer\build_installer.bat
+
+  docker-compose-smoke:
+    name: Docker Compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Validate and start the Docker stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          sed -i \
+            -e 's/^PUBLIC_HOST=.*/PUBLIC_HOST=127.0.0.1/' \
+            -e 's/^BACKEND_SHARED_SECRET=.*/BACKEND_SHARED_SECRET=ci-backend-secret/' \
+            -e 's/^ADMIN_TOKEN=.*/ADMIN_TOKEN=ci-admin-token/' \
+            -e 's/^STATS_TOKEN=.*/STATS_TOKEN=ci-stats-token/' \
+            -e 's/^WEB_AUTH_SHARED_SECRET=.*/WEB_AUTH_SHARED_SECRET=ci-web-auth-secret/' \
+            -e 's/^WEB_AUTH_CDKEY_FINGERPRINT_SALT=.*/WEB_AUTH_CDKEY_FINGERPRINT_SALT=ci-fingerprint-salt-not-for-production/' \
+            .env
+          mkdir -p data
+          python -m pip install -r requirements-server.txt
+          python generate_keys.py --keys-dir data/homeworld/keys
+          chown -R 1001:1001 data
+          chmod 700 data
+          docker compose config --quiet
+          trap 'docker compose logs --no-color; docker compose down --volumes --remove-orphans' EXIT
+          docker compose up --detach --build
+
+          for attempt in $(seq 1 24); do
+            if curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null && \
+               curl --fail --silent --show-error http://127.0.0.1:8080/ready >/dev/null; then
+              docker compose ps
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Timed out waiting for the Docker stack to become ready." >&2
+          exit 1

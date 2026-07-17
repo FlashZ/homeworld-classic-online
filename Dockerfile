@@ -6,10 +6,16 @@ ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app/won_oss_server
 
 COPY requirements-server.txt /tmp/requirements-server.txt
-RUN apk add --no-cache git
-RUN pip install --no-cache-dir -r /tmp/requirements-server.txt
+RUN apk add --no-cache git \
+    && addgroup -S -g 1001 won \
+    && adduser -S -D -H -u 1001 -G won won \
+    && pip install --no-cache-dir -r /tmp/requirements-server.txt
 
-COPY . /app/won_oss_server
+COPY --chown=1001:1001 . /app/won_oss_server
+
+# The Compose deployment mounts a writable /data volume owned by UID 1001.
+# Everything else remains read-only at runtime.
+USER 1001:1001
 
 EXPOSE 9100 15101 15100-15120 2021 8080
 

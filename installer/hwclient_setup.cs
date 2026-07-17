@@ -12,7 +12,7 @@ using Microsoft.Win32;
 internal static class HWClientSetup
 {
     private const string CustomHostOptionLabel = "Custom host or IP";
-    private const string ConfigureBothOptionLabel = "Configure both detected games";
+    private const string ConfigureBothOptionLabel = "Configure both games";
     private const int DefaultGatewayPort = 15101;
     private const string WonCdKeysRegistryPath = @"SOFTWARE\WON\CDKeys";
     private const string SierraCdKeyValueName = "CDKey";
@@ -592,7 +592,11 @@ internal static class HWClientSetup
         {
             Directory.CreateDirectory(tempRoot);
             ReportMapPackProgress(progress, "Preparing community maps", 0, "Creating temporary download folder.");
-            MapPackInstaller.DownloadArchive(MapPackInstaller.RepositoryArchiveUrl, archivePath, progress);
+            MapPackInstaller.DownloadArchive(
+                MapPackInstaller.RepositoryArchiveUrl,
+                archivePath,
+                MapPackInstaller.RepositoryArchiveSha256,
+                progress);
             ReportMapPackProgress(progress, "Extracting community maps", 0, "Unpacking downloaded archive.");
             Directory.CreateDirectory(extractedPath);
             ZipFile.ExtractToDirectory(archivePath, extractedPath);
@@ -1079,19 +1083,19 @@ internal static class HWClientSetup
         }
 
         List<InstallTarget> detectedTargets = CollectDetectedInstallTargets(KnownGames);
-        if (detectedTargets.Count == 1)
-        {
-            return detectedTargets;
-        }
-
+        GameInstallConfig preferredGame = detectedTargets.Count == 1
+            ? detectedTargets[0].Game
+            : null;
         GameSelectionResult selection = PromptForGameSelection(
-            detectedTargets.Count > 0 ? detectedTargets.ConvertAll(target => target.Game).ToArray() : KnownGames,
-            allowConfigureBoth: !options.Uninstall);
+            KnownGames,
+            allowConfigureBoth: !options.Uninstall,
+            preferredGame: preferredGame,
+            preferBoth: detectedTargets.Count == KnownGames.Length);
 
         if (selection.ConfigureAll)
         {
             return ResolveMultipleInstallTargets(
-                detectedTargets.Count > 0 ? detectedTargets.ConvertAll(target => target.Game).ToArray() : KnownGames,
+                KnownGames,
                 options.Uninstall);
         }
 
@@ -1170,7 +1174,11 @@ internal static class HWClientSetup
         return null;
     }
 
-    private static GameSelectionResult PromptForGameSelection(IList<GameInstallConfig> options, bool allowConfigureBoth)
+    private static GameSelectionResult PromptForGameSelection(
+        IList<GameInstallConfig> options,
+        bool allowConfigureBoth,
+        GameInstallConfig preferredGame,
+        bool preferBoth)
     {
         if (options == null || options.Count == 0)
         {
@@ -1197,7 +1205,7 @@ internal static class HWClientSetup
             form.StartPosition = FormStartPosition.CenterScreen;
             form.MaximizeBox = false;
             form.MinimizeBox = false;
-            form.ClientSize = new Size(400, 170);
+            form.ClientSize = new Size(400, 184);
             form.Font = SystemFonts.MessageBoxFont;
             form.AcceptButton = okButton;
             form.CancelButton = cancelButton;
@@ -1209,13 +1217,13 @@ internal static class HWClientSetup
 
             summaryLabel.AutoSize = false;
             summaryLabel.Location = new Point(15, 38);
-            summaryLabel.Size = new Size(370, 34);
+            summaryLabel.Size = new Size(370, 42);
             summaryLabel.Text = allowConfigureBoth
-                ? "Choose one game to configure, or pick Configure both to walk through each detected install in sequence."
+                ? "Choose Homeworld, Cataclysm, or both. If a game is not detected, you can select its install folder next."
                 : "Choose which game to configure.";
 
             gameCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-            gameCombo.Location = new Point(15, 80);
+            gameCombo.Location = new Point(15, 88);
             gameCombo.Size = new Size(368, 24);
             gameCombo.TabIndex = 0;
             foreach (GameInstallConfig game in options)
@@ -1226,16 +1234,36 @@ internal static class HWClientSetup
             {
                 gameCombo.Items.Add(ConfigureBothOptionLabel);
             }
-            gameCombo.SelectedIndex = 0;
+            if (allowConfigureBoth && preferBoth)
+            {
+                gameCombo.SelectedIndex = options.Count;
+            }
+            else if (preferredGame != null)
+            {
+                int preferredIndex = 0;
+                for (int i = 0; i < options.Count; i += 1)
+                {
+                    if (string.Equals(options[i].Key, preferredGame.Key, StringComparison.OrdinalIgnoreCase))
+                    {
+                        preferredIndex = i;
+                        break;
+                    }
+                }
+                gameCombo.SelectedIndex = preferredIndex;
+            }
+            else
+            {
+                gameCombo.SelectedIndex = 0;
+            }
 
             okButton.Text = "Continue";
-            okButton.Location = new Point(204, 126);
+            okButton.Location = new Point(204, 140);
             okButton.Size = new Size(84, 28);
             okButton.DialogResult = DialogResult.OK;
             okButton.TabIndex = 1;
 
             cancelButton.Text = "Cancel";
-            cancelButton.Location = new Point(296, 126);
+            cancelButton.Location = new Point(296, 140);
             cancelButton.Size = new Size(84, 28);
             cancelButton.DialogResult = DialogResult.Cancel;
             cancelButton.TabIndex = 2;
@@ -1574,22 +1602,24 @@ internal static class HWClientSetup
         StringBuilder summary = new StringBuilder();
         summary.Append("Configures ");
         summary.Append(CurrentGame.DisplayName);
-        summary.Append(" for online play: writes NetTweak.script and kver.kp to your game folder, and optionally sets up a CD key in the registry.");
+        summary.Append(" for online play.");
+        summary.AppendLine();
+        summary.Append("Writes NetTweak.script and kver.kp; CD key setup is optional.");
 
         if (existingState.HasAnyRegistryCdKey)
         {
             summary.AppendLine();
             if (existingState.RegistryOwnedByInstaller)
             {
-                summary.Append("An installer-managed CD key was detected and will be refreshed with a new random key by default.");
+                summary.Append("Installer key detected; a new random key will be used.");
             }
             else if (existingState.RegistryUsesLegacySharedDefault)
             {
-                summary.Append("A legacy shared installer CD key was detected and will be refreshed with a new random key by default.");
+                summary.Append("Shared installer key detected; a new random key will be used.");
             }
             else
             {
-                summary.Append("An existing CD key was detected and will be preserved unless you opt in below.");
+                summary.Append("Existing player CD key detected; it will be kept.");
             }
         }
 
@@ -1836,6 +1866,8 @@ internal static class HWClientSetup
         using (GroupBox optionalContentGroup = new GroupBox())
         using (CheckBox installMapsCheckBox = new CheckBox())
         using (Label mapsHelpLabel = new Label())
+        using (Label attributionLabel = new Label())
+        using (Label contactLabel = new Label())
         using (Button installButton = new Button())
         using (Button cancelButton = new Button())
         {
@@ -1854,7 +1886,7 @@ internal static class HWClientSetup
             form.Text = CurrentGame.WindowTitle;
             form.FormBorderStyle = FormBorderStyle.FixedDialog;
             form.StartPosition = FormStartPosition.CenterScreen;
-            form.ClientSize = new Size(520, 610);
+            form.ClientSize = new Size(520, 660);
             form.MinimizeBox = false;
             form.MaximizeBox = false;
             form.Font = SystemFonts.MessageBoxFont;
@@ -1863,12 +1895,12 @@ internal static class HWClientSetup
 
             // --- Summary ---
             summaryLabel.Location = new Point(15, 12);
-            summaryLabel.Size = new Size(490, 52);
+            summaryLabel.Size = new Size(490, 58);
             summaryLabel.Text = BuildInstallSummaryText(existingState);
 
             // --- Install path group ---
             installGroup.Text = "Install Folder";
-            installGroup.Location = new Point(12, 68);
+            installGroup.Location = new Point(12, 74);
             installGroup.Size = new Size(496, 84);
 
             installPathLabel.AutoSize = true;
@@ -1897,7 +1929,7 @@ internal static class HWClientSetup
 
             // --- Server group ---
             serverGroup.Text = "Server";
-            serverGroup.Location = new Point(12, 160);
+            serverGroup.Location = new Point(12, 166);
             serverGroup.Size = new Size(496, 108);
 
             presetLabel.AutoSize = true;
@@ -1926,41 +1958,41 @@ internal static class HWClientSetup
 
             // --- Registry / CD key group ---
             registryGroup.Text = "CD Key";
-            registryGroup.Location = new Point(12, 276);
-            registryGroup.Size = new Size(496, 178);
+            registryGroup.Location = new Point(12, 282);
+            registryGroup.Size = new Size(496, 202);
 
             detectedKeyLabel.Location = new Point(12, 22);
-            detectedKeyLabel.Size = new Size(470, 36);
+            detectedKeyLabel.Size = new Size(470, 52);
 
             keepExistingKeyRadio.AutoSize = true;
-            keepExistingKeyRadio.Location = new Point(15, 62);
+            keepExistingKeyRadio.Location = new Point(15, 76);
             keepExistingKeyRadio.Text = "Keep detected CD key";
             keepExistingKeyRadio.Checked = selectedRegistryAction == RegistryCdKeyAction.KeepExisting;
             keepExistingKeyRadio.TabIndex = 2;
 
             replaceKeyRadio.AutoSize = true;
-            replaceKeyRadio.Location = new Point(15, 87);
+            replaceKeyRadio.Location = new Point(15, 101);
             replaceKeyRadio.Text = "Replace with generated key";
             replaceKeyRadio.Checked = selectedRegistryAction == RegistryCdKeyAction.WriteGenerated;
             replaceKeyRadio.TabIndex = 3;
 
             selectedKeyLabel.AutoSize = true;
-            selectedKeyLabel.Location = new Point(36, 116);
+            selectedKeyLabel.Location = new Point(36, 130);
             selectedKeyLabel.Text = "New key:";
 
-            cdKeyTextBox.Location = new Point(95, 113);
+            cdKeyTextBox.Location = new Point(95, 127);
             cdKeyTextBox.ReadOnly = true;
             cdKeyTextBox.Size = new Size(270, 23);
             cdKeyTextBox.TabIndex = 4;
             cdKeyTextBox.Font = new Font("Consolas", 9.5f);
 
-            generateKeyButton.Location = new Point(373, 112);
+            generateKeyButton.Location = new Point(373, 126);
             generateKeyButton.Size = new Size(100, 25);
             generateKeyButton.Text = "Randomize";
             generateKeyButton.TabIndex = 5;
 
-            registryHelpLabel.Location = new Point(15, 144);
-            registryHelpLabel.Size = new Size(460, 28);
+            registryHelpLabel.Location = new Point(15, 158);
+            registryHelpLabel.Size = new Size(460, 38);
             registryHelpLabel.ForeColor = SystemColors.GrayText;
 
             registryGroup.Controls.Add(detectedKeyLabel);
@@ -1973,8 +2005,8 @@ internal static class HWClientSetup
 
             // --- Optional content group ---
             optionalContentGroup.Text = "Optional Content";
-            optionalContentGroup.Location = new Point(12, 462);
-            optionalContentGroup.Size = new Size(496, 72);
+            optionalContentGroup.Location = new Point(12, 492);
+            optionalContentGroup.Size = new Size(496, 100);
 
             installMapsCheckBox.AutoSize = true;
             installMapsCheckBox.Location = new Point(12, 22);
@@ -1982,22 +2014,33 @@ internal static class HWClientSetup
             installMapsCheckBox.TabIndex = 6;
 
             mapsHelpLabel.Location = new Point(34, 44);
-            mapsHelpLabel.Size = new Size(448, 20);
+            mapsHelpLabel.Size = new Size(448, 48);
             mapsHelpLabel.ForeColor = SystemColors.GrayText;
-            mapsHelpLabel.Text = "Adds maps from FlashZ/Homeworld_Map_Collection to the MultiPlayer folder.";
+            mapsHelpLabel.Text = "Downloads the reviewed community map pack from FlashZ/Homeworld_Map_Collection and adds it to MultiPlayer.";
 
             optionalContentGroup.Controls.Add(installMapsCheckBox);
             optionalContentGroup.Controls.Add(mapsHelpLabel);
 
+            // --- Attribution ---
+            attributionLabel.AutoSize = true;
+            attributionLabel.Location = new Point(12, 602);
+            attributionLabel.ForeColor = SystemColors.GrayText;
+            attributionLabel.Text = "Created by Nick Kerr-Bell (Zero|SF)";
+
+            contactLabel.AutoSize = true;
+            contactLabel.Location = new Point(12, 622);
+            contactLabel.ForeColor = SystemColors.GrayText;
+            contactLabel.Text = "nick@kerrbell.dev";
+
             // --- Buttons ---
             installButton.Text = "Install";
             installButton.Size = new Size(84, 30);
-            installButton.Location = new Point(334, 568);
+            installButton.Location = new Point(334, 618);
             installButton.TabIndex = 7;
 
             cancelButton.Text = "Cancel";
             cancelButton.Size = new Size(84, 30);
-            cancelButton.Location = new Point(424, 568);
+            cancelButton.Location = new Point(424, 618);
             cancelButton.DialogResult = DialogResult.Cancel;
             cancelButton.TabIndex = 8;
 
@@ -2140,6 +2183,9 @@ internal static class HWClientSetup
             form.Controls.Add(installGroup);
             form.Controls.Add(serverGroup);
             form.Controls.Add(registryGroup);
+            form.Controls.Add(optionalContentGroup);
+            form.Controls.Add(attributionLabel);
+            form.Controls.Add(contactLabel);
             form.Controls.Add(installButton);
             form.Controls.Add(cancelButton);
 

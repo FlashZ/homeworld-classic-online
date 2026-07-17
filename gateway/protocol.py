@@ -85,10 +85,10 @@ OP_SERVER_EVENT = 0x40
 
 TITAN_MAX_FRAME = 65536
 ROUTING_MAX_CHAT_CHARS = 220
-# Disabled on purpose: routing clients should stay connected until the
-# transport actually closes or server keepalives fail, not after a fixed idle
-# window.
-ROUTING_IDLE_TIMEOUT_SECONDS = None
+# Keep client connections alive during normal lobby/game play, but release
+# abandoned sockets rather than allowing a slow-connection resource drain.
+ROUTING_IDLE_TIMEOUT_SECONDS = 300.0
+TITAN_IDLE_TIMEOUT_SECONDS = 300.0
 ROUTING_RECONNECT_GRACE_SECONDS = 90.0
 ROOM_ALLOCATION_GRACE_SECONDS = 120.0
 ROUTING_HEARTBEAT_INTERVAL_SECONDS = 15.0
@@ -227,11 +227,15 @@ def _rwstr(data: bytes, off: int) -> Tuple[str, int]:
 async def _titan_recv(reader: asyncio.StreamReader,
                       first4: Optional[bytes] = None) -> bytes:
     """Read one Titan LE-framed message body (without the 4-byte size header)."""
-    hdr = first4 if first4 is not None else await reader.readexactly(4)
+    hdr = first4 if first4 is not None else await asyncio.wait_for(
+        reader.readexactly(4), timeout=TITAN_IDLE_TIMEOUT_SECONDS
+    )
     size, = struct.unpack("<I", hdr)
     if size < 4 or size > TITAN_MAX_FRAME:
         raise ValueError(f"titan_bad_frame_size:{size}")
-    return await reader.readexactly(size - 4)
+    return await asyncio.wait_for(
+        reader.readexactly(size - 4), timeout=TITAN_IDLE_TIMEOUT_SECONDS
+    )
 
 
 def _titan_wrap(body: bytes) -> bytes:

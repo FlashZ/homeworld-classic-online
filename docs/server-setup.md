@@ -19,6 +19,18 @@ Copy `.env.example` to `.env`, then set at least:
 - `BACKEND_SHARED_SECRET`
 - `ADMIN_TOKEN`
 
+Before the first hardened Docker start, create a private data directory the
+unprivileged container user can write to:
+
+```bash
+sudo install -d -m 700 -o 1001 -g 1001 data
+chmod 600 .env
+```
+
+The Compose stack runs as a non-root user with a read-only application
+filesystem. Keep `data/` and `.env` private: they contain the SQLite account
+database and server key material.
+
 For a normal single-product stack, also set:
 
 - `PRODUCT=homeworld` or `PRODUCT=cataclysm`
