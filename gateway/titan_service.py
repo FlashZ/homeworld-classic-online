@@ -4752,6 +4752,7 @@ async def main_async(args: argparse.Namespace) -> None:
             default_product=default_db_product,
             shared_secret=str(args.web_auth_shared_secret or "").strip(),
             code_ttl_seconds=float(args.web_auth_code_ttl_seconds),
+            cdkey_fingerprint_salt=str(args.web_auth_cdkey_fingerprint_salt or "").strip(),
         )
         setattr(srv, "web_auth_bridge", web_auth_bridge)
 
@@ -4957,6 +4958,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=float(os.environ.get("WEB_AUTH_CODE_TTL_SECONDS", "300") or "300"),
         help="Lifetime in seconds for issued browser auth exchange codes.",
+    )
+    p.add_argument(
+        "--web-auth-cdkey-fingerprint-salt",
+        default=os.environ.get("WEB_AUTH_CDKEY_FINGERPRINT_SALT", ""),
+        help="Private salt used to derive non-reversible CD-key fingerprints for account suggestions.",
     )
     p.add_argument("--db-path", default="",
                    help="Path to the SQLite backend DB shown in the admin dashboard. Defaults to data/<product>/won_server.db when omitted.")
