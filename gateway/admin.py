@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import secrets
@@ -20,6 +21,19 @@ if TYPE_CHECKING:
     from .titan_service import BinaryGatewayServer
 
 LOGGER = logging.getLogger(__name__)
+
+# Legacy shared installer CD keys (normalized, no separators). Early installer
+# builds shipped the same hardcoded key to everyone; the admin panel flags and
+# can bulk-clear accounts still bound to them so the key can be retired.
+LEGACY_SHARED_CD_KEYS: Dict[str, str] = {
+    "homeworld": "NYX7ZEC9FYZ6GUX84253",
+    "cataclysm": "GAF6CAB4SEX5ZYL62622",
+}
+
+
+def _normalize_cd_key(value: object) -> str:
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
 
 class DashboardLogHandler(logging.Handler):
     """In-memory ring buffer for the local admin dashboard."""
@@ -70,6 +84,11 @@ class AdminDashboardServer:
         stats_token: str = "",
         web_auth_shared_secret: str = "",
         web_auth_public_base_url: str = "",
+        forward_auth_user_header: str = "",
+        forward_auth_secret: str = "",
+        forward_auth_secret_header: str = "x-admin-proxy-secret",
+        forward_auth_groups_header: str = "",
+        forward_auth_allowed_groups: str = "",
         repo_monitor: Optional[GitRepoMonitor] = None,
     ) -> None:
         self.gateway = gateway
@@ -95,11 +114,31 @@ class AdminDashboardServer:
         self.log_handler = log_handler
         self.admin_token = admin_token.strip()
         self.stats_token = stats_token.strip()
+        # Trusted reverse-proxy (forward-auth) config. When a front proxy
+        # (Authelia, oauth2-proxy, Cloudflare Access, Tailscale, Authentik, ...)
+        # authenticates the user and injects an identity header, the panel can
+        # trust it. A shared secret header guards against header spoofing if the
+        # admin port is ever reachable without going through the proxy.
+        self.forward_auth_user_header = forward_auth_user_header.strip().lower()
+        self.forward_auth_secret = forward_auth_secret.strip()
+        self.forward_auth_secret_header = (
+            forward_auth_secret_header.strip().lower() or "x-admin-proxy-secret"
+        )
+        self.forward_auth_groups_header = forward_auth_groups_header.strip().lower()
+        self.forward_auth_allowed_groups = {
+            g.strip()
+            for g in re.split(r"[,;|]", forward_auth_allowed_groups or "")
+            if g.strip()
+        }
         self.web_auth_shared_secret = web_auth_shared_secret.strip()
         self.web_auth_public_base_url = web_auth_public_base_url.strip()
         self.web_auth_bridge = getattr(gateway, "web_auth_bridge", None)
         repo_root = Path(__file__).resolve().parents[1]
-        self.repo_monitor = repo_monitor or GitRepoMonitor(str(repo_root))
+        self.repo_monitor = repo_monitor or GitRepoMonitor(
+            str(repo_root),
+            remote_name=os.environ.get("WON_REPO_REMOTE", "origin"),
+            read_only_check=os.environ.get("WON_REPO_READ_ONLY_CHECK", "").strip() == "1",
+        )
         self.started_at = time.time()
 
     def start_background_tasks(self) -> None:
@@ -141,6 +180,45 @@ class AdminDashboardServer:
                 return True
         return False
 
+    @property
+    def _forward_auth_enabled(self) -> bool:
+        return bool(self.forward_auth_user_header)
+
+    def _forward_auth_identity(self, headers: Dict[str, str]) -> str:
+        """Return the authenticated username from a trusted forward-auth proxy,
+        or "" if the request is not a valid, trusted forward-auth request.
+
+        Guards, in order: forward-auth must be enabled; the identity header must
+        be present; if a proxy secret is configured it must match (anti-spoof);
+        if a group allowlist is configured the forwarded groups must intersect
+        it."""
+        if not self._forward_auth_enabled:
+            return ""
+        user = str(headers.get(self.forward_auth_user_header, "") or "").strip()
+        if not user:
+            return ""
+        if self.forward_auth_secret:
+            provided = str(headers.get(self.forward_auth_secret_header, "") or "")
+            if not (provided and secrets.compare_digest(provided, self.forward_auth_secret)):
+                LOGGER.warning(
+                    "Rejected forward-auth request for %r: missing/invalid proxy secret",
+                    user,
+                )
+                return ""
+        if self.forward_auth_allowed_groups:
+            groups_raw = (
+                str(headers.get(self.forward_auth_groups_header, "") or "")
+                if self.forward_auth_groups_header
+                else ""
+            )
+            groups = {g.strip() for g in re.split(r"[,;|]", groups_raw) if g.strip()}
+            if not (groups & self.forward_auth_allowed_groups):
+                LOGGER.warning(
+                    "Rejected forward-auth user %r: not in an allowed group", user
+                )
+                return ""
+        return user
+
     def _is_authorized(
         self,
         path: str,
@@ -149,6 +227,12 @@ class AdminDashboardServer:
     ) -> bool:
         if path in {"/web-auth/login", "/api/web-auth/exchange"}:
             return True
+
+        # A trusted forward-auth proxy authenticates every path (browser SSE and
+        # fetch carry the proxy's session cookie transparently).
+        if self._forward_auth_identity(headers):
+            return True
+
         if path in {"/api/stats", "/api/live-feed"}:
             if self.stats_token and self._matches_token(
                 self.stats_token,
@@ -164,14 +248,20 @@ class AdminDashboardServer:
                 header_names=("x-admin-token",),
             ):
                 return True
-            return not self.stats_token and not self.admin_token
+            # Open only when no auth mechanism is configured at all.
+            return not self.stats_token and not self.admin_token and not self._forward_auth_enabled
 
-        return self._matches_token(
-            self.admin_token,
-            query,
-            headers,
-            header_names=("x-admin-token",),
-        )
+        if self.admin_token:
+            return self._matches_token(
+                self.admin_token,
+                query,
+                headers,
+                header_names=("x-admin-token",),
+            )
+        # No admin token: if forward-auth is the configured mechanism, a request
+        # that reached here failed it, so deny. Otherwise fall back to the legacy
+        # loopback-open behavior.
+        return not self._forward_auth_enabled
 
     def _get_web_auth_bridge(self) -> Any:
         bridge = getattr(self, "web_auth_bridge", None)
@@ -493,6 +583,77 @@ class AdminDashboardServer:
             return Path(self.db_path).resolve()
         return (Path(__file__).resolve().parent / "__admin_db_missing__.sqlite").resolve()
 
+    def _accounts_page(
+        self, product: str, query: str = "", offset: int = 0, limit: int = 50
+    ) -> Dict[str, object]:
+        """Server-side, paginated, searchable view of the users table for one
+        product. Replaces the old client-side slice of the snapshot so accounts
+        beyond the preview limit are reachable and search covers the whole
+        table."""
+        product_key = str(product or "").strip() or self.default_db_product
+        offset = max(0, int(offset))
+        limit = max(1, min(200, int(limit)))
+        legacy = LEGACY_SHARED_CD_KEYS.get(product_key.lower(), "")
+        result: Dict[str, object] = {
+            "ok": True,
+            "product": product_key,
+            "total": 0,
+            "offset": offset,
+            "limit": limit,
+            "rows": [],
+            "legacy_cd_key": legacy,
+            "legacy_count": 0,
+        }
+        db_path = self._resolve_db_path(product)
+        if not db_path.exists():
+            result["ok"] = False
+            result["error"] = "database not found"
+            return result
+        # Normalize the stored key in SQL so display/plain forms both match.
+        norm = "REPLACE(REPLACE(UPPER(COALESCE(native_cd_key,'')),'-',''),' ','')"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            where = ""
+            params: list = []
+            q = str(query or "").strip()
+            if q:
+                where = "WHERE username LIKE ? OR native_cd_key LIKE ?"
+                params = [f"%{q}%", f"%{q}%"]
+            result["total"] = int(
+                conn.execute(
+                    f"SELECT COUNT(*) AS c FROM users {where}", params
+                ).fetchone()["c"]
+            )
+            rows = conn.execute(
+                "SELECT username, created_at, "
+                "COALESCE(native_cd_key,'') AS native_cd_key, "
+                "COALESCE(native_login_key,'') AS native_login_key "
+                f"FROM users {where} ORDER BY created_at LIMIT ? OFFSET ?",
+                params + [limit, offset],
+            ).fetchall()
+            result["rows"] = [
+                {
+                    "username": r["username"],
+                    "created_at": r["created_at"],
+                    "native_cd_key": r["native_cd_key"],
+                    "native_login_key": r["native_login_key"],
+                }
+                for r in rows
+            ]
+            if legacy:
+                result["legacy_count"] = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) AS c FROM users WHERE {norm}=?", [legacy]
+                    ).fetchone()["c"]
+                )
+        except sqlite3.Error as exc:
+            result["ok"] = False
+            result["error"] = str(exc)
+        finally:
+            conn.close()
+        return result
+
     @staticmethod
     def _product_runtime_info(gateway_snapshot: Dict[str, object]) -> Dict[str, Dict[str, object]]:
         runtimes: Dict[str, Dict[str, object]] = {}
@@ -595,11 +756,96 @@ class AdminDashboardServer:
             "db": default_db,
             "dbs": dbs,
             "db_default_product": self.default_db_product,
+            "factories": self._factories_snapshot(),
             "logs": self._annotate_logs(
                 self.log_handler.snapshot(limit=max(1, log_limit)),
                 gateway_snapshot,
             ),
         }
+
+    def _factories_snapshot(self) -> list[Dict[str, object]]:
+        """Enumerate factory/region entries across product databases so the
+        admin 'Gateways & Factories' view can show real regions.
+
+        Two sources are merged: TitanFactoryServer directory entities (which
+        carry the multi-region publish address via public_host/public_port) and
+        runtime rows in the factories table (region + running/max)."""
+        out: list[Dict[str, object]] = []
+        for product, path in self.db_paths.items():
+            db_path = Path(path).resolve()
+            if not db_path.exists() or db_path.is_dir():
+                continue
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            try:
+                tables = {
+                    str(r["name"])
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                if "directory_entities" in tables:
+                    for row in conn.execute(
+                        "SELECT entity_name, entity_type, payload FROM directory_entities"
+                    ):
+                        name = str(row["entity_name"] or "")
+                        etype = str(row["entity_type"] or "")
+                        is_factory = (
+                            etype == "factory"
+                            or name == "TitanFactoryServer"
+                            or name.startswith("Factory:")
+                        )
+                        if not is_factory:
+                            continue
+                        try:
+                            payload = json.loads(row["payload"] or "{}")
+                        except (ValueError, TypeError):
+                            payload = {}
+                        if not isinstance(payload, dict):
+                            payload = {}
+                        public_host = str(payload.get("public_host") or "").strip()
+                        public_port = payload.get("public_port")
+                        out.append(
+                            {
+                                "product": product,
+                                "source": "directory",
+                                "description": str(
+                                    payload.get("Description")
+                                    or name.split(":", 1)[-1]
+                                    or "factory"
+                                ),
+                                "public_host": public_host,
+                                "public_port": public_port,
+                                "host": str(payload.get("host") or ""),
+                                "port": payload.get("port"),
+                                # A dedicated public address means this entry
+                                # points clients at a remote region's gateway.
+                                "remote": bool(public_host and public_port),
+                            }
+                        )
+                if "factories" in tables:
+                    for row in conn.execute(
+                        "SELECT factory_id, host, region, max_processes, running, total_started FROM factories"
+                    ):
+                        out.append(
+                            {
+                                "product": product,
+                                "source": "registered",
+                                "description": str(row["region"] or row["factory_id"] or "factory"),
+                                "factory_id": str(row["factory_id"] or ""),
+                                "region": str(row["region"] or ""),
+                                "host": str(row["host"] or ""),
+                                "running": int(row["running"] or 0),
+                                "max_processes": int(row["max_processes"] or 0),
+                                "total_started": int(row["total_started"] or 0),
+                                "remote": True,
+                            }
+                        )
+            except sqlite3.Error as exc:
+                LOGGER.debug("Factory snapshot failed for %s: %s", product, exc)
+            finally:
+                conn.close()
+        return out
 
     @staticmethod
     def _http_response(
@@ -650,7 +896,7 @@ class AdminDashboardServer:
         lines.extend(["", ""])
         return "\n".join(lines).encode("utf-8")
 
-    def _html(self, embedded_token: str = "") -> str:
+    def _html(self, embedded_token: str = "", identity: str = "") -> str:
         return """<!doctype html>
 <html lang="en">
 <head>
@@ -667,6 +913,8 @@ class AdminDashboardServer:
       --success:#22c55e;--success-soft:rgba(34,197,94,.14);
       --warning:#f59e0b;--warning-soft:rgba(245,158,11,.14);
       --danger:#ef4444;--danger-soft:rgba(239,68,68,.14);
+      --hw:#f2a154;--hw-soft:rgba(242,161,84,.14);
+      --cata:#2dd4bf;--cata-soft:rgba(45,212,191,.14);
       --shadow-lg:0 18px 40px rgba(0,0,0,.32);
     }
     *{box-sizing:border-box;margin:0;padding:0;}
@@ -859,6 +1107,29 @@ class AdminDashboardServer:
       .kv{grid-template-columns:1fr;}
       .summary-card .value{font-size:32px;}
     }
+    /* product scope switcher (topbar) */
+    .scope-switcher{display:flex;background:var(--bg-panel);border:1px solid var(--line);border-radius:11px;padding:3px;gap:2px;}
+    .scope-switcher button{background:transparent;border:0;color:var(--text-mid);font:inherit;font-size:12.5px;font-weight:600;
+      padding:6px 13px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:7px;white-space:nowrap;}
+    .scope-switcher button:hover{color:var(--text-hi);}
+    .scope-switcher button.on{background:var(--bg-panel-3);color:var(--text-hi);}
+    .scope-switcher button[data-scope="all"].on{background:var(--accent-glow);color:var(--accent);}
+    .scope-switcher .sw{width:8px;height:8px;border-radius:2px;flex:none;}
+    /* sub-tabs (Live / Activity & Logs) */
+    .subtabs{display:flex;gap:4px;background:var(--bg-panel);border:1px solid var(--line);border-radius:10px;padding:3px;flex-wrap:wrap;}
+    .subtabs button{background:transparent;border:0;color:var(--text-mid);font:inherit;font-size:12.5px;font-weight:600;padding:6px 13px;border-radius:7px;cursor:pointer;}
+    .subtabs button:hover{color:var(--text-hi);}
+    .subtabs button.on{background:var(--bg-panel-3);color:var(--text-hi);}
+    .subtabs button .mono{font-family:ui-monospace,Menlo,Consolas,monospace;opacity:.7;margin-left:5px;}
+    .sectionbar{display:flex;align-items:center;gap:14px;margin-bottom:16px;flex-wrap:wrap;}
+    .sectionbar .spacer{flex:1;}
+    .pill-hw{background:var(--hw-soft);color:var(--hw);border-color:rgba(242,161,84,.3);}
+    .pill-cata{background:var(--cata-soft);color:var(--cata);border-color:rgba(45,212,191,.3);}
+    .prod-swatch{display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:5px;vertical-align:middle;}
+    .region-map{display:flex;gap:14px;flex-wrap:wrap;}
+    .region{flex:1;min-width:200px;border:1px solid var(--line);border-radius:12px;padding:15px;background:var(--bg-panel-2);}
+    .region .rg-name{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;}
+    .region .rg-meta{margin-top:10px;font-size:12px;color:var(--text-low);line-height:1.7;}
   </style>
 </head>
 <body>
@@ -881,6 +1152,7 @@ class AdminDashboardServer:
         </div>
       </div>
       <div class="topbar-meta">
+        <div class="scope-switcher" id="scope-switcher"></div>
         <div class="meta-stack">
           <div class="topbar-status" id="topbar-status">Loading status...</div>
           <div class="meta" id="topbar-meta">Loading...</div>
@@ -904,6 +1176,7 @@ class AdminDashboardServer:
     const modalBox = document.getElementById("modal-box");
     const toastContainer = document.getElementById("toast-container");
     const adminToken = __ADMIN_TOKEN__;
+    const adminIdentity = __ADMIN_IDENTITY__;
     let activePage = "overview";
     let pauseRefresh = false;
     let pauseRefreshUntil = 0;
@@ -912,6 +1185,11 @@ class AdminDashboardServer:
     let activeDbProduct = "";
     let activeDbTable = "";
     let activeLogProduct = "all";
+    let productScope = "all";          // global product filter: all | homeworld | cataclysm
+    let liveTab = "players";           // Live page sub-tab
+    let activityTab = "activity";      // Activity & Logs page sub-tab
+    let accountsQuery = "";            // Accounts page search text
+    const scopeSwitcher = document.getElementById("scope-switcher");
     let uiState = {
       pageId: "overview",
       contentScrollTop: 0,
@@ -923,13 +1201,10 @@ class AdminDashboardServer:
 
     const pages = [
       {id:"overview",label:"Overview",icon:'<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>'},
-      {id:"players",label:"Players",icon:'<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>'},
-      {id:"rooms",label:"Rooms",icon:'<rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>'},
-      {id:"activity",label:"Activity",icon:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'},
-      {id:"ips",label:"IP Metrics",icon:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'},
-      {id:"database",label:"Database",icon:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>'},
-      {id:"sessions",label:"Sessions",icon:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>'},
-      {id:"logs",label:"Logs",icon:'<polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>'},
+      {id:"live",label:"Live",icon:'<circle cx="12" cy="12" r="3"/><path d="M5 12a7 7 0 0 1 14 0M2 12a10 10 0 0 1 20 0"/>'},
+      {id:"activity",label:"Activity & Logs",icon:'<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'},
+      {id:"accounts",label:"Accounts",icon:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>'},
+      {id:"infra",label:"Infrastructure",icon:'<rect x="3" y="4" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7.5h.01M7 17h.01"/>'},
     ];
 
     function esc(v){return String(v??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -970,10 +1245,33 @@ class AdminDashboardServer:
       }
       return name||"Homeworld Chat";
     }
+    function productHue(product){
+      const p=String(product||"").toLowerCase();
+      if(p==="homeworld")return "hw";
+      if(p==="cataclysm")return "cata";
+      return "";
+    }
     function productBadge(product){
       const name=String(product||"").trim();
       if(!name||name==="shared-edge")return "";
-      return `<span class="pill" style="margin-left:0;margin-right:6px;">${esc(name)}</span>`;
+      const hue=productHue(name);
+      const cls=hue?`pill pill-${hue}`:"pill";
+      const sw=hue?`<span class="prod-swatch" style="background:var(--${hue})"></span>`:"";
+      const code=name==="homeworld"?"HW":name==="cataclysm"?"CA":name.slice(0,2).toUpperCase();
+      return `<span class="${cls}" style="margin-left:0;margin-right:6px;">${sw}${esc(code)}</span>`;
+    }
+    // Global product scope helpers. When a scope is active, per-product page
+    // sections collapse to the selected game instead of repeating both.
+    function inScope(product){return productScope==="all"||String(product||"")===productScope;}
+    function scopedKeys(metrics){
+      const keys=(metrics&&metrics.keys)||[];
+      return productScope==="all"?keys:keys.filter(k=>k===productScope);
+    }
+    function scopedOverall(metrics){
+      if(productScope!=="all"&&metrics&&metrics.byProduct&&metrics.byProduct[productScope]){
+        return metrics.byProduct[productScope];
+      }
+      return metrics?metrics.overall:{};
     }
     function productText(product){
       const name=String(product||"").trim();
@@ -1257,7 +1555,8 @@ class AdminDashboardServer:
       }
     }
     function restoreUiState(){
-      if(uiState.pageId===activePage&&activePage!=="logs"){
+      const onLogs=(activePage==="activity"&&activityTab==="logs");
+      if(uiState.pageId===activePage&&!onLogs){
         content.scrollTop=uiState.contentScrollTop||0;
       }
       const msg=document.getElementById("broadcast-msg");
@@ -1349,14 +1648,35 @@ class AdminDashboardServer:
       return slowEvents>0?{label:"Transport Warning",tone:"warn"}:{label:"Stable",tone:"ok"};
     }
 
+    function accountCount(snapshot){
+      const dbs=snapshot.dbs||{};let n=0;
+      for(const key of Object.keys(dbs)){
+        if(!inScope(key))continue;
+        const t=((dbs[key]||{}).tables||{}).users;
+        if(t)n+=Number(t.count||0);
+      }
+      return n;
+    }
     function renderNav(snapshot){
-      const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const act=gw.activity||[];const logs=snapshot.logs||[];
-      const counts={players:rt.current_player_count||0,rooms:rt.room_count||0,activity:act.length,logs:logs.length};
+      const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const act=(gw.activity||[]);const logs=snapshot.logs||[];
+      const feedCount=act.length+logs.length;
+      const counts={live:rt.current_player_count||0,activity:feedCount,accounts:accountCount(snapshot)};
       nav.innerHTML=pages.map(p=>{
         const badge=counts[p.id]!=null?`<span class="nav-badge">${counts[p.id]}</span>`:"";
         return `<button class="nav-item${activePage===p.id?" active":""}" data-page="${p.id}"><svg viewBox="0 0 24 24">${p.icon}</svg>${esc(p.label)}${badge}</button>`;
       }).join("");
       nav.querySelectorAll("[data-page]").forEach(btn=>{btn.addEventListener("click",()=>{activePage=btn.dataset.page;setNavOpen(false);renderAll(lastSnapshot);});});
+    }
+    function renderScopeSwitcher(snapshot){
+      const products=sortedProductKeys(Object.keys((snapshot.gateway||{}).products||{}));
+      if(products.length<2){scopeSwitcher.style.display="none";return;}
+      scopeSwitcher.style.display="";
+      if(productScope!=="all"&&products.indexOf(productScope)<0)productScope="all";
+      const opts=[{k:"all",label:"All"}].concat(products.map(p=>({k:p,label:p.charAt(0).toUpperCase()+p.slice(1),hue:productHue(p)})));
+      scopeSwitcher.innerHTML=opts.map(o=>{
+        const sw=o.hue?`<span class="sw" style="background:var(--${o.hue})"></span>`:"";
+        return `<button data-scope="${esc(o.k)}" class="${productScope===o.k?"on":""}">${sw}${esc(o.label)}</button>`;
+      }).join("");
     }
 
     function renderSidebarFooter(snapshot){
@@ -1364,7 +1684,8 @@ class AdminDashboardServer:
       const gw=snapshot.gateway||{};
       const repo=snapshot.repo||{};
       const extra=repo.local_label?`<br>${esc(repo.local_label)}${repo.update_available?' &middot; update available':''}`:"";
-      sidebarFooter.innerHTML=`<span class="status-dot ok"></span> Online ${age(up)}<br>${esc(gw.product||"")} &middot; ${esc(gw.version_str||"")} &middot; ${esc(gw.public_host||"")}${extra}`;
+      const who=adminIdentity?`<br><span style="color:var(--accent)">&#128100; ${esc(adminIdentity)}</span>`:"";
+      sidebarFooter.innerHTML=`<span class="status-dot ok"></span> Online ${age(up)}<br>${esc(gw.product||"")} &middot; ${esc(gw.version_str||"")} &middot; ${esc(gw.public_host||"")}${extra}${who}`;
     }
 
     function renderTopbar(snapshot){
@@ -1379,10 +1700,10 @@ class AdminDashboardServer:
     function renderOverview(snapshot){
       const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const am=gw.activity_metrics||{};const db=snapshot.db||{};const repo=snapshot.repo||{};
       const metrics=productMetrics(snapshot);
-      const gameStats=metrics.overall;
+      const gameStats=scopedOverall(metrics);
       const banned=gw.banned_ips||[];
-      const alerts=dashboardAlerts(snapshot,gameStats);
-      const productCards=metrics.keys.map(product=>{
+      const alerts=dashboardAlerts(snapshot,metrics.overall);
+      const productCards=scopedKeys(metrics).map(product=>{
         const bucket=metrics.byProduct[product];
         const info=bucket.info||{};
         return `<article class="runtime-card">
@@ -1467,7 +1788,41 @@ class AdminDashboardServer:
           <span class="eyebrow">Runtime Status</span>
           <h2>Per-Product Live Status</h2>
           <div class="runtime-grid">${productCards}</div>
-        </section>`:""}
+        </section>`:""}`;
+    }
+
+    function renderFactoriesCard(snapshot){
+      const gw=snapshot.gateway||{};
+      const factories=Array.isArray(snapshot.factories)?snapshot.factories:[];
+      const regions=factories.filter(f=>inScope(f.product||""));
+      const rows=regions.map(f=>{
+        const name=esc(f.description||f.region||f.factory_id||"factory");
+        const remote=!!f.remote;
+        // Registered factory rows carry live process counts; directory rows
+        // carry the published address (remote region) or fall back to local.
+        const addr=(f.public_host&&f.public_port)?`${f.public_host}:${f.public_port}`
+          :(f.host?`${f.host}${f.port?(":"+f.port):""}`:"");
+        const tag=f.source==="registered"?"registered":(remote?"remote region":"local gateway");
+        const tagCls=remote?"pill-ok":"pill";
+        const detail=f.source==="registered"
+          ?`${Number(f.running||0)}/${Number(f.max_processes||0)||"&infin;"} processes`
+          :(remote?"published to clients":"served by this gateway");
+        return `<div class="region"><div class="rg-name">${productBadge(f.product||"")}${name}<span class="pill ${tagCls}" style="margin-left:auto">${tag}</span></div><div class="rg-meta"><span class="mono">${esc(addr)||"&mdash;"}</span><br>${detail}</div></div>`;
+      }).join("")||`<p class="muted">No factory entries found. In shared-edge single-region mode this gateway is the factory. Add a TitanFactoryServer directory entity with <span class="mono">public_host</span> / <span class="mono">public_port</span> to publish another region.</p>`;
+      return `<section class="card">
+        <span class="eyebrow">Topology</span>
+        <h2>Gateways &amp; Factories <span class="pill">${regions.length}</span></h2>
+        <div class="region-map">${rows}</div>
+      </section>`;
+    }
+
+    function renderInfrastructure(snapshot){
+      const gw=snapshot.gateway||{};const rt=gw.routing_manager||{};const am=gw.activity_metrics||{};const db=snapshot.db||{};const repo=snapshot.repo||{};
+      const metrics=productMetrics(snapshot);
+      const gameStats=scopedOverall(metrics);
+      const banned=gw.banned_ips||[];
+      return `
+        ${renderFactoriesCard(snapshot)}
         <section class="utility-grid">
           <div class="card">
             <span class="eyebrow">Infrastructure</span>
@@ -1514,7 +1869,7 @@ class AdminDashboardServer:
           <h2>GitHub Updates</h2>
           <div class="action-bar">
             <button class="btn" data-action="github-check">Check GitHub</button>
-            <button class="btn ${repo.can_update?'btn-accent':''}" data-action="github-update">Update From GitHub</button>
+            ${repo.read_only_check?"":`<button class="btn ${repo.can_update?'btn-accent':''}" data-action="github-update" ${repo.can_update?"":"disabled"}>Update From GitHub</button>`}
           </div>
           <div class="kv">
             <div class="k">Status</div><div class="v">${repoSummary(repo)}</div>
@@ -1527,6 +1882,7 @@ class AdminDashboardServer:
             <div class="k">Remote</div><div class="v">${esc(repo.remote_url||"")}</div>
           </div>
           ${repo.last_error?`<p class="muted" style="margin-top:12px;color:var(--danger);">${esc(repo.last_error)}</p>`:""}
+          ${repo.read_only_check?`<p class="muted" style="margin-top:12px;">This hardened deployment checks GitHub without writing to the running container. Deploy updates from the VPS host.</p>`:""}
           ${repo.last_update_message?`<p class="muted" style="margin-top:12px;">${esc(repo.last_update_message)}</p>`:""}
           ${repo.restart_required?`<p class="muted" style="margin-top:8px;color:var(--warning);">Restart the gateway service to apply the updated code.</p>`:""}
         </section>
@@ -1538,7 +1894,130 @@ class AdminDashboardServer:
             <thead><tr><th>IP</th><th>Reason</th><th style="width:80px">Action</th></tr></thead>
             <tbody>${banned.map(b=>`<tr><td class="mono">${esc(b.ip)}</td><td>${esc(b.reason)}</td><td><button class="btn btn-sm" data-action="unban-ip" data-ip="${esc(b.ip)}">Unban</button></td></tr>`).join("")}</tbody>
           </table></div>
-        </section>`:""}`;
+        </section>`:""}
+        ${renderDatabase(snapshot)}`;
+    }
+
+    function subtabBar(tabs, active, attr){
+      return `<div class="subtabs">${tabs.map(t=>`<button class="${t.id===active?"on":""}" data-${attr}="${t.id}">${esc(t.label)}${t.count!=null?` <span class="mono">${esc(t.count)}</span>`:""}</button>`).join("")}</div>`;
+    }
+
+    // Live: Players + Rooms + Peer Sessions merged behind sub-tabs (IP data is
+    // shown inline on Players rather than as its own near-empty page).
+    function renderLive(snapshot){
+      const rt=(snapshot.gateway||{}).routing_manager||{};
+      const players=(rt.players||[]).filter(p=>inScope(p.product));
+      const servers=(rt.servers||[]).filter(s=>inScope(s.product));
+      const sessions=Object.values((snapshot.gateway||{}).peer_sessions||{}).filter(s=>inScope(s.product));
+      const tabs=[
+        {id:"players",label:"Players",count:players.length},
+        {id:"rooms",label:"Rooms",count:servers.length},
+        {id:"sessions",label:"Peer Sessions",count:sessions.length},
+        {id:"ips",label:"IP Metrics"},
+      ];
+      if(!tabs.find(t=>t.id===liveTab))liveTab="players";
+      const body=liveTab==="rooms"?renderRooms(snapshot)
+        :liveTab==="sessions"?renderSessions(snapshot)
+        :liveTab==="ips"?renderIPs(snapshot)
+        :renderPlayers(snapshot);
+      return `<div class="sectionbar">${subtabBar(tabs,liveTab,"live")}</div>${body}`;
+    }
+
+    // Activity & Logs: the activity feed and gateway logs share one page.
+    function renderActivityAndLogs(snapshot){
+      const act=(snapshot.gateway||{}).activity||[];
+      const logs=snapshot.logs||[];
+      const tabs=[
+        {id:"activity",label:"Activity",count:act.length},
+        {id:"logs",label:"Logs",count:logs.length},
+      ];
+      if(!tabs.find(t=>t.id===activityTab))activityTab="activity";
+      const body=activityTab==="logs"?renderLogs(snapshot):renderActivity(snapshot);
+      return `<div class="sectionbar">${subtabBar(tabs,activityTab,"activity-tab")}</div>${body}`;
+    }
+
+    // Accounts: the users table promoted to a first-class, searchable page with
+    // duplicate legacy-CD-key detection. Reuses the same row actions.
+    // Accounts data is served page-by-page from /api/accounts (server-side
+    // search + pagination) rather than sliced from the 8s snapshot, so every
+    // account is reachable and search covers the whole table. Cache is keyed by
+    // product; the poll renders from cache and never refetches on its own.
+    const ACCOUNTS_LIMIT=50;
+    let accountsCache={};       // product -> {rows,total,offset,legacy_count,legacy_cd_key,q,loading,seq}
+    let accountsReqSeq=0;
+    function scheduleLoadAccounts(product,offset){
+      const seq=++accountsReqSeq;
+      const prev=accountsCache[product]||{};
+      // Mark loading synchronously (with the current query) so the next render
+      // does not re-schedule the same fetch.
+      accountsCache[product]=Object.assign({},prev,{q:accountsQuery,offset:offset,loading:true,seq:seq});
+      const url=`/api/accounts?product=${encodeURIComponent(product)}&q=${encodeURIComponent(accountsQuery)}&offset=${offset}&limit=${ACCOUNTS_LIMIT}`;
+      fetch(withToken(url),{cache:"no-store"}).then(r=>r.json()).then(data=>{
+        const cur=accountsCache[product];
+        if(cur&&cur.seq!==seq)return;   // superseded by a newer request
+        accountsCache[product]=Object.assign({},data,{q:accountsQuery,loading:false,seq:seq});
+        if(activePage==="accounts"){lastContentHtml="";renderAll(lastSnapshot);}
+      }).catch(()=>{const cur=accountsCache[product];if(cur&&cur.seq===seq)cur.loading=false;});
+    }
+    function renderAccountSection(product){
+      const info=snapshotProductInfo(lastSnapshot||{},product);
+      const c=accountsCache[product];
+      const head=`${productBadge(product)}${esc(info.community_name||product)} Accounts`;
+      if(!c||(c.loading&&!(c.rows&&c.rows.length))){
+        return `<div class="card" style="margin-top:12px;"><h2 style="margin:0 0 8px;">${head}</h2><p class="muted">Loading accounts&hellip;</p></div>`;
+      }
+      if(c.ok===false){
+        return `<div class="card" style="margin-top:12px;"><h2 style="margin:0 0 8px;">${head}</h2><p class="muted" style="color:var(--danger)">${esc(c.error||"Failed to load accounts.")}</p></div>`;
+      }
+      const rows=c.rows||[];
+      const total=Number(c.total||0);
+      const legacy=String(c.legacy_cd_key||"");
+      const legacyCount=Number(c.legacy_count||0);
+      const offset=Number(c.offset||0);
+      const from=total?offset+1:0, to=offset+rows.length;
+      const legacyPill=legacyCount?`<span class="pill pill-danger" title="Accounts still bound to the legacy shared installer key.">${legacyCount} on legacy key</span>
+        <button class="btn accent" data-action="clear-legacy" data-product="${esc(product)}">Clear all ${legacyCount} legacy-key bindings</button>`:"";
+      const body=rows.length?`<div class="table-wrap"><table>
+          <thead><tr><th>Username</th><th>Created</th><th>CD Key</th><th>Login Key</th><th style="width:230px">Actions</th></tr></thead>
+          <tbody>${rows.map(r=>{
+            const cd=String(r.native_cd_key||"");
+            const isDup=legacy&&cd.replace(/[^0-9A-Za-z]/g,"").toUpperCase()===legacy;
+            const created=(r.created_at&&Number(r.created_at)>0)?`<span title="${esc(r.created_at)}">${esc(new Date(Number(r.created_at)*1000).toLocaleString())}</span>`:'<span class="muted">&mdash;</span>';
+            const login=String(r.native_login_key||"");
+            const loginShort=login.length>16?`<span class="mono" title="${esc(login)}">${esc(login.slice(0,10))}&hellip;${esc(login.slice(-4))}</span>`:esc(login);
+            return `<tr>
+              <td><span class="u" style="color:var(--text-hi);font-weight:600;">${esc(r.username)}</span></td>
+              <td>${created}</td>
+              <td class="mono">${esc(cd)||'<span class="muted">&mdash;</span>'}${isDup?' <span class="pill pill-danger">legacy</span>':""}</td>
+              <td>${loginShort||'<span class="muted">&mdash;</span>'}</td>
+              <td><button class="btn btn-sm" data-action="reset-pw" data-product="${esc(product)}" data-username="${esc(r.username)}">Reset PW</button> <button class="btn btn-sm" data-action="clear-cd-key" data-product="${esc(product)}" data-username="${esc(r.username)}">Clear CD Key</button> <button class="btn btn-danger btn-sm" data-action="delete-user" data-product="${esc(product)}" data-username="${esc(r.username)}">Delete</button></td>
+            </tr>`;
+          }).join("")}</tbody>
+        </table></div>`:`<p class="muted">${accountsQuery?"No accounts match this search.":"No accounts yet."}</p>`;
+      const pager=total>ACCOUNTS_LIMIT?`<div class="sectionbar" style="margin-top:12px;margin-bottom:0;">
+          <span class="muted">Showing ${from}&ndash;${to} of ${total}</span><div class="spacer"></div>
+          <button class="btn btn-sm" data-acct-page data-product="${esc(product)}" data-offset="${Math.max(0,offset-ACCOUNTS_LIMIT)}" ${offset<=0?"disabled":""}>&larr; Prev</button>
+          <button class="btn btn-sm" data-acct-page data-product="${esc(product)}" data-offset="${offset+ACCOUNTS_LIMIT}" ${to>=total?"disabled":""}>Next &rarr;</button>
+        </div>`:(total?`<p class="muted" style="margin-top:12px;">Showing all ${total}.</p>`:"");
+      return `<div class="card" style="margin-top:12px;">
+        <div class="sectionbar"><h2 style="margin:0;">${head} <span class="pill">${total}</span></h2>${legacyPill}<div class="spacer"></div></div>
+        ${body}
+        ${pager}
+      </div>`;
+    }
+    function renderAccounts(snapshot){
+      const products=sortedProductKeys(Object.keys(snapshot.dbs||{})).filter(inScope);
+      // Kick off loads for products whose cache is missing or whose search term
+      // is stale. Guarded so the poll's re-render does not spam the endpoint.
+      products.forEach(p=>{
+        const c=accountsCache[p];
+        if(!c||c.q!==accountsQuery)scheduleLoadAccounts(p,0);
+      });
+      const sections=products.map(renderAccountSection).join("");
+      return `<div class="sectionbar">
+          <input type="search" id="accounts-search" placeholder="Search username or CD key..." value="${esc(accountsQuery)}" style="background:var(--bg-panel);border:1px solid var(--line);border-radius:9px;padding:8px 12px;color:var(--text-hi);font:inherit;font-size:13px;min-width:260px;">
+          <div class="spacer"></div>
+        </div>${sections||'<div class="card"><p class="muted">No account databases in scope.</p></div>'}`;
     }
 
     function renderPlayers(snapshot){
@@ -1550,7 +2029,7 @@ class AdminDashboardServer:
         if(!grouped[product])grouped[product]=[];
         grouped[product].push(player);
       }
-      return metrics.keys.map(product=>{
+      return scopedKeys(metrics).map(product=>{
         const info=snapshotProductInfo(snapshot,product);
         const bucket=metrics.byProduct[product];
         const rows=grouped[product]||[];
@@ -1630,7 +2109,7 @@ class AdminDashboardServer:
         if(!grouped[product])grouped[product]=[];
         grouped[product].push(room);
       }
-      return metrics.keys.map(product=>{
+      return scopedKeys(metrics).map(product=>{
         const info=snapshotProductInfo(snapshot,product);
         const bucket=metrics.byProduct[product];
         const rooms=grouped[product]||[];
@@ -1709,7 +2188,7 @@ class AdminDashboardServer:
         if(!grouped[product])grouped[product]=[];
         grouped[product].push(entry);
       }
-      const summaryCards=metrics.keys.map(product=>{
+      const summaryCards=scopedKeys(metrics).map(product=>{
         const bucket=metrics.byProduct[product];
         const info=bucket.info||{};
         return `<div class="stat-card">
@@ -1727,7 +2206,7 @@ class AdminDashboardServer:
           <button class="btn btn-danger" data-action="clear-activity">Clear</button>
         </div>
         ${summaryCards?`<div class="stat-grid">${summaryCards}</div>`:""}
-        ${activity.length?metrics.keys.map(product=>{
+        ${activity.length?scopedKeys(metrics).map(product=>{
           const info=snapshotProductInfo(snapshot,product);
           const rows=grouped[product]||[];
           return `<div class="card" style="margin-top:12px;">
@@ -1763,7 +2242,7 @@ class AdminDashboardServer:
         }
       }
       return `<div class="card"><h2>IP Metrics <span class="pill">${ips.length}</span></h2>
-        ${ips.length?metrics.keys.map(product=>{
+        ${ips.length?scopedKeys(metrics).map(product=>{
           const info=snapshotProductInfo(snapshot,product);
           const rows=grouped[product]||[];
           return `<div class="card" style="margin-top:12px;">
@@ -1807,6 +2286,19 @@ class AdminDashboardServer:
       const rows=info.rows||[];
       const cols=rows.length?Object.keys(rows[0]):[];
       const isUsersTable=activeDbTable==="users";
+      const totalCount=Number(info.count||0);
+      const truncated=totalCount>rows.length;
+      const fmtCell=(col,v)=>{
+        if(v===null||v===undefined)return '<span class="muted">—</span>';
+        if((col==="created_at"||col.endsWith("_at"))&&typeof v==="number"&&v>0){
+          return `<span title="${esc(v)}">${esc(new Date(v*1000).toLocaleString())}</span>`;
+        }
+        const s=String(v);
+        if(/^[0-9a-fA-F]{24,}$/.test(s)){
+          return `<span class="mono" title="${esc(s)}">${esc(s.slice(0,10))}…${esc(s.slice(-4))}</span>`;
+        }
+        return esc(s);
+      };
       return `<div class="card">
         <h2>Database ${productBadge(activeDbProduct)}${esc(infoCardProduct.community_name||activeDbProduct)} <span class="pill">${esc(db.table_count||0)} tables</span> <span class="pill">${esc(db.total_rows||0)} rows</span></h2>
         <div class="kv" style="margin-bottom:12px;">
@@ -1821,9 +2313,9 @@ class AdminDashboardServer:
           <tbody>${rows.map(r=>`<tr>${cols.map(c=>{
             const v=r[c];
             if(v&&typeof v==="object")return '<td class="mono">'+esc(JSON.stringify(v))+"</td>";
-            return "<td>"+esc(v)+"</td>";
+            return "<td>"+fmtCell(c,v)+"</td>";
           }).join("")}${isUsersTable?`<td><button class="btn btn-sm" data-action="reset-pw" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Reset PW</button> <button class="btn btn-sm" data-action="clear-cd-key" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Clear CD Key</button> <button class="btn btn-danger btn-sm" data-action="delete-user" data-product="${esc(activeDbProduct)}" data-username="${esc(r.username)}">Delete</button></td>`:""}</tr>`).join("")}</tbody>
-        </table></div>`:'<p class="muted">Table is empty.</p>'}
+        </table></div>${truncated?`<p class="muted" style="margin-top:8px;">Showing first ${esc(rows.length)} of ${esc(totalCount)} rows.</p>`:""}`:'<p class="muted">Table is empty.</p>'}
       </div>`;
     }
 
@@ -1875,47 +2367,72 @@ class AdminDashboardServer:
       </div>`;
     }
 
+    // --- Non-destructive DOM updates -------------------------------------
+    // Instead of nuking content.innerHTML on every 8s poll (which drops focus,
+    // caret position, text selection and scroll), we morph the existing DOM in
+    // place: unchanged nodes keep their identity, so interaction survives a
+    // refresh. A full innerHTML write is still used on page switches, where
+    // there is no in-page state worth preserving.
+    let lastRenderedPage=null;
+    let lastContentHtml="";
+    function morphSyncAttrs(oldEl,newEl){
+      const keep={value:1,checked:1,selected:1};
+      for(let i=oldEl.attributes.length-1;i>=0;i--){
+        const name=oldEl.attributes[i].name;
+        if(!newEl.hasAttribute(name)&&!keep[name])oldEl.removeAttribute(name);
+      }
+      for(let i=0;i<newEl.attributes.length;i++){
+        const a=newEl.attributes[i];
+        if(keep[a.name])continue; // never clobber live form-control state
+        if(oldEl.getAttribute(a.name)!==a.value)oldEl.setAttribute(a.name,a.value);
+      }
+    }
+    function morphNode(oldN,newN){
+      if(oldN.nodeType!==newN.nodeType||(oldN.nodeType===1&&(oldN.tagName!==newN.tagName||oldN.id!==newN.id))){
+        oldN.replaceWith(newN);
+        return;
+      }
+      if(oldN.nodeType===1){
+        morphSyncAttrs(oldN,newN);
+        morphChildren(oldN,newN);
+      }else if(oldN.nodeType===3||oldN.nodeType===8){
+        if(oldN.nodeValue!==newN.nodeValue)oldN.nodeValue=newN.nodeValue;
+      }
+    }
+    function morphChildren(oldParent,newParent){
+      let o=oldParent.firstChild,n=newParent.firstChild;
+      while(o&&n){
+        const nextO=o.nextSibling,nextN=n.nextSibling;
+        morphNode(o,n);
+        o=nextO;n=nextN;
+      }
+      while(o){const nx=o.nextSibling;o.remove();o=nx;}
+      while(n){const nx=n.nextSibling;oldParent.appendChild(n);n=nx;}
+    }
+    function morphContent(container,html){
+      const tmp=document.createElement(container.tagName);
+      tmp.innerHTML=html;
+      morphChildren(container,tmp);
+    }
     function renderAll(snapshot){
       if(!snapshot)return;
       captureUiState();
       lastSnapshot=snapshot;
       renderNav(snapshot);
+      renderScopeSwitcher(snapshot);
       renderSidebarFooter(snapshot);
       renderTopbar(snapshot);
-      const renderers={overview:renderOverview,players:renderPlayers,rooms:renderRooms,activity:renderActivity,ips:renderIPs,database:renderDatabase,sessions:renderSessions,logs:renderLogs};
+      const renderers={overview:renderOverview,live:renderLive,activity:renderActivityAndLogs,accounts:renderAccounts,infra:renderInfrastructure};
       const fn=renderers[activePage]||renderOverview;
-      content.innerHTML=fn(snapshot);
+      const html=fn(snapshot);
+      if(activePage!==lastRenderedPage){
+        content.innerHTML=html;       // clean slate on navigation
+      }else if(html!==lastContentHtml){
+        morphContent(content,html);   // in-place update, preserves interaction
+      }
+      lastRenderedPage=activePage;
+      lastContentHtml=html;
       restoreUiState();
-      bindDbTabs();
-      bindLogFilters();
-    }
-    function bindDbTabs(){
-      content.querySelectorAll("[data-db-product]").forEach(btn=>{
-        btn.addEventListener("click",()=>{
-          activeDbProduct=btn.dataset.dbProduct||"";
-          activeDbTable="";
-          content.innerHTML=renderDatabase(lastSnapshot);
-          bindDbTabs();
-        });
-      });
-      content.querySelectorAll("[data-db-table]").forEach(btn=>{
-        btn.addEventListener("click",()=>{
-          activeDbTable=btn.dataset.dbTable||"";
-          content.innerHTML=renderDatabase(lastSnapshot);
-          bindDbTabs();
-        });
-      });
-    }
-    function bindLogFilters(){
-      content.querySelectorAll("[data-log-product]").forEach(btn=>{
-        btn.addEventListener("click",()=>{
-          captureUiState();
-          activeLogProduct=btn.dataset.logProduct||"all";
-          content.innerHTML=renderLogs(lastSnapshot);
-          restoreUiState();
-          bindLogFilters();
-        });
-      });
     }
 
     function withToken(path){
@@ -1931,6 +2448,7 @@ class AdminDashboardServer:
         const res=await fetch(withToken(`/api/admin/${endpoint}`),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
         const data=await res.json();
         if(data.ok){showToast(data.message||"Action succeeded","success");}else{showToast(data.error||"Action failed","error");}
+        accountsCache={};   // account rows may have changed; force a re-fetch
         await refresh();
       }catch(err){showToast("Request failed: "+err,"error");}
       finally{pauseRefresh=false;pauseAutoRefresh(6000);}
@@ -1954,6 +2472,40 @@ class AdminDashboardServer:
     }
     function closeModal(){modalOverlay.classList.remove("show");pauseRefresh=false;}
     modalOverlay.addEventListener("click",e=>{if(e.target===modalOverlay)closeModal();});
+
+    // Database tab / log-filter switches use event delegation on the stable
+    // content container. Direct per-button binding would double-attach now that
+    // morphContent reuses buttons across refreshes.
+    content.addEventListener("click",e=>{
+      const dbP=e.target.closest("[data-db-product]");
+      if(dbP){activeDbProduct=dbP.dataset.dbProduct||"";activeDbTable="";renderAll(lastSnapshot);return;}
+      const dbT=e.target.closest("[data-db-table]");
+      if(dbT){activeDbTable=dbT.dataset.dbTable||"";renderAll(lastSnapshot);return;}
+      const lgP=e.target.closest("[data-log-product]");
+      if(lgP){activeLogProduct=lgP.dataset.logProduct||"all";renderAll(lastSnapshot);return;}
+      const lv=e.target.closest("[data-live]");
+      if(lv){liveTab=lv.dataset.live||"players";renderAll(lastSnapshot);return;}
+      const av=e.target.closest("[data-activity-tab]");
+      if(av){activityTab=av.dataset.activityTab||"activity";renderAll(lastSnapshot);return;}
+      const ap=e.target.closest("[data-acct-page]");
+      if(ap&&!ap.disabled){scheduleLoadAccounts(ap.dataset.product,Math.max(0,Number(ap.dataset.offset||0)));return;}
+    });
+
+    // Global product scope switcher.
+    scopeSwitcher.addEventListener("click",e=>{
+      const b=e.target.closest("[data-scope]");
+      if(!b)return;
+      productScope=b.dataset.scope||"all";
+      lastContentHtml="";           // force re-render of the scoped content
+      renderAll(lastSnapshot);
+    });
+
+    // Accounts search. morphContent preserves the input's caret across the
+    // re-render, so filtering as you type does not steal focus.
+    content.addEventListener("input",e=>{
+      const s=e.target.closest("#accounts-search");
+      if(s){accountsQuery=s.value;lastContentHtml="";renderAll(lastSnapshot);}
+    });
 
     content.addEventListener("click",e=>{
       const btn=e.target.closest("[data-action]");
@@ -2012,6 +2564,10 @@ class AdminDashboardServer:
         const product=btn.dataset.product||activeDbProduct||"";
         showModal("Clear CD Key",`<p>Clear the native CD key and login key binding for <strong>${esc(u)}</strong>${product?` in <strong>${esc(product)}</strong>`:""}?</p><p class="muted">This lets the next retail login bind a fresh key for that account.</p>`,()=>adminAction("clear-cd-key",{product,username:u}));
       }
+      if(action==="clear-legacy"){
+        const product=btn.dataset.product||activeDbProduct||"";
+        showModal("Clear Legacy CD Keys",`<p>Clear the legacy shared installer CD key from <strong>all</strong> accounts still bound to it${product?` in <strong>${esc(product)}</strong>`:""}?</p><p class="muted">Each affected player re-binds a fresh unique key on their next retail login. This cannot be undone.</p>`,()=>adminAction("clear-legacy-cd-keys",{product}));
+      }
     });
 
     async function refresh(){
@@ -2041,10 +2597,49 @@ class AdminDashboardServer:
       try{if(!shouldDeferRefresh())await refresh();}catch(err){topbarMeta.textContent="Refresh failed: "+err;}
       setTimeout(loop,8000);
     }
+
+    // Live-match telemetry pushes updates as they happen so active games do not
+    // wait up to 8s for the next poll. The poll remains the fallback for state
+    // the feed does not cover (idle lobbies, account/db changes).
+    function startLiveFeed(){
+      if(typeof EventSource==="undefined")return;
+      let pending=null;
+      const bump=()=>{
+        if(pending)return;
+        pending=setTimeout(()=>{pending=null;if(!shouldDeferRefresh())refresh().catch(()=>{});},400);
+      };
+      try{
+        const es=new EventSource(withToken("/api/live-feed"));
+        es.addEventListener("message",bump);
+        ["match_checkpoint_hint","match_resolution_hint","match_slot_manifest","match_launch_config"].forEach(n=>es.addEventListener(n,bump));
+      }catch(e){/* fall back to polling */}
+    }
+
     loop();
+    startLiveFeed();
   </script>
 </body>
-</html>""".replace("__ADMIN_TOKEN__", json.dumps(embedded_token))
+</html>""".replace("__ADMIN_TOKEN__", json.dumps(embedded_token)).replace("__ADMIN_IDENTITY__", json.dumps(identity))
+
+    def _record_admin_action(
+        self, action: str, product: str, *, username: str = ""
+    ) -> None:
+        """Record a destructive admin account action in the activity feed so
+        delete/reset/clear operations leave an audit trail, mirroring how
+        admin broadcasts are already logged."""
+        recorder = getattr(self.gateway, "record_activity", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(
+                "admin-action",
+                product=str(product or "").strip(),
+                player_name="[ADMIN]",
+                text=f"{action}: {username}" if username else action,
+                details={"action": action, "username": username},
+            )
+        except Exception as exc:  # never let auditing break the action itself
+            LOGGER.debug("Failed to record admin action %s: %s", action, exc)
 
     async def _handle_admin_post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch POST admin action requests."""
@@ -2154,6 +2749,10 @@ class AdminDashboardServer:
                 try:
                     cur = conn.execute("DELETE FROM users WHERE username=?", (username,))
                     conn.commit()
+                    if cur.rowcount > 0:
+                        self._record_admin_action(
+                            "delete-user", product, username=username
+                        )
                     return {
                         "ok": cur.rowcount > 0,
                         "error": "" if cur.rowcount > 0 else "user not found",
@@ -2176,6 +2775,10 @@ class AdminDashboardServer:
                 try:
                     cur = conn.execute("UPDATE users SET password_hash=? WHERE username=?", (password_hash, username))
                     conn.commit()
+                    if cur.rowcount > 0:
+                        self._record_admin_action(
+                            "reset-password", product, username=username
+                        )
                     return {
                         "ok": cur.rowcount > 0,
                         "error": "" if cur.rowcount > 0 else "user not found",
@@ -2199,10 +2802,52 @@ class AdminDashboardServer:
                         (username,),
                     )
                     conn.commit()
+                    if cur.rowcount > 0:
+                        self._record_admin_action(
+                            "clear-cd-key", product, username=username
+                        )
                     return {
                         "ok": cur.rowcount > 0,
                         "error": "" if cur.rowcount > 0 else "user not found",
                         "product": product or self.default_db_product,
+                    }
+                finally:
+                    conn.close()
+
+            if path == "/api/admin/clear-legacy-cd-keys":
+                product = str(body.get("product", "")).strip()
+                product_key = product or self.default_db_product
+                legacy = LEGACY_SHARED_CD_KEYS.get(str(product_key).lower(), "")
+                if not legacy:
+                    return {"ok": False, "error": "no legacy key known for this product"}
+                db_path = self._resolve_db_path(product)
+                if not db_path.exists():
+                    return {"ok": False, "error": "database not found"}
+                norm = "REPLACE(REPLACE(UPPER(COALESCE(native_cd_key,'')),'-',''),' ','')"
+                conn = sqlite3.connect(str(db_path))
+                try:
+                    cur = conn.execute(
+                        "UPDATE users SET native_cd_key='', native_login_key='' "
+                        f"WHERE {norm}=?",
+                        (legacy,),
+                    )
+                    conn.commit()
+                    cleared = cur.rowcount
+                    if cleared > 0:
+                        self._record_admin_action(
+                            "clear-legacy-cd-keys",
+                            product,
+                            username=f"{cleared} account(s)",
+                        )
+                    return {
+                        "ok": True,
+                        "cleared": cleared,
+                        "message": (
+                            f"Cleared the legacy shared key from {cleared} account(s)."
+                            if cleared
+                            else "No accounts were bound to the legacy key."
+                        ),
+                        "product": product_key,
                     }
                 finally:
                     conn.close()
@@ -2357,6 +3002,19 @@ class AdminDashboardServer:
         elif parsed.path == "/api/stats":
             body = json.dumps(self.gateway.stats_snapshot(), indent=2).encode("utf-8")
             writer.write(self._http_response(body, "application/json; charset=utf-8"))
+        elif parsed.path == "/api/accounts":
+            acct_product = str(query.get("product", [""])[0] or "")
+            acct_q = str(query.get("q", [""])[0] or "")
+            acct_offset = 0
+            acct_limit = 50
+            with contextlib.suppress(TypeError, ValueError):
+                acct_offset = max(0, int(query.get("offset", ["0"])[0] or "0"))
+            with contextlib.suppress(TypeError, ValueError):
+                acct_limit = max(1, min(200, int(query.get("limit", ["50"])[0] or "50")))
+            body = json.dumps(
+                self._accounts_page(acct_product, acct_q, acct_offset, acct_limit)
+            ).encode("utf-8")
+            writer.write(self._http_response(body, "application/json; charset=utf-8"))
         elif parsed.path == "/api/replay-journal":
             match_id = str(query.get("match_id", [""])[0] or "")
             read_journal = getattr(self.gateway, "read_replay_journal", None)
@@ -2392,22 +3050,6 @@ class AdminDashboardServer:
                 writer.write(self._sse_frame("ready", hello))
                 await writer.drain()
                 while True:
-                    live_feed_bus = getattr(self.gateway, "live_feed_bus", None)
-                    dropped_for = getattr(live_feed_bus, "dropped_for", None)
-                    dropped = int(dropped_for(queue)) if callable(dropped_for) else 0
-                    if dropped:
-                        # Do not claim a continuous stream after the bounded
-                        # buffer has overflowed.  A client that sees this is
-                        # required to reject the affected replay input.
-                        overflow = {
-                            "event": "live_feed_overflow",
-                            "ts": time.time(),
-                            "dropped_events": dropped,
-                            "authority": "capture_integrity",
-                        }
-                        writer.write(self._sse_frame("live_feed_overflow", overflow))
-                        await writer.drain()
-                        return
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=15.0)
                     except asyncio.TimeoutError:
@@ -2427,7 +3069,10 @@ class AdminDashboardServer:
         elif parsed.path == "/":
             writer.write(
                 self._http_response(
-                    self._html(str(query.get("token", [""])[0] or "")).encode("utf-8"),
+                    self._html(
+                        str(query.get("token", [""])[0] or ""),
+                        identity=self._forward_auth_identity(headers),
+                    ).encode("utf-8"),
                     "text/html; charset=utf-8",
                 )
             )

@@ -1,6 +1,8 @@
 services:
   backend:
     build: .
+    # Run tini as PID 1 so orphaned child processes (e.g. git helpers spawned
+    # by the dashboard repo monitor) are reaped instead of piling up as zombies.
     init: true
     restart: unless-stopped
     read_only: true
@@ -69,6 +71,8 @@ services:
 
   backend-cataclysm:
     build: .
+    # Run tini as PID 1 so orphaned child processes (e.g. git helpers spawned
+    # by the dashboard repo monitor) are reaped instead of piling up as zombies.
     init: true
     restart: unless-stopped
     read_only: true
@@ -131,6 +135,8 @@ services:
 
   gateway:
     build: .
+    # Run tini as PID 1 so orphaned child processes (e.g. git helpers spawned
+    # by the dashboard repo monitor) are reaped instead of piling up as zombies.
     init: true
     restart: unless-stopped
     read_only: true
@@ -240,6 +246,17 @@ services:
           --db-path "$$DB_PATH" \
           --keys-dir "$$KEYS_DIR" \
           --log "${LOG_LEVEL:-INFO}"
+    environment:
+      # The dashboard reads the deployment remote without running git fetch in
+      # this read-only production container. Host-side deploys perform writes.
+      WON_REPO_REMOTE: "${WON_REPO_REMOTE:-gateway-updates}"
+      WON_REPO_READ_ONLY_CHECK: "${WON_REPO_READ_ONLY_CHECK:-1}"
+      # Optional reverse-proxy / forward-auth login (read as argparse defaults).
+      ADMIN_FORWARD_USER_HEADER: "${ADMIN_FORWARD_USER_HEADER:-}"
+      ADMIN_FORWARD_SECRET: "${ADMIN_FORWARD_SECRET:-}"
+      ADMIN_FORWARD_SECRET_HEADER: "${ADMIN_FORWARD_SECRET_HEADER:-x-admin-proxy-secret}"
+      ADMIN_FORWARD_GROUPS_HEADER: "${ADMIN_FORWARD_GROUPS_HEADER:-}"
+      ADMIN_ALLOWED_GROUPS: "${ADMIN_ALLOWED_GROUPS:-}"
     depends_on:
       backend:
         condition: service_healthy

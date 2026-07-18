@@ -851,6 +851,55 @@ def test_stats_token_is_scoped_to_stats_endpoint() -> None:
     assert dashboard._is_authorized("/api/snapshot", {"token": ["admin-secret"]}, {})
 
 
+def test_forward_auth_header_trust_with_spoof_and_group_guards() -> None:
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=object(),
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        admin_token="break-glass",
+        forward_auth_user_header="X-Forwarded-User",
+        forward_auth_secret="proxy-secret",
+        forward_auth_groups_header="X-Forwarded-Groups",
+        forward_auth_allowed_groups="won-admins",
+    )
+
+    good = {
+        "x-forwarded-user": "zero",
+        "x-admin-proxy-secret": "proxy-secret",
+        "x-forwarded-groups": "users,won-admins",
+    }
+    # Valid forward-auth grants access to admin paths.
+    assert dashboard._is_authorized("/api/snapshot", {}, good)
+    assert dashboard._forward_auth_identity(good) == "zero"
+
+    # Missing proxy secret is treated as a spoof attempt and rejected.
+    assert not dashboard._is_authorized(
+        "/api/snapshot", {}, {"x-forwarded-user": "zero", "x-forwarded-groups": "won-admins"}
+    )
+    # Authenticated but not in an allowed group.
+    assert not dashboard._is_authorized(
+        "/api/snapshot",
+        {},
+        {"x-forwarded-user": "zero", "x-admin-proxy-secret": "proxy-secret", "x-forwarded-groups": "users"},
+    )
+    # No identity header at all, and no token -> denied.
+    assert not dashboard._is_authorized("/api/snapshot", {}, {})
+    # The static token still works as break-glass alongside forward-auth.
+    assert dashboard._is_authorized("/api/snapshot", {"token": ["break-glass"]}, {})
+
+
+def test_forward_auth_without_secret_or_groups_allows_any_proxy_user() -> None:
+    dashboard = titan_binary_gateway.AdminDashboardServer(
+        gateway=object(),
+        db_path="won_server.db",
+        log_handler=titan_binary_gateway.DashboardLogHandler(),
+        forward_auth_user_header="X-Forwarded-User",
+    )
+    # Forward-auth configured but no token: a valid identity is required.
+    assert dashboard._is_authorized("/api/snapshot", {}, {"x-forwarded-user": "ops"})
+    assert not dashboard._is_authorized("/api/snapshot", {}, {})
+
+
 def test_admin_live_feed_sse_frame_uses_event_stream_format() -> None:
     dashboard = titan_binary_gateway.AdminDashboardServer(
         gateway=object(),

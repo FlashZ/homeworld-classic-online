@@ -714,7 +714,7 @@ class BinaryGatewayServer:
             return []
         join_leave_chat = [
             entry for entry in self._activity
-            if entry.get("kind") in {"join", "rejoin", "leave", "chat", "broadcast"}
+            if entry.get("kind") in {"join", "rejoin", "leave", "chat", "broadcast", "admin-action"}
         ]
         events: list[Dict[str, object]] = []
         for entry in list(join_leave_chat)[-limit:]:
@@ -3161,6 +3161,44 @@ class BinaryGatewayServer:
         auth_addr = struct.pack(">H", self.public_port) + ip_raw
         routing_addr = struct.pack(">H", self.routing_port) + ip_raw
 
+        def _factory_net_addr(payload: dict, default: bytes) -> bytes:
+            """Build a WON net_addr (>H port + 4-byte IPv4) for a factory entry.
+
+            Multi-region: a factory entity can opt in to publishing a remote
+            region's public gateway address via dedicated ``public_host`` /
+            ``public_port`` fields, so clients that pick it connect to that
+            region's gateway instead of being pointed back here.  The generic
+            ``host`` / ``port`` fields are deliberately ignored -- in the stock
+            ``/TitanServers`` seed those are internal placeholders (e.g.
+            127.0.0.1:9000) shared across every entity, so honoring them would
+            break the default single-region setup.  When no public address is
+            configured we fall back to this gateway's own auth address."""
+            if not isinstance(payload, dict):
+                return default
+            host_s = str(payload.get("public_host") or "").strip()
+            raw_port = payload.get("public_port")
+            if not host_s or raw_port is None:
+                return default
+            try:
+                port_i = int(raw_port)
+            except (TypeError, ValueError):
+                port_i = 0
+            if port_i <= 0 or port_i > 0xFFFF:
+                LOGGER.warning(
+                    "Factory entry public_port %r is out of range; using local gateway address",
+                    raw_port,
+                )
+                return default
+            try:
+                host_raw = _socket.inet_aton(host_s)
+            except OSError:
+                LOGGER.warning(
+                    "Factory entry public_host %r is not a valid IPv4 address; using local gateway address",
+                    host_s,
+                )
+                return default
+            return struct.pack(">H", port_i) + host_raw
+
         if path == self.product_profile.directory_root:
             LOGGER.info("DirGet: native %s query", self.product_profile.directory_root)
             flags = (
@@ -3236,7 +3274,7 @@ class BinaryGatewayServer:
                         "type": "S",
                         "name": self.product_profile.factory_service_name,
                         "display_name": display_name,
-                        "net_addr": auth_addr,
+                        "net_addr": _factory_net_addr(payload, auth_addr),
                         "data_objects": data_objects,
                     })
 
@@ -4731,6 +4769,11 @@ async def main_async(args: argparse.Namespace) -> None:
         stats_token=args.stats_token,
         web_auth_shared_secret=str(args.web_auth_shared_secret or ""),
         web_auth_public_base_url=str(args.web_auth_public_base_url or ""),
+        forward_auth_user_header=str(getattr(args, "admin_forward_user_header", "") or ""),
+        forward_auth_secret=str(getattr(args, "admin_forward_secret", "") or ""),
+        forward_auth_secret_header=str(getattr(args, "admin_forward_secret_header", "") or "x-admin-proxy-secret"),
+        forward_auth_groups_header=str(getattr(args, "admin_forward_groups_header", "") or ""),
+        forward_auth_allowed_groups=str(getattr(args, "admin_allowed_groups", "") or ""),
     )
     admin_server = None
     if args.admin_port > 0:
@@ -4866,6 +4909,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--stats-token",
         default=os.environ.get("STATS_TOKEN", ""),
         help="Optional token for the bot-friendly /api/stats endpoint. Falls back to --admin-token when unset.",
+    )
+    p.add_argument(
+        "--admin-forward-user-header",
+        default=os.environ.get("ADMIN_FORWARD_USER_HEADER", ""),
+        help=(
+            "Trust this request header as the authenticated admin username when set "
+            "(e.g. X-Forwarded-User, X-authentik-username, Cf-Access-Authenticated-User-Email). "
+            "Enables reverse-proxy / forward-auth login; leave empty to disable."
+        ),
+    )
+    p.add_argument(
+        "--admin-forward-secret",
+        default=os.environ.get("ADMIN_FORWARD_SECRET", ""),
+        help=(
+            "Shared secret the front proxy must also send (in --admin-forward-secret-header) "
+            "for forward-auth headers to be trusted. Strongly recommended to prevent header spoofing."
+        ),
+    )
+    p.add_argument(
+        "--admin-forward-secret-header",
+        default=os.environ.get("ADMIN_FORWARD_SECRET_HEADER", "x-admin-proxy-secret"),
+        help="Header carrying --admin-forward-secret. Default: x-admin-proxy-secret.",
+    )
+    p.add_argument(
+        "--admin-forward-groups-header",
+        default=os.environ.get("ADMIN_FORWARD_GROUPS_HEADER", ""),
+        help="Optional header carrying the user's groups (e.g. X-authentik-groups) for --admin-allowed-groups gating.",
+    )
+    p.add_argument(
+        "--admin-allowed-groups",
+        default=os.environ.get("ADMIN_ALLOWED_GROUPS", ""),
+        help="Optional comma-separated allowlist of groups; forward-auth users must be in one. Empty allows any authenticated user.",
     )
     p.add_argument(
         "--web-auth-shared-secret",

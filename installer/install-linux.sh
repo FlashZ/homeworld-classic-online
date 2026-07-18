@@ -76,6 +76,32 @@ product_name() {
   esac
 }
 
+# Legacy shared installer default keys. Early installer builds wrote the same
+# hardcoded key for everyone; these are refreshed to a unique random key by
+# default, matching the Windows installer's IsLegacySharedRegistryCdKey check.
+legacy_shared_key() {
+  case "$1" in
+    Homeworld) echo "NYX7ZEC9FYZ6GUX84253" ;;
+    Cataclysm) echo "GAF6CAB4SEX5ZYL62622" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Strip separators/whitespace and upper-case so display and plain forms compare
+# equal (e.g. "NYX7-ZEC9-..." vs "nyx7zec9...").
+normalize_cd_key() {
+  printf '%s' "$1" | tr -d '\r\n\t -' | tr '[:lower:]' '[:upper:]'
+}
+
+is_legacy_shared_key() {
+  local product="$1"
+  local candidate
+  candidate="$(normalize_cd_key "$2")"
+  local legacy
+  legacy="$(legacy_shared_key "$product")"
+  [[ -n "$legacy" && "$candidate" == "$legacy" ]]
+}
+
 default_server() {
   case "$1" in
     homeworld) echo "homeworld.kerrbell.dev" ;;
@@ -177,17 +203,40 @@ write_registry_key() {
   local existing_key
   existing_key="$(query_existing_key "$product" "$prefix")"
   if [[ -n "$existing_key" && "$FORCE_NEW_KEY" -eq 0 ]]; then
-    if [[ "$KEEP_KEY" -eq 1 || "$NON_INTERACTIVE" -eq 1 ]]; then
+    # An explicit --keep-key always wins. Otherwise a legacy shared installer
+    # default is refreshed to a unique key by default (interactive prompt
+    # defaults to Yes; non-interactive refreshes silently), so players who
+    # installed with an old build stop sharing one key.
+    if [[ "$KEEP_KEY" -eq 1 ]]; then
       echo "Keeping detected $product CD key: $existing_key"
       return
     fi
 
-    echo "Detected $product CD key: $existing_key"
-    read -r -p "Replace it with a generated key? [y/N] " answer
-    case "$answer" in
-      y|Y|yes|YES) ;;
-      *) echo "Keeping detected $product CD key: $existing_key"; return ;;
-    esac
+    if is_legacy_shared_key "$product" "$existing_key"; then
+      if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+        echo "Detected a legacy shared $product installer key ($existing_key); refreshing it with a unique generated key."
+      else
+        echo "Detected a legacy shared $product installer key: $existing_key"
+        echo "This key was shipped to everyone by older installer builds, so replacing it is recommended."
+        read -r -p "Replace it with a unique generated key? [Y/n] " answer
+        case "$answer" in
+          n|N|no|NO) echo "Keeping detected $product CD key: $existing_key"; return ;;
+          *) ;;
+        esac
+      fi
+    else
+      if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+        echo "Keeping detected $product CD key: $existing_key"
+        return
+      fi
+
+      echo "Detected $product CD key: $existing_key"
+      read -r -p "Replace it with a generated key? [y/N] " answer
+      case "$answer" in
+        y|Y|yes|YES) ;;
+        *) echo "Keeping detected $product CD key: $existing_key"; return ;;
+      esac
+    fi
   fi
 
   local key_json display plain encrypted_hex encrypted_reg reg_file
