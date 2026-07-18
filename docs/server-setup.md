@@ -40,8 +40,12 @@ If you want to enable the browser-based WON auth bridge for Homeworld Stats, als
 
 - `WEB_AUTH_SHARED_SECRET`
 - `WEB_AUTH_PUBLIC_BASE_URL`
+- `WEB_AUTH_CDKEY_FINGERPRINT_SALT` (32+ random bytes, kept only on the WON backend)
 
 The `WEB_AUTH_PUBLIC_BASE_URL` value should be the public Homeworld Stats base URL, because the gateway validates browser return targets against it.
+When the fingerprint salt is configured, a successful exchange also returns a salted CD-key fingerprint and
+same-product account suggestions. Raw CD keys are never returned, and suggestions still require each account's
+normal login before the stats site can claim it.
 
 Then start it:
 
