@@ -69,6 +69,110 @@ def test_claim_pending_reconnect_by_id_requires_matching_ip() -> None:
     assert 7 not in server._pending_reconnects
 
 
+def test_evict_native_login_removes_active_client_and_pending_reconnect() -> None:
+    class FakeGateway:
+        def __init__(self) -> None:
+            self.releases: list[dict[str, object]] = []
+
+        def record_activity(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def record_live_player_event(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def _release_native_login_claim(self, **kwargs: object) -> bool:
+            self.releases.append(dict(kwargs))
+            return True
+
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    gateway = FakeGateway()
+    writer = FakeWriter()
+    server = titan_binary_gateway.SilencerRoutingServer(
+        gateway,
+        listen_port=15102,
+        publish_in_directory=True,
+    )
+    server._native_clients[5] = titan_binary_gateway.NativeRouteClientState(
+        client_id=5,
+        client_name_raw=b"DaMaG",
+        client_name="DaMaG",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=writer,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+        auth_user_id=1000,
+        account_username="DaMaG",
+    )
+    server._pending_reconnects[7] = titan_binary_gateway.PendingNativeReconnect(
+        client_id=7,
+        client_name_raw=b"DaMaG",
+        client_name="DaMaG",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        connected_at=100.0,
+        last_activity_at=101.0,
+        last_activity_kind="peer_data",
+        chat_count=1,
+        peer_data_messages=2,
+        peer_data_bytes=64,
+        auth_user_id=1000,
+        account_username="DaMaG",
+    )
+
+    evicted = asyncio.run(
+        server.evict_native_login(
+            user_id=1000,
+            username="DaMaG",
+            reason="native_login_replaced",
+        )
+    )
+
+    assert evicted == 2
+    assert writer.closed is True
+    assert server._native_clients == {}
+    assert server._pending_reconnects == {}
+    assert [release["user_id"] for release in gateway.releases] == [1000, 1000]
+    assert all(
+        release["reason"] == "routing_native_login_replaced"
+        for release in gateway.releases
+    )
+
+
+def test_replace_active_native_login_evicts_old_routing_session() -> None:
+    class FakeRoutingManager:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def evict_native_login(self, **kwargs: object) -> int:
+            self.calls.append(dict(kwargs))
+            return 1
+
+    runtime = titan_binary_gateway.BinaryGatewayServer("127.0.0.1", 0)
+    routing_manager = FakeRoutingManager()
+    runtime.routing_manager = routing_manager  # type: ignore[assignment]
+    runtime._register_native_login_claim("DaMaG", 1000)
+    runtime._attach_native_login_claim(1000, 5)
+
+    replaced = asyncio.run(runtime._replace_active_native_login("DaMaG"))
+
+    assert replaced is True
+    assert runtime._username_for_active_native_login(1000) == ""
+    assert routing_manager.calls == [
+        {
+            "user_id": 1000,
+            "username": "DaMaG",
+            "reason": "native_login_replaced",
+        }
+    ]
+
+
 def test_dashboard_snapshot_marks_unpublished_active_room_as_game_room() -> None:
     manager = titan_binary_gateway.RoutingServerManager(
         host="127.0.0.1",

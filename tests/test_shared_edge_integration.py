@@ -287,7 +287,7 @@ def test_shared_edge_native_auth_routes_homeworld_and_cataclysm_over_one_gateway
     asyncio.run(_run())
 
 
-def test_shared_edge_rejects_second_native_login_for_same_active_user(
+def test_shared_edge_allows_same_native_user_to_relogin_without_cd_key_ghost(
     tmp_path: Path,
 ) -> None:
     async def _run() -> None:
@@ -335,7 +335,19 @@ def test_shared_edge_rejects_second_native_login_for_same_active_user(
             )
             assert first_user_id in home_runtime._issued_user_ids
 
-            duplicate_status = await _perform_native_login_failure_status(
+            bad_password_status = await _perform_native_login_failure_status(
+                home_runtime,
+                gateway_port=gateway_port,
+                username="HomeUser",
+                password="wrong-password",
+                community_name="Homeworld",
+                login_key_raw=b"hw-log02",
+                cd_key_raw=shared_cd_key,
+            )
+            assert bad_password_status == won_crypto.STATUS_AUTH_BAD_PASSWORD
+            assert home_runtime._username_for_active_native_login(first_user_id) == "HomeUser"
+
+            second_user_id = await _perform_native_login(
                 home_runtime,
                 gateway_port=gateway_port,
                 username="HomeUser",
@@ -343,9 +355,18 @@ def test_shared_edge_rejects_second_native_login_for_same_active_user(
                 community_name="Homeworld",
                 login_key_raw=b"hw-log02",
                 cd_key_raw=shared_cd_key,
+                create_account=False,
             )
 
-            assert duplicate_status == won_crypto.STATUS_AUTH_CD_KEY_IN_USE
+            assert second_user_id != first_user_id
+            assert home_runtime._username_for_active_native_login(first_user_id) == ""
+            assert home_runtime._username_for_active_native_login(second_user_id) == "HomeUser"
+            assert home_runtime._release_native_login_claim(
+                user_id=first_user_id,
+                username="HomeUser",
+                reason="stale_disconnect_after_relogin",
+            ) is False
+            assert home_runtime._username_for_active_native_login(second_user_id) == "HomeUser"
         finally:
             gateway_server.close()
             await gateway_server.wait_closed()

@@ -492,6 +492,85 @@ class SilencerRoutingServer:
             pass
         return True
 
+    async def evict_native_login(
+        self,
+        *,
+        user_id: int = 0,
+        username: str = "",
+        reason: str = "native_login_replaced",
+    ) -> int:
+        """Remove live or pending routing sessions that belong to a native account."""
+        target_user_id = int(user_id or 0)
+        target_username = str(username or "").strip()
+        evicted = 0
+
+        def matches(
+            *,
+            auth_user_id: int = 0,
+            account_username: str = "",
+        ) -> bool:
+            if target_user_id and int(auth_user_id or 0) == target_user_id:
+                return True
+            return bool(target_username and str(account_username or "") == target_username)
+
+        for client in list(self._native_clients.values()):
+            if not matches(
+                auth_user_id=client.auth_user_id,
+                account_username=client.account_username,
+            ):
+                continue
+            removed = self._native_clients.pop(client.client_id, None)
+            if removed is None:
+                continue
+            evicted += 1
+            LOGGER.info(
+                "Routing(native): evicting previous native login client_id=%d name=%r user_id=%d account=%r reason=%s",
+                removed.client_id,
+                removed.client_name,
+                removed.auth_user_id,
+                removed.account_username,
+                reason,
+            )
+            with contextlib.suppress(Exception):
+                removed.writer.close()
+            await self._finalize_client_departure(
+                removed.client_id,
+                removed.client_name,
+                removed.client_ip,
+                auth_user_id=removed.auth_user_id,
+                account_username=removed.account_username,
+                disconnect_reason=reason,
+            )
+
+        for client_id, reservation in list(self._pending_reconnects.items()):
+            if not matches(
+                auth_user_id=reservation.auth_user_id,
+                account_username=reservation.account_username,
+            ):
+                continue
+            removed = self._pending_reconnects.pop(client_id, None)
+            if removed is None:
+                continue
+            evicted += 1
+            LOGGER.info(
+                "Routing(native): evicting previous pending reconnect id=%d name=%r user_id=%d account=%r reason=%s",
+                removed.client_id,
+                removed.client_name,
+                removed.auth_user_id,
+                removed.account_username,
+                reason,
+            )
+            await self._finalize_client_departure(
+                removed.client_id,
+                removed.client_name,
+                removed.client_ip,
+                auth_user_id=removed.auth_user_id,
+                account_username=removed.account_username,
+                disconnect_reason=reason,
+            )
+
+        return evicted
+
     async def admin_broadcast_chat(self, text: str) -> int:
         """Admin action: send a chat message from [ADMIN] to all clients."""
         text = _sanitize_routing_chat_text(text)
@@ -2672,6 +2751,22 @@ class RoutingServerManager:
         if server is None:
             return False
         return await server.admin_kick_client(client_id)
+
+    async def evict_native_login(
+        self,
+        *,
+        user_id: int = 0,
+        username: str = "",
+        reason: str = "native_login_replaced",
+    ) -> int:
+        total = 0
+        for server in list(self._servers.values()):
+            total += await server.evict_native_login(
+                user_id=user_id,
+                username=username,
+                reason=reason,
+            )
+        return total
 
     async def admin_broadcast(self, message: str, room_port: Optional[int] = None) -> int:
         total = 0
