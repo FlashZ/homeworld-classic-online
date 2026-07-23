@@ -503,7 +503,16 @@ class BinaryGatewayServer:
         normalized = ""
         if user_id:
             normalized = str(self._native_login_claims_by_user_id.get(int(user_id), "") or "")
-        if not normalized:
+            if not normalized:
+                candidate = self._normalize_native_login_username(username)
+                candidate_claim = self._native_login_claims.get(candidate)
+                if (
+                    candidate_claim is None
+                    or int(candidate_claim.user_id) != int(user_id)
+                ):
+                    return False
+                normalized = candidate
+        else:
             normalized = self._normalize_native_login_username(username)
         if not normalized:
             return False
@@ -520,6 +529,40 @@ class BinaryGatewayServer:
             reason or "released",
         )
         return True
+
+    async def _replace_active_native_login(self, username: str) -> bool:
+        self._expire_native_login_claims()
+        normalized = self._normalize_native_login_username(username)
+        if not normalized:
+            return False
+
+        claim = self._native_login_claims.get(normalized)
+        target_user_id = int(claim.user_id) if claim is not None else 0
+        target_username = str(claim.username) if claim is not None else normalized
+        evicted = 0
+        if self.routing_manager is not None:
+            evicted = await self.routing_manager.evict_native_login(
+                user_id=target_user_id,
+                username=target_username,
+                reason="native_login_replaced",
+            )
+
+        released = False
+        if claim is not None:
+            released = self._release_native_login_claim(
+                user_id=target_user_id,
+                reason="native_login_replaced",
+            )
+
+        if released or evicted:
+            LOGGER.info(
+                "Auth1: native login replacement prepared user=%r user_id=%d evicted_sessions=%d released_claim=%s",
+                target_username,
+                target_user_id,
+                evicted,
+                released,
+            )
+        return bool(released or evicted)
 
     def _expire_peer_sessions(self) -> int:
         now = time.time()
@@ -2431,7 +2474,7 @@ class BinaryGatewayServer:
                         "create_account": bool(native_login["create_account"]),
                         "client_ip": client_ip,
                         "allow_cd_key_rebind": True,
-                        "account_active": self._is_native_login_active(username),
+                        "account_active": False,
                     }
                 )
                 if not backend.get("ok"):
@@ -2459,6 +2502,7 @@ class BinaryGatewayServer:
                         bool(native_result.get("cd_key_bound", False)),
                         bool(native_result.get("binding_changed", False)),
                     )
+                await self._replace_active_native_login(username)
                 user_id = self._alloc_user_id()
                 self._register_native_login_claim(username, user_id)
 
@@ -3665,6 +3709,22 @@ class SharedRoutingServerManager:
                 return await manager.admin_kick_player(port, client_id)
         return False
 
+    async def evict_native_login(
+        self,
+        *,
+        user_id: int = 0,
+        username: str = "",
+        reason: str = "native_login_replaced",
+    ) -> int:
+        total = 0
+        for manager in self._managers.values():
+            total += await manager.evict_native_login(
+                user_id=user_id,
+                username=username,
+                reason=reason,
+            )
+        return total
+
     async def admin_broadcast(
         self,
         message: str,
@@ -3928,7 +3988,7 @@ class SharedBinaryGatewayServer:
                         "create_account": bool(native_login["create_account"]),
                         "client_ip": client_ip,
                         "allow_cd_key_rebind": True,
-                        "account_active": runtime._is_native_login_active(username),
+                        "account_active": False,
                     }
                 )
                 if not backend.get("ok"):
@@ -3956,6 +4016,7 @@ class SharedBinaryGatewayServer:
                         bool(native_result.get("binding_changed", False)),
                         runtime.product_profile.key,
                     )
+                await runtime._replace_active_native_login(username)
                 user_id = runtime._alloc_user_id()
                 runtime._register_native_login_claim(username, user_id)
 
