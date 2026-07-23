@@ -1485,6 +1485,8 @@ class SilencerRoutingServer:
         disconnect_reason = "transport_lost"
         auth_user_id = 0
         account_username = ""
+        client_ip = str(peer[0]) if peer and len(peer) > 0 and isinstance(peer[0], str) else "127.0.0.1"
+        client_ip_u32 = int.from_bytes(_host_to_ip4(client_ip), "little")
 
         try:
             svc, msg, req_body = won_crypto.parse_tmessage(first_payload)
@@ -1712,8 +1714,6 @@ class SilencerRoutingServer:
                                 STATUS_ROUTING_INVALID_PASSWORD,
                             )
                             continue
-                        client_ip = str(peer[0]) if peer and len(peer) > 0 and isinstance(peer[0], str) else "127.0.0.1"
-                        client_ip_u32 = int.from_bytes(_host_to_ip4(client_ip), "little")
                         reconnect = await self._claim_pending_reconnect(
                             bytes(req["client_name_raw"]),
                             client_ip,

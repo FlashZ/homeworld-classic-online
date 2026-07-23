@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import struct
 import time
 
 import titan_binary_gateway
@@ -171,6 +172,180 @@ def test_replace_active_native_login_evicts_old_routing_session() -> None:
             "reason": "native_login_replaced",
         }
     ]
+
+
+def test_reconnect_client_before_register_uses_peer_ip(monkeypatch) -> None:
+    class FakeGateway:
+        _auth_keys_loaded = True
+        _auth_p = 23
+        _auth_q = 11
+        _auth_g = 5
+        _auth_y = 8
+        _next_user_id = 2000
+
+        def __init__(self) -> None:
+            self.attached: list[tuple[int, int]] = []
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def _build_user_cert(self, user_id: int) -> tuple[bytes, int, int]:
+            return b"server-cert", 0, 3
+
+        def _username_for_active_native_login(self, user_id: int) -> str:
+            return "DaMaG" if int(user_id) == 1040 else ""
+
+        def _attach_native_login_claim(self, user_id: int, client_id: int) -> None:
+            self.attached.append((int(user_id), int(client_id)))
+
+        def _release_native_login_claim(self, **_kwargs: object) -> bool:
+            return True
+
+        def record_activity(self, kind: str, **kwargs: object) -> None:
+            self.events.append((kind, dict(kwargs)))
+
+        def record_live_player_event(self, kind: str, **kwargs: object) -> None:
+            self.events.append((kind, dict(kwargs)))
+
+    class FakeReader:
+        pass
+
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.closed = False
+
+        def get_extra_info(self, name: str, default: object = None) -> object:
+            if name == "peername":
+                return ("213.217.0.31", 49476)
+            return default
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(bytes(data))
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    secret_b = b"12345678"
+    clear_reconnect = bytes(
+        [
+            titan_binary_gateway.MINI_HEADER_TYPE,
+            titan_binary_gateway.MINI_ROUTING_SERVICE,
+            titan_binary_gateway.ROUTING_RECONNECT_CLIENT,
+            0x07,
+            0x00,
+            0x00,
+        ]
+    )
+    clear_disconnect = bytes(
+        [
+            titan_binary_gateway.MINI_HEADER_TYPE,
+            titan_binary_gateway.MINI_ROUTING_SERVICE,
+            titan_binary_gateway.ROUTING_DISCONNECT_CLIENT,
+        ]
+    )
+    routing_payloads = iter([b"challenge2", b"\x04reconnect", b"\x04disconnect"])
+
+    async def fake_recv(_reader: object) -> bytes:
+        try:
+            return next(routing_payloads)
+        except StopIteration:
+            raise asyncio.IncompleteReadError(partial=b"", expected=1)
+
+    def fake_parse_tmessage(body: bytes) -> tuple[int, int, bytes]:
+        if body == b"first":
+            return (
+                titan_binary_gateway.AUTH1_PEER_SERVICE_TYPE,
+                titan_binary_gateway.AUTH1_PEER_REQUEST,
+                b"request",
+            )
+        return (
+            titan_binary_gateway.AUTH1_PEER_SERVICE_TYPE,
+            titan_binary_gateway.AUTH1_PEER_CHALLENGE2,
+            b"challenge2",
+        )
+
+    def fake_decrypt(payload: bytes, _session_key: bytes, _seq: object) -> bytes:
+        if payload == b"\x04reconnect":
+            return clear_reconnect
+        return clear_disconnect
+
+    async def fake_send_reply(
+        _writer: object,
+        clear_msg: bytes,
+        _session_key: bytes,
+        out_seq: object,
+    ) -> object:
+        assert clear_msg
+        return out_seq
+
+    monkeypatch.setattr(routing_module.won_crypto, "parse_tmessage", fake_parse_tmessage)
+    monkeypatch.setattr(
+        routing_module,
+        "_parse_auth1_peer_request",
+        lambda _body: {
+            "certificate": b"cert",
+            "auth_mode": 1,
+            "encrypt_mode": 1,
+            "encrypt_flags": 0x0001,
+        },
+    )
+    monkeypatch.setattr(
+        routing_module,
+        "_parse_auth1_certificate",
+        lambda _cert: {
+            "sig": b"",
+            "unsigned": b"",
+            "user_id": 1040,
+            "p": 23,
+            "g": 5,
+            "y": 8,
+        },
+    )
+    monkeypatch.setattr(routing_module.os, "urandom", lambda _size: secret_b)
+    monkeypatch.setattr(routing_module.won_crypto, "eg_encrypt", lambda *args: b"cipher")
+    monkeypatch.setattr(
+        routing_module.won_crypto,
+        "eg_decrypt",
+        lambda *args: struct.pack("<H", len(secret_b)) + secret_b + b"secret-a",
+    )
+    monkeypatch.setattr(
+        routing_module,
+        "_parse_auth1_peer_challenge2",
+        lambda _body: b"challenge2-cipher",
+    )
+    monkeypatch.setattr(routing_module, "_routing_recv_with_idle_timeout", fake_recv)
+    monkeypatch.setattr(routing_module, "_decrypt_persistent_non_t", fake_decrypt)
+
+    gateway = FakeGateway()
+    server = titan_binary_gateway.SilencerRoutingServer(
+        gateway,  # type: ignore[arg-type]
+        listen_port=15103,
+        publish_in_directory=False,
+    )
+    server._send_native_route_reply = fake_send_reply  # type: ignore[method-assign]
+    server._pending_reconnects[7] = titan_binary_gateway.PendingNativeReconnect(
+        client_id=7,
+        client_name_raw=b"DaMaG",
+        client_name="DaMaG",
+        client_ip="213.217.0.31",
+        client_ip_u32=0,
+        connected_at=100.0,
+        last_activity_at=101.0,
+        last_activity_kind="peer_data",
+        chat_count=1,
+        peer_data_messages=2,
+        peer_data_bytes=64,
+        auth_user_id=1040,
+        account_username="DaMaG",
+    )
+
+    asyncio.run(server._handle_native_client(FakeReader(), FakeWriter(), b"first"))  # type: ignore[arg-type]
+
+    assert gateway.attached == [(1040, 7)]
+    assert 7 not in server._pending_reconnects
+    assert any(kind == "rejoin" for kind, _event in gateway.events)
 
 
 def test_dashboard_snapshot_marks_unpublished_active_room_as_game_room() -> None:
