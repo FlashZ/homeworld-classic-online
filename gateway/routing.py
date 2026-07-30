@@ -26,7 +26,8 @@ LOGGER = logging.getLogger(__name__)
 PUBLISHED_GAME_ACTIVITY_WINDOW_SECONDS = 15.0
 SLOW_PEER_DATA_DELIVERY_THRESHOLD_SECONDS = 0.150
 SLOW_PEER_DATA_LOG_COOLDOWN_SECONDS = 15.0
-PEER_DATA_SEND_TIMEOUT_SECONDS = 1.0
+ROUTING_CLIENT_SEND_TIMEOUT_SECONDS = 1.0
+PEER_DATA_SEND_TIMEOUT_SECONDS = ROUTING_CLIENT_SEND_TIMEOUT_SECONDS
 _MULTIPLAYER_LEVEL_PATH_RE = re.compile(
     rb"(?i)multiplayer\\(?P<folder>[^\\\x00\r\n]+)\\(?P<file>[^\\\x00\r\n]+)\.level"
 )
@@ -592,19 +593,28 @@ class SilencerRoutingServer:
             addressees=[],
             include_exclude_flag=False,
         )
-        delivered = 0
-        for client in list(self._native_clients.values()):
-            try:
-                if not client.admin_sender_announced:
-                    await self._send_native_route_client_reply(client, join_msg)
-                    client.admin_sender_announced = True
-                await self._send_native_route_client_reply(client, peer_chat)
-                delivered += 1
-            except Exception as exc:
-                LOGGER.warning(
-                    "Routing(admin): failed broadcast to client_id=%d: %s",
-                    client.client_id, exc,
+
+        async def deliver(client: NativeRouteClientState) -> bool:
+            if not client.admin_sender_announced:
+                joined = await self._deliver_native_route_client_message(
+                    message_kind="admin-join",
+                    client=client,
+                    clear_msg=join_msg,
                 )
+                if not joined:
+                    return False
+                client.admin_sender_announced = True
+            return await self._deliver_native_route_client_message(
+                message_kind="admin-chat",
+                client=client,
+                clear_msg=peer_chat,
+                payload_len=len(data),
+            )
+
+        deliveries = await asyncio.gather(
+            *[deliver(client) for client in list(self._native_clients.values())]
+        )
+        delivered = sum(1 for success in deliveries if success)
         LOGGER.info("Routing(admin): broadcast delivered to %d clients", delivered)
         return delivered
 
@@ -637,6 +647,7 @@ class SilencerRoutingServer:
     async def _send_server_keepalives(self) -> None:
         now = time.time()
         keepalive = _build_mini_routing_keep_alive()
+        deliveries = []
         for client in list(self._native_clients.values()):
             if now - client.last_activity_at < ROUTING_HEARTBEAT_IDLE_SECONDS:
                 continue
@@ -645,23 +656,24 @@ class SilencerRoutingServer:
                 and now - client.last_server_keepalive_at < ROUTING_HEARTBEAT_INTERVAL_SECONDS
             ):
                 continue
-            try:
-                await self._send_native_route_client_reply(client, keepalive)
-                client.last_server_keepalive_at = now
+
+            async def deliver(target: NativeRouteClientState) -> None:
+                sent = await self._deliver_native_route_client_message(
+                    message_kind="server-keepalive",
+                    client=target,
+                    clear_msg=keepalive,
+                )
+                if not sent:
+                    return
+                target.last_server_keepalive_at = now
                 LOGGER.debug(
                     "Routing(native): ServerKeepAlive sent to client_id=%d name=%r",
-                    client.client_id,
-                    client.client_name,
+                    target.client_id,
+                    target.client_name,
                 )
-            except Exception as exc:
-                LOGGER.warning(
-                    "Routing(native): ServerKeepAlive failed for client_id=%d name=%r: %s",
-                    client.client_id,
-                    client.client_name,
-                    exc,
-                )
-                with contextlib.suppress(Exception):
-                    client.writer.close()
+            deliveries.append(deliver(client))
+        if deliveries:
+            await asyncio.gather(*deliveries)
 
     async def _maintenance_loop(self) -> None:
         try:
@@ -1203,6 +1215,78 @@ class SilencerRoutingServer:
                 client.out_seq,
             )
 
+    async def _deliver_native_route_client_message(
+        self,
+        *,
+        message_kind: str,
+        client: NativeRouteClientState,
+        clear_msg: bytes,
+        sender_client_id: int = 0,
+        payload_len: int = 0,
+        timeout_seconds: float | None = None,
+        track_peer_data_slow: bool = False,
+    ) -> bool:
+        send_started_at = time.perf_counter()
+        timeout_value = (
+            ROUTING_CLIENT_SEND_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else timeout_seconds
+        )
+        timeout_value = max(0.0, float(timeout_value))
+        try:
+            if timeout_value > 0.0:
+                await asyncio.wait_for(
+                    self._send_native_route_client_reply(client, clear_msg),
+                    timeout=timeout_value,
+                )
+            else:
+                await self._send_native_route_client_reply(client, clear_msg)
+            if track_peer_data_slow:
+                self._record_slow_peer_data_delivery(
+                    sender_client_id=int(sender_client_id),
+                    recipient=client,
+                    payload_len=payload_len,
+                    elapsed_seconds=(time.perf_counter() - send_started_at),
+                )
+            return True
+        except asyncio.TimeoutError:
+            elapsed_seconds = time.perf_counter() - send_started_at
+            if track_peer_data_slow:
+                self._record_slow_peer_data_delivery(
+                    sender_client_id=int(sender_client_id),
+                    recipient=client,
+                    payload_len=payload_len,
+                    elapsed_seconds=elapsed_seconds,
+                )
+            stats = self._writer_buffer_stats(client.writer)
+            LOGGER.warning(
+                "Routing(native): %s delivery timed out sender_id=%d recipient_id=%d recipient_name=%r elapsed_ms=%d timeout_ms=%d payload_len=%d write_buffer_size=%d write_buffer_high_water=%d room_port=%s",
+                message_kind,
+                int(sender_client_id),
+                client.client_id,
+                client.client_name,
+                max(1, int(round(elapsed_seconds * 1000.0))),
+                max(1, int(round(timeout_value * 1000.0))),
+                max(0, int(payload_len)),
+                int(stats["write_buffer_size"]),
+                int(stats["write_buffer_high_water"]),
+                self.listen_port,
+            )
+            with contextlib.suppress(Exception):
+                client.writer.close()
+            return False
+        except Exception as exc:
+            LOGGER.warning(
+                "Routing(native): failed %s delivery to client_id=%d name=%r: %s",
+                message_kind,
+                client.client_id,
+                client.client_name,
+                exc,
+            )
+            with contextlib.suppress(Exception):
+                client.writer.close()
+            return False
+
     async def _broadcast_native_route_chat(
         self,
         sender_client_id: int,
@@ -1234,19 +1318,19 @@ class SilencerRoutingServer:
                 continue
             targets.append(client)
 
-        delivered = 0
-        for client in targets:
-            try:
-                await self._send_native_route_client_reply(client, peer_chat)
-                delivered += 1
-            except Exception as exc:
-                LOGGER.warning(
-                    "Routing(native): failed chat delivery to client_id=%d name=%r: %s",
-                    client.client_id,
-                    client.client_name,
-                    exc,
+        deliveries = await asyncio.gather(
+            *[
+                self._deliver_native_route_client_message(
+                    message_kind="chat",
+                    client=client,
+                    clear_msg=peer_chat,
+                    sender_client_id=int(sender_client_id),
+                    payload_len=len(bytes(data or b"")),
                 )
-        return delivered
+                for client in targets
+            ]
+        )
+        return sum(1 for delivered in deliveries if delivered)
 
     async def _deliver_native_route_peer_data(
         self,
@@ -1256,55 +1340,15 @@ class SilencerRoutingServer:
         peer_data: bytes,
         payload_len: int,
     ) -> bool:
-        send_started_at = time.perf_counter()
-        timeout_seconds = max(0.0, float(PEER_DATA_SEND_TIMEOUT_SECONDS))
-        try:
-            if timeout_seconds > 0.0:
-                await asyncio.wait_for(
-                    self._send_native_route_client_reply(client, peer_data),
-                    timeout=timeout_seconds,
-                )
-            else:
-                await self._send_native_route_client_reply(client, peer_data)
-            self._record_slow_peer_data_delivery(
-                sender_client_id=int(sender_client_id),
-                recipient=client,
-                payload_len=payload_len,
-                elapsed_seconds=(time.perf_counter() - send_started_at),
-            )
-            return True
-        except asyncio.TimeoutError:
-            elapsed_seconds = time.perf_counter() - send_started_at
-            self._record_slow_peer_data_delivery(
-                sender_client_id=int(sender_client_id),
-                recipient=client,
-                payload_len=payload_len,
-                elapsed_seconds=elapsed_seconds,
-            )
-            stats = self._writer_buffer_stats(client.writer)
-            LOGGER.warning(
-                "Routing(native): peer-data delivery timed out sender_id=%d recipient_id=%d recipient_name=%r elapsed_ms=%d timeout_ms=%d payload_len=%d write_buffer_size=%d write_buffer_high_water=%d room_port=%s",
-                int(sender_client_id),
-                client.client_id,
-                client.client_name,
-                max(1, int(round(elapsed_seconds * 1000.0))),
-                max(1, int(round(timeout_seconds * 1000.0))),
-                max(0, int(payload_len)),
-                int(stats["write_buffer_size"]),
-                int(stats["write_buffer_high_water"]),
-                self.listen_port,
-            )
-            with contextlib.suppress(Exception):
-                client.writer.close()
-            return False
-        except Exception as exc:
-            LOGGER.warning(
-                "Routing(native): failed peer-data delivery to client_id=%d name=%r: %s",
-                client.client_id,
-                client.client_name,
-                exc,
-            )
-            return False
+        return await self._deliver_native_route_client_message(
+            message_kind="peer-data",
+            client=client,
+            clear_msg=peer_data,
+            sender_client_id=int(sender_client_id),
+            payload_len=payload_len,
+            timeout_seconds=PEER_DATA_SEND_TIMEOUT_SECONDS,
+            track_peer_data_slow=True,
+        )
 
     async def _broadcast_native_route_peer_data(
         self,
@@ -1349,21 +1393,22 @@ class SilencerRoutingServer:
         clear_msg: bytes,
         exclude_client_id: int = 0,
     ) -> int:
-        delivered = 0
-        for client_id, client in list(self._native_clients.items()):
-            if exclude_client_id and client_id == exclude_client_id:
-                continue
-            try:
-                await self._send_native_route_client_reply(client, clear_msg)
-                delivered += 1
-            except Exception as exc:
-                LOGGER.warning(
-                    "Routing(native): failed group-change delivery to client_id=%d name=%r: %s",
-                    client.client_id,
-                    client.client_name,
-                    exc,
+        targets = [
+            client
+            for client_id, client in list(self._native_clients.items())
+            if not exclude_client_id or client_id != exclude_client_id
+        ]
+        deliveries = await asyncio.gather(
+            *[
+                self._deliver_native_route_client_message(
+                    message_kind="group-change",
+                    client=client,
+                    clear_msg=clear_msg,
                 )
-        return delivered
+                for client in targets
+            ]
+        )
+        return sum(1 for delivered in deliveries if delivered)
 
     @staticmethod
     def _route_data_key(link_id: int, data_type: bytes) -> Tuple[int, bytes]:
@@ -1407,24 +1452,25 @@ class SilencerRoutingServer:
         clear_msg: bytes,
         data_object: NativeRouteDataObject,
     ) -> int:
-        delivered = 0
+        targets = []
         for client in list(self._native_clients.values()):
-            if not any(
+            if any(
                 self._route_data_matches_subscription(data_object, subscription)
                 for subscription in client.subscriptions
             ):
-                continue
-            try:
-                await self._send_native_route_client_reply(client, clear_msg)
-                delivered += 1
-            except Exception as exc:
-                LOGGER.warning(
-                    "Routing(native): failed data-object delivery to client_id=%d name=%r: %s",
-                    client.client_id,
-                    client.client_name,
-                    exc,
+                targets.append(client)
+        deliveries = await asyncio.gather(
+            *[
+                self._deliver_native_route_client_message(
+                    message_kind="data-object",
+                    client=client,
+                    clear_msg=clear_msg,
+                    payload_len=len(bytes(data_object.data or b"")),
                 )
-        return delivered
+                for client in targets
+            ]
+        )
+        return sum(1 for delivered in deliveries if delivered)
 
     async def _remove_owned_data_objects(self, owner_id: int) -> int:
         removed = 0

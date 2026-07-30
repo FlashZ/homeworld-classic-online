@@ -626,6 +626,237 @@ def test_routing_recv_skips_wait_for_when_idle_timeout_is_disabled(monkeypatch) 
     assert payload == b"payload"
 
 
+class _CloseOnlyWriter:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _native_route_client(
+    client_id: int,
+    name: str,
+    *,
+    writer: object | None = None,
+) -> titan_binary_gateway.NativeRouteClientState:
+    return titan_binary_gateway.NativeRouteClientState(
+        client_id=client_id,
+        client_name_raw=name.encode("ascii"),
+        client_name=name,
+        client_ip=f"1.2.3.{client_id}",
+        client_ip_u32=0,
+        writer=writer,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+
+
+def test_broadcast_native_route_chat_does_not_wait_for_slow_recipient(
+    monkeypatch,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    server._native_clients = {
+        1: _native_route_client(1, "Alpha"),
+        2: _native_route_client(2, "Bravo"),
+        3: _native_route_client(3, "Charlie"),
+    }
+    events: list[tuple[int, str, float]] = []
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        events.append((client.client_id, "start", time.perf_counter()))
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+        events.append((client.client_id, "end", time.perf_counter()))
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+
+    delivered = asyncio.run(
+        server._broadcast_native_route_chat(
+            1,
+            titan_binary_gateway.CHAT_GROUP_ID,
+            b"hello",
+            [],
+            False,
+        )
+    )
+
+    assert delivered == 2
+    starts = {
+        client_id: timestamp
+        for client_id, phase, timestamp in events
+        if phase == "start"
+    }
+    ends = {
+        client_id: timestamp
+        for client_id, phase, timestamp in events
+        if phase == "end"
+    }
+    assert starts[3] - starts[2] < 0.05
+    assert ends[3] < ends[2]
+
+
+def test_broadcast_native_route_chat_times_out_stalled_recipient(
+    monkeypatch,
+    caplog,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    slow_writer = _CloseOnlyWriter()
+    server._native_clients = {
+        1: _native_route_client(1, "Alpha"),
+        2: _native_route_client(2, "Bravo", writer=slow_writer),
+        3: _native_route_client(3, "Charlie"),
+    }
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+    monkeypatch.setattr(
+        routing_module,
+        "ROUTING_CLIENT_SEND_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        delivered = asyncio.run(
+            server._broadcast_native_route_chat(
+                1,
+                titan_binary_gateway.CHAT_GROUP_ID,
+                b"hello",
+                [],
+                False,
+            )
+        )
+
+    assert delivered == 1
+    assert slow_writer.closed is True
+    assert "chat delivery timed out" in caplog.text
+    assert "recipient_id=2" in caplog.text
+
+
+def test_broadcast_native_route_group_change_times_out_stalled_recipient(
+    monkeypatch,
+    caplog,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    slow_writer = _CloseOnlyWriter()
+    server._native_clients = {
+        1: _native_route_client(1, "Alpha"),
+        2: _native_route_client(2, "Bravo", writer=slow_writer),
+        3: _native_route_client(3, "Charlie"),
+    }
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+    monkeypatch.setattr(
+        routing_module,
+        "ROUTING_CLIENT_SEND_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        delivered = asyncio.run(
+            server._broadcast_native_route_group_change(
+                b"group-change",
+                exclude_client_id=1,
+            )
+        )
+
+    assert delivered == 1
+    assert slow_writer.closed is True
+    assert "group-change delivery timed out" in caplog.text
+    assert "recipient_id=2" in caplog.text
+
+
+def test_broadcast_native_route_data_object_times_out_stalled_subscriber(
+    monkeypatch,
+    caplog,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    slow_writer = _CloseOnlyWriter()
+    slow = _native_route_client(2, "Bravo", writer=slow_writer)
+    fast = _native_route_client(3, "Charlie")
+    subscription = titan_binary_gateway.NativeRouteSubscription(
+        link_id=0,
+        data_type=b"HW",
+        exact_or_recursive=True,
+        group_or_members=False,
+    )
+    slow.subscriptions.append(subscription)
+    fast.subscriptions.append(subscription)
+    server._native_clients = {
+        2: slow,
+        3: fast,
+    }
+    data_object = titan_binary_gateway.NativeRouteDataObject(
+        link_id=0,
+        owner_id=1,
+        lifespan=0,
+        data_type=b"HW",
+        data=b"room",
+    )
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+    monkeypatch.setattr(
+        routing_module,
+        "ROUTING_CLIENT_SEND_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        delivered = asyncio.run(
+            server._broadcast_native_route_data_object(
+                b"data-object",
+                data_object,
+            )
+        )
+
+    assert delivered == 1
+    assert slow_writer.closed is True
+    assert "data-object delivery timed out" in caplog.text
+    assert "recipient_id=2" in caplog.text
+
+
 def test_broadcast_native_route_peer_data_records_slow_recipient_diagnostics(
     monkeypatch,
     caplog,
