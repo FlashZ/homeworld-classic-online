@@ -28,6 +28,7 @@ class GatewayWebAuthBridge:
         default_product: str,
         shared_secret: str,
         code_ttl_seconds: float,
+        cdkey_fingerprint_salt: str = "",
     ) -> None:
         if not db_paths:
             raise ValueError("missing_db_paths")
@@ -36,6 +37,7 @@ class GatewayWebAuthBridge:
         self.default_product = str(default_product or next(iter(self.db_paths)))
         self.shared_secret = str(shared_secret)
         self.code_ttl_seconds = float(code_ttl_seconds)
+        self.cdkey_fingerprint_salt = str(cdkey_fingerprint_salt or "").strip()
         self._codes: dict[str, _IssuedCode] = {}
         self._lock = threading.Lock()
 
@@ -48,6 +50,78 @@ class GatewayWebAuthBridge:
         if resolved not in self.db_paths:
             raise ValueError("unknown_product")
         return resolved
+
+    @staticmethod
+    def _normalize_cd_key(value: object) -> str:
+        return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+    @staticmethod
+    def _ensure_users_schema(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                native_cd_key TEXT,
+                native_login_key TEXT,
+                last_seen_at REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(users)")}
+        if "native_cd_key" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN native_cd_key TEXT")
+        if "native_login_key" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN native_login_key TEXT")
+        if "last_seen_at" not in columns:
+            conn.execute("ALTER TABLE users ADD COLUMN last_seen_at REAL NOT NULL DEFAULT 0")
+
+    def _cdkey_fingerprint(self, cd_key: object) -> str:
+        normalized = self._normalize_cd_key(cd_key)
+        if not normalized or not self.cdkey_fingerprint_salt:
+            return ""
+        digest = hashlib.sha256(
+            self.cdkey_fingerprint_salt.encode("utf-8") + b"\0" + normalized.encode("ascii")
+        ).hexdigest()
+        return f"sha256:{digest}"
+
+    def _account_link_metadata(self, *, product: str, username: str) -> dict[str, Any]:
+        if not self.cdkey_fingerprint_salt:
+            return {"cdkey_fingerprint": "", "linkable_accounts": []}
+        conn = sqlite3.connect(self.db_paths[product])
+        conn.row_factory = sqlite3.Row
+        try:
+            self._ensure_users_schema(conn)
+            rows = conn.execute(
+                """
+                SELECT username, COALESCE(native_cd_key, '') AS native_cd_key,
+                       COALESCE(last_seen_at, 0) AS last_seen_at
+                FROM users
+                """
+            ).fetchall()
+            conn.commit()
+        finally:
+            conn.close()
+        current = next((row for row in rows if str(row["username"]) == username), None)
+        normalized_key = self._normalize_cd_key(current["native_cd_key"] if current is not None else "")
+        if not normalized_key:
+            return {"cdkey_fingerprint": "", "linkable_accounts": []}
+        linked = [
+            {
+                "product": product,
+                "username": str(row["username"]),
+                "last_seen_at": float(row["last_seen_at"] or 0.0),
+            }
+            for row in rows
+            if str(row["username"]) != username
+            and self._normalize_cd_key(row["native_cd_key"]) == normalized_key
+        ]
+        linked.sort(key=lambda row: (-float(row["last_seen_at"]), str(row["username"]).lower()))
+        return {
+            "cdkey_fingerprint": self._cdkey_fingerprint(normalized_key),
+            "linkable_accounts": linked[:25],
+        }
 
     def start_login(
         self,
@@ -62,25 +136,21 @@ class GatewayWebAuthBridge:
 
         conn = sqlite3.connect(db_path)
         try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    username TEXT PRIMARY KEY,
-                    password_hash TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    native_cd_key TEXT,
-                    native_login_key TEXT
-                )
-                """
-            )
+            self._ensure_users_schema(conn)
             row = conn.execute(
                 "SELECT password_hash FROM users WHERE username = ?",
                 (str(username),),
             ).fetchone()
+            if row is not None and secrets.compare_digest(self.hash_password(password), str(row[0])):
+                conn.execute(
+                    "UPDATE users SET last_seen_at = ? WHERE username = ?",
+                    (time.time(), str(username)),
+                )
+                conn.commit()
         finally:
             conn.close()
 
-        if row is None or self.hash_password(password) != str(row[0]):
+        if row is None or not secrets.compare_digest(self.hash_password(password), str(row[0])):
             raise ValueError("invalid_credentials")
 
         now = time.time()
@@ -219,7 +289,7 @@ class GatewayWebAuthBridge:
         product: str,
         shared_secret: str,
     ) -> dict[str, Any]:
-        if shared_secret != self.shared_secret:
+        if not secrets.compare_digest(str(shared_secret), self.shared_secret):
             raise ValueError("invalid_shared_secret")
 
         with self._lock:
@@ -232,13 +302,15 @@ class GatewayWebAuthBridge:
         if record.product != self._resolve_product(product):
             raise ValueError("product_mismatch")
 
-        return {
+        payload = {
             "product": record.product,
             "username": record.username,
             "return_to": record.return_to,
             "issued_at": record.issued_at,
             "expires_at": record.expires_at,
         }
+        payload.update(self._account_link_metadata(product=record.product, username=record.username))
+        return payload
 
 
 WebAuthBridge = GatewayWebAuthBridge

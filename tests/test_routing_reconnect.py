@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import struct
 import time
 
 import titan_binary_gateway
@@ -67,6 +68,284 @@ def test_claim_pending_reconnect_by_id_requires_matching_ip() -> None:
     assert found is not None
     assert found.client_id == 7
     assert 7 not in server._pending_reconnects
+
+
+def test_evict_native_login_removes_active_client_and_pending_reconnect() -> None:
+    class FakeGateway:
+        def __init__(self) -> None:
+            self.releases: list[dict[str, object]] = []
+
+        def record_activity(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def record_live_player_event(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def _release_native_login_claim(self, **kwargs: object) -> bool:
+            self.releases.append(dict(kwargs))
+            return True
+
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    gateway = FakeGateway()
+    writer = FakeWriter()
+    server = titan_binary_gateway.SilencerRoutingServer(
+        gateway,
+        listen_port=15102,
+        publish_in_directory=True,
+    )
+    server._native_clients[5] = titan_binary_gateway.NativeRouteClientState(
+        client_id=5,
+        client_name_raw=b"DaMaG",
+        client_name="DaMaG",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        writer=writer,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+        auth_user_id=1000,
+        account_username="DaMaG",
+    )
+    server._pending_reconnects[7] = titan_binary_gateway.PendingNativeReconnect(
+        client_id=7,
+        client_name_raw=b"DaMaG",
+        client_name="DaMaG",
+        client_ip="1.2.3.4",
+        client_ip_u32=0,
+        connected_at=100.0,
+        last_activity_at=101.0,
+        last_activity_kind="peer_data",
+        chat_count=1,
+        peer_data_messages=2,
+        peer_data_bytes=64,
+        auth_user_id=1000,
+        account_username="DaMaG",
+    )
+
+    evicted = asyncio.run(
+        server.evict_native_login(
+            user_id=1000,
+            username="DaMaG",
+            reason="native_login_replaced",
+        )
+    )
+
+    assert evicted == 2
+    assert writer.closed is True
+    assert server._native_clients == {}
+    assert server._pending_reconnects == {}
+    assert [release["user_id"] for release in gateway.releases] == [1000, 1000]
+    assert all(
+        release["reason"] == "routing_native_login_replaced"
+        for release in gateway.releases
+    )
+
+
+def test_replace_active_native_login_evicts_old_routing_session() -> None:
+    class FakeRoutingManager:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def evict_native_login(self, **kwargs: object) -> int:
+            self.calls.append(dict(kwargs))
+            return 1
+
+    runtime = titan_binary_gateway.BinaryGatewayServer("127.0.0.1", 0)
+    routing_manager = FakeRoutingManager()
+    runtime.routing_manager = routing_manager  # type: ignore[assignment]
+    runtime._register_native_login_claim("DaMaG", 1000)
+    runtime._attach_native_login_claim(1000, 5)
+
+    replaced = asyncio.run(runtime._replace_active_native_login("DaMaG"))
+
+    assert replaced is True
+    assert runtime._username_for_active_native_login(1000) == ""
+    assert routing_manager.calls == [
+        {
+            "user_id": 1000,
+            "username": "DaMaG",
+            "reason": "native_login_replaced",
+        }
+    ]
+
+
+def test_reconnect_client_before_register_uses_peer_ip(monkeypatch) -> None:
+    class FakeGateway:
+        _auth_keys_loaded = True
+        _auth_p = 23
+        _auth_q = 11
+        _auth_g = 5
+        _auth_y = 8
+        _next_user_id = 2000
+
+        def __init__(self) -> None:
+            self.attached: list[tuple[int, int]] = []
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def _build_user_cert(self, user_id: int) -> tuple[bytes, int, int]:
+            return b"server-cert", 0, 3
+
+        def _username_for_active_native_login(self, user_id: int) -> str:
+            return "DaMaG" if int(user_id) == 1040 else ""
+
+        def _attach_native_login_claim(self, user_id: int, client_id: int) -> None:
+            self.attached.append((int(user_id), int(client_id)))
+
+        def _release_native_login_claim(self, **_kwargs: object) -> bool:
+            return True
+
+        def record_activity(self, kind: str, **kwargs: object) -> None:
+            self.events.append((kind, dict(kwargs)))
+
+        def record_live_player_event(self, kind: str, **kwargs: object) -> None:
+            self.events.append((kind, dict(kwargs)))
+
+    class FakeReader:
+        pass
+
+    class FakeWriter:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.closed = False
+
+        def get_extra_info(self, name: str, default: object = None) -> object:
+            if name == "peername":
+                return ("213.217.0.31", 49476)
+            return default
+
+        def write(self, data: bytes) -> None:
+            self.writes.append(bytes(data))
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    secret_b = b"12345678"
+    clear_reconnect = bytes(
+        [
+            titan_binary_gateway.MINI_HEADER_TYPE,
+            titan_binary_gateway.MINI_ROUTING_SERVICE,
+            titan_binary_gateway.ROUTING_RECONNECT_CLIENT,
+            0x07,
+            0x00,
+            0x00,
+        ]
+    )
+    clear_disconnect = bytes(
+        [
+            titan_binary_gateway.MINI_HEADER_TYPE,
+            titan_binary_gateway.MINI_ROUTING_SERVICE,
+            titan_binary_gateway.ROUTING_DISCONNECT_CLIENT,
+        ]
+    )
+    routing_payloads = iter([b"challenge2", b"\x04reconnect", b"\x04disconnect"])
+
+    async def fake_recv(_reader: object) -> bytes:
+        try:
+            return next(routing_payloads)
+        except StopIteration:
+            raise asyncio.IncompleteReadError(partial=b"", expected=1)
+
+    def fake_parse_tmessage(body: bytes) -> tuple[int, int, bytes]:
+        if body == b"first":
+            return (
+                titan_binary_gateway.AUTH1_PEER_SERVICE_TYPE,
+                titan_binary_gateway.AUTH1_PEER_REQUEST,
+                b"request",
+            )
+        return (
+            titan_binary_gateway.AUTH1_PEER_SERVICE_TYPE,
+            titan_binary_gateway.AUTH1_PEER_CHALLENGE2,
+            b"challenge2",
+        )
+
+    def fake_decrypt(payload: bytes, _session_key: bytes, _seq: object) -> bytes:
+        if payload == b"\x04reconnect":
+            return clear_reconnect
+        return clear_disconnect
+
+    async def fake_send_reply(
+        _writer: object,
+        clear_msg: bytes,
+        _session_key: bytes,
+        out_seq: object,
+    ) -> object:
+        assert clear_msg
+        return out_seq
+
+    monkeypatch.setattr(routing_module.won_crypto, "parse_tmessage", fake_parse_tmessage)
+    monkeypatch.setattr(
+        routing_module,
+        "_parse_auth1_peer_request",
+        lambda _body: {
+            "certificate": b"cert",
+            "auth_mode": 1,
+            "encrypt_mode": 1,
+            "encrypt_flags": 0x0001,
+        },
+    )
+    monkeypatch.setattr(
+        routing_module,
+        "_parse_auth1_certificate",
+        lambda _cert: {
+            "sig": b"",
+            "unsigned": b"",
+            "user_id": 1040,
+            "p": 23,
+            "g": 5,
+            "y": 8,
+        },
+    )
+    monkeypatch.setattr(routing_module.os, "urandom", lambda _size: secret_b)
+    monkeypatch.setattr(routing_module.won_crypto, "eg_encrypt", lambda *args: b"cipher")
+    monkeypatch.setattr(
+        routing_module.won_crypto,
+        "eg_decrypt",
+        lambda *args: struct.pack("<H", len(secret_b)) + secret_b + b"secret-a",
+    )
+    monkeypatch.setattr(
+        routing_module,
+        "_parse_auth1_peer_challenge2",
+        lambda _body: b"challenge2-cipher",
+    )
+    monkeypatch.setattr(routing_module, "_routing_recv_with_idle_timeout", fake_recv)
+    monkeypatch.setattr(routing_module, "_decrypt_persistent_non_t", fake_decrypt)
+
+    gateway = FakeGateway()
+    server = titan_binary_gateway.SilencerRoutingServer(
+        gateway,  # type: ignore[arg-type]
+        listen_port=15103,
+        publish_in_directory=False,
+    )
+    server._send_native_route_reply = fake_send_reply  # type: ignore[method-assign]
+    server._pending_reconnects[7] = titan_binary_gateway.PendingNativeReconnect(
+        client_id=7,
+        client_name_raw=b"DaMaG",
+        client_name="DaMaG",
+        client_ip="213.217.0.31",
+        client_ip_u32=0,
+        connected_at=100.0,
+        last_activity_at=101.0,
+        last_activity_kind="peer_data",
+        chat_count=1,
+        peer_data_messages=2,
+        peer_data_bytes=64,
+        auth_user_id=1040,
+        account_username="DaMaG",
+    )
+
+    asyncio.run(server._handle_native_client(FakeReader(), FakeWriter(), b"first"))  # type: ignore[arg-type]
+
+    assert gateway.attached == [(1040, 7)]
+    assert 7 not in server._pending_reconnects
+    assert any(kind == "rejoin" for kind, _event in gateway.events)
 
 
 def test_dashboard_snapshot_marks_unpublished_active_room_as_game_room() -> None:
@@ -345,6 +624,237 @@ def test_routing_recv_skips_wait_for_when_idle_timeout_is_disabled(monkeypatch) 
     payload = asyncio.run(routing_module._routing_recv_with_idle_timeout(object()))
 
     assert payload == b"payload"
+
+
+class _CloseOnlyWriter:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _native_route_client(
+    client_id: int,
+    name: str,
+    *,
+    writer: object | None = None,
+) -> titan_binary_gateway.NativeRouteClientState:
+    return titan_binary_gateway.NativeRouteClientState(
+        client_id=client_id,
+        client_name_raw=name.encode("ascii"),
+        client_name=name,
+        client_ip=f"1.2.3.{client_id}",
+        client_ip_u32=0,
+        writer=writer,  # type: ignore[arg-type]
+        session_key=b"",
+        out_seq=None,
+    )
+
+
+def test_broadcast_native_route_chat_does_not_wait_for_slow_recipient(
+    monkeypatch,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    server._native_clients = {
+        1: _native_route_client(1, "Alpha"),
+        2: _native_route_client(2, "Bravo"),
+        3: _native_route_client(3, "Charlie"),
+    }
+    events: list[tuple[int, str, float]] = []
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        events.append((client.client_id, "start", time.perf_counter()))
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+        events.append((client.client_id, "end", time.perf_counter()))
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+
+    delivered = asyncio.run(
+        server._broadcast_native_route_chat(
+            1,
+            titan_binary_gateway.CHAT_GROUP_ID,
+            b"hello",
+            [],
+            False,
+        )
+    )
+
+    assert delivered == 2
+    starts = {
+        client_id: timestamp
+        for client_id, phase, timestamp in events
+        if phase == "start"
+    }
+    ends = {
+        client_id: timestamp
+        for client_id, phase, timestamp in events
+        if phase == "end"
+    }
+    assert starts[3] - starts[2] < 0.05
+    assert ends[3] < ends[2]
+
+
+def test_broadcast_native_route_chat_times_out_stalled_recipient(
+    monkeypatch,
+    caplog,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    slow_writer = _CloseOnlyWriter()
+    server._native_clients = {
+        1: _native_route_client(1, "Alpha"),
+        2: _native_route_client(2, "Bravo", writer=slow_writer),
+        3: _native_route_client(3, "Charlie"),
+    }
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+    monkeypatch.setattr(
+        routing_module,
+        "ROUTING_CLIENT_SEND_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        delivered = asyncio.run(
+            server._broadcast_native_route_chat(
+                1,
+                titan_binary_gateway.CHAT_GROUP_ID,
+                b"hello",
+                [],
+                False,
+            )
+        )
+
+    assert delivered == 1
+    assert slow_writer.closed is True
+    assert "chat delivery timed out" in caplog.text
+    assert "recipient_id=2" in caplog.text
+
+
+def test_broadcast_native_route_group_change_times_out_stalled_recipient(
+    monkeypatch,
+    caplog,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    slow_writer = _CloseOnlyWriter()
+    server._native_clients = {
+        1: _native_route_client(1, "Alpha"),
+        2: _native_route_client(2, "Bravo", writer=slow_writer),
+        3: _native_route_client(3, "Charlie"),
+    }
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+    monkeypatch.setattr(
+        routing_module,
+        "ROUTING_CLIENT_SEND_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        delivered = asyncio.run(
+            server._broadcast_native_route_group_change(
+                b"group-change",
+                exclude_client_id=1,
+            )
+        )
+
+    assert delivered == 1
+    assert slow_writer.closed is True
+    assert "group-change delivery timed out" in caplog.text
+    assert "recipient_id=2" in caplog.text
+
+
+def test_broadcast_native_route_data_object_times_out_stalled_subscriber(
+    monkeypatch,
+    caplog,
+) -> None:
+    server = titan_binary_gateway.SilencerRoutingServer(
+        listen_port=15102,
+        publish_in_directory=False,
+    )
+    slow_writer = _CloseOnlyWriter()
+    slow = _native_route_client(2, "Bravo", writer=slow_writer)
+    fast = _native_route_client(3, "Charlie")
+    subscription = titan_binary_gateway.NativeRouteSubscription(
+        link_id=0,
+        data_type=b"HW",
+        exact_or_recursive=True,
+        group_or_members=False,
+    )
+    slow.subscriptions.append(subscription)
+    fast.subscriptions.append(subscription)
+    server._native_clients = {
+        2: slow,
+        3: fast,
+    }
+    data_object = titan_binary_gateway.NativeRouteDataObject(
+        link_id=0,
+        owner_id=1,
+        lifespan=0,
+        data_type=b"HW",
+        data=b"room",
+    )
+
+    async def fake_send(
+        client: titan_binary_gateway.NativeRouteClientState,
+        clear_msg: bytes,
+    ) -> None:
+        assert clear_msg
+        if client.client_id == 2:
+            await asyncio.sleep(0.2)
+
+    monkeypatch.setattr(server, "_send_native_route_client_reply", fake_send)
+    monkeypatch.setattr(
+        routing_module,
+        "ROUTING_CLIENT_SEND_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        delivered = asyncio.run(
+            server._broadcast_native_route_data_object(
+                b"data-object",
+                data_object,
+            )
+        )
+
+    assert delivered == 1
+    assert slow_writer.closed is True
+    assert "data-object delivery timed out" in caplog.text
+    assert "recipient_id=2" in caplog.text
 
 
 def test_broadcast_native_route_peer_data_records_slow_recipient_diagnostics(
