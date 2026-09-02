@@ -10,6 +10,7 @@ WINE_PREFIX="${WINEPREFIX:-}"
 SERVER=""
 WINE_BIN="${WON_INSTALLER_WINE:-wine}"
 PYTHON_BIN="${WON_INSTALLER_PYTHON:-python3}"
+KEY_HELPER_BIN="${WON_INSTALLER_KEY_HELPER:-$REPO_ROOT/installer/RetailCdKeyGen.exe}"
 # Pin the optional map pack to a reviewed commit. Do not use a moving branch URL
 # here: installer releases need to download the same map contents over time.
 MAP_ARCHIVE_URL="https://github.com/FlashZ/Homeworld_Map_Collection/archive/df266b9ca8caab4c1fe3c7e27fe93bce4dcf1210.zip"
@@ -114,8 +115,10 @@ supported_exe_exists() {
   local game="$1"
   local dir="$2"
   case "$game" in
-    homeworld) [[ -f "$dir/Homeworld.exe" ]] ;;
-    cataclysm) [[ -f "$dir/Cataclysm.exe" || -f "$dir/HomeworldCataclysm.exe" || -f "$dir/Homeworld.exe" ]] ;;
+    homeworld) find "$dir" -maxdepth 1 -type f -iname 'homeworld.exe' -print -quit | grep -q . ;;
+    cataclysm)
+      find "$dir" -maxdepth 1 -type f \( -iname 'cataclysm.exe' -o -iname 'homeworldcataclysm.exe' -o -iname 'homeworld.exe' \) -print -quit | grep -q .
+      ;;
     *) return 1 ;;
   esac
 }
@@ -173,7 +176,17 @@ generate_key_json() {
     printf '%s\n' "$WON_INSTALLER_KEY_JSON"
     return
   fi
-  "$PYTHON_BIN" "$REPO_ROOT/generate_cdkeys.py" --product "$product" --count 1 --format json
+
+  if [[ -f "$KEY_HELPER_BIN" && "$SKIP_REGISTRY" -eq 0 ]]; then
+    WINEPREFIX="$WINE_PREFIX" "$WINE_BIN" "$KEY_HELPER_BIN" --product "$product" 2>/dev/null
+    return
+  fi
+
+  local generated
+  if ! generated="$("$PYTHON_BIN" "$REPO_ROOT/generate_cdkeys.py" --product "$product" --count 1 --format json)"; then
+    die "CD-key generation failed. Use the release bundle (which includes RetailCdKeyGen.exe) or install pycryptodome for $PYTHON_BIN."
+  fi
+  printf '%s\n' "$generated"
 }
 
 json_field() {
@@ -188,7 +201,7 @@ hex_for_reg() {
 query_existing_key() {
   local product="$1"
   local prefix="$2"
-  WINEPREFIX="$prefix" "$WINE_BIN" reg query "HKLM\\Software\\Sierra On-Line\\$product" /v CDKey 2>/dev/null \
+  WINEPREFIX="$prefix" "$WINE_BIN" reg query "HKLM\\Software\\Sierra On-Line\\$product" /v CDKey /reg:32 2>/dev/null \
     | awk '/CDKey/ { print $NF; exit }' || true
 }
 
@@ -244,9 +257,18 @@ write_registry_key() {
   display="$(printf '%s' "$key_json" | json_field display_key)"
   plain="$(printf '%s' "$key_json" | json_field plain_key)"
   encrypted_hex="$(printf '%s' "$key_json" | json_field encrypted_key_hex)"
+  WINEPREFIX="$prefix" "$WINE_BIN" reg add "HKLM\\Software\\WON\\CDKeys" \
+    /v "$product" /t REG_BINARY /d "$encrypted_hex" /f /reg:32
+  WINEPREFIX="$prefix" "$WINE_BIN" reg add "HKLM\\Software\\Sierra On-Line\\$product" \
+    /v CDKey /t REG_SZ /d "$plain" /f /reg:32
+  WINEPREFIX="$prefix" "$WINE_BIN" reg add "HKLM\\Software\\Sierra On-Line\\$product" \
+    /v "${product}OnlineSetupWroteCdKey" /t REG_DWORD /d 1 /f /reg:32
+
+  # Also populate Wine's default registry view for older 32-bit-only prefixes
+  # and unusual launchers. The explicit reg add calls above are authoritative
+  # for modern 64-bit Proton prefixes.
   encrypted_reg="$(printf '%s' "$encrypted_hex" | hex_for_reg)"
   reg_file="$(mktemp)"
-
   cat > "$reg_file" <<EOF
 REGEDIT4
 
@@ -257,9 +279,17 @@ REGEDIT4
 "CDKey"="$plain"
 "${product}OnlineSetupWroteCdKey"=dword:00000001
 EOF
-
   WINEPREFIX="$prefix" "$WINE_BIN" regedit "$reg_file"
   rm -f "$reg_file"
+
+  if [[ "$game" == "cataclysm" ]]; then
+    local virtual_path="HKCU\\Software\\Classes\\VirtualStore\\MACHINE\\SOFTWARE\\WOW6432Node\\Sierra On-Line\\Cataclysm"
+    WINEPREFIX="$prefix" "$WINE_BIN" reg add "$virtual_path" /v CDKey /t REG_SZ /d "$plain" /f
+    WINEPREFIX="$prefix" "$WINE_BIN" reg add "$virtual_path" \
+      /v CataclysmOnlineSetupWroteCdKey /t REG_DWORD /d 1 /f
+    WINEPREFIX="$prefix" "$WINE_BIN" reg add "HKLM\\Software\\Sierra On-Line\\Cataclysm\\1.0.0.0" \
+      /ve /t REG_SZ /d "" /f /reg:32
+  fi
   echo "Wrote generated $product CD key: $display"
 }
 

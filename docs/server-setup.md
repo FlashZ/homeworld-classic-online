@@ -218,6 +218,8 @@ You can override the output filename with `INSTALLER_OUTPUT_NAME=...`.
 The Linux/Wine helper lives at `installer/install-linux.sh`. Release builds package it as `RetailWONSetup-linux-<tag>.zip` with:
 
 - `installer/install-linux.sh`
+- `installer/install-bazzite.sh`
+- `installer/RetailCdKeyGen.exe`
 - `generate_cdkeys.py`
 - `won_crypto.py`
 - `keys/kver.kp`

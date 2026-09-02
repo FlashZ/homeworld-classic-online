@@ -49,6 +49,20 @@ Do this from the game's **Internet** screen after installing.
 
 ### Linux, Wine, or Proton
 
+#### Bazzite / Steam (guided setup)
+
+Download and extract the latest `RetailWONSetup-linux-...zip`, open a terminal in the extracted folder, and run:
+
+```bash
+bash installer/install-bazzite.sh
+```
+
+The script asks whether you are setting up **Homeworld 1.05** or **Cataclysm 1.0.0.1 / Emergence**, asks for the folder containing the game EXE, finds the non-Steam Proton shortcut, and writes the required files and CD key into the correct 32-bit Proton registry view. Launch the game once through Steam before running it. Homeworld can be installed on another drive; the script grants Protontricks access to the selected folders.
+
+If Protontricks is missing, install it from Bazzite's **Discover** application first. Do not use this with Homeworld Remastered Classic; that executable is not supported.
+
+#### Other Wine or Proton setups
+
 Check [GitHub Releases](https://github.com/FlashZ/homeworld-classic-online/releases) for a `RetailWONSetup-linux-...zip` bundle first. If the latest release does not include one, use the Linux/Wine/Proton helper from the source repository:
 
 ```bash

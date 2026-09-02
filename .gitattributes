@@ -1,0 +1,4 @@
+# This file is executed directly by Bash after being extracted from a release
+# bundle.  Keep the working-tree copy LF-only on Windows release runners.
+installer/install-linux.sh text eol=lf
+installer/install-bazzite.sh text eol=lf
