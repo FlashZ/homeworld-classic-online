@@ -212,6 +212,16 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $bundleRoot "keys") | Out-Null
 
           Copy-Item "installer/install-linux.sh" (Join-Path $bundleRoot "installer/install-linux.sh")
+          Copy-Item "installer/install-bazzite.sh" (Join-Path $bundleRoot "installer/install-bazzite.sh")
+          Copy-Item "installer/RetailCdKeyGen.exe" (Join-Path $bundleRoot "installer/RetailCdKeyGen.exe")
+          # The release job runs on Windows, where core.autocrlf can turn the
+          # Bash shebang into "bash\r".  Normalize the packaged helper even
+          # if checkout configuration changes or ignores .gitattributes.
+          foreach ($linuxHelperName in @("install-linux.sh", "install-bazzite.sh")) {
+            $linuxHelperPath = Join-Path $bundleRoot "installer/$linuxHelperName"
+            $linuxHelper = [System.IO.File]::ReadAllText($linuxHelperPath) -replace "`r?`n", "`n"
+            [System.IO.File]::WriteAllText($linuxHelperPath, $linuxHelper, [System.Text.UTF8Encoding]::new($false))
+          }
           Copy-Item "generate_cdkeys.py" (Join-Path $bundleRoot "generate_cdkeys.py")
           Copy-Item "won_crypto.py" (Join-Path $bundleRoot "won_crypto.py")
           Copy-Item "keys/kver.kp" (Join-Path $bundleRoot "keys/kver.kp")

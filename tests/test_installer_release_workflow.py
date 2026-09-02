@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "installer-release.yml"
+ATTRIBUTES = ROOT / ".gitattributes"
 
 
 def test_installer_release_packages_linux_helper_bundle() -> None:
@@ -19,6 +20,15 @@ def test_installer_release_packages_linux_helper_bundle() -> None:
     assert "won_crypto.py" in text
     assert "keys/kver.kp" in text
     assert "${{ steps.linux_bundle.outputs.zip_path }}" in text
+
+
+def test_linux_helper_is_forced_to_lf_in_checkout_and_release_bundle() -> None:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    attributes = ATTRIBUTES.read_text(encoding="utf-8")
+
+    assert "installer/install-linux.sh text eol=lf" in attributes
+    assert "$linuxHelper = [System.IO.File]::ReadAllText($linuxHelperPath) -replace \"`r?`n\", \"`n\"" in workflow
+    assert "[System.IO.File]::WriteAllText($linuxHelperPath, $linuxHelper, [System.Text.UTF8Encoding]::new($false))" in workflow
 
 
 def test_installer_release_publishes_verifiable_release_artifacts() -> None:

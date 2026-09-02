@@ -43,6 +43,18 @@ if errorlevel 1 exit /b %errorlevel%
   "%SCRIPT_DIR%hwclient_setup.cs"
 
 set "BUILD_EXIT=%ERRORLEVEL%"
+if not "%BUILD_EXIT%"=="0" goto cleanup
+
+"%CSC%" ^
+  /nologo ^
+  /target:exe ^
+  /out:"%SCRIPT_DIR%RetailCdKeyGen.exe" ^
+  "%SCRIPT_DIR%retail_cdkey.cs" ^
+  "%SCRIPT_DIR%retail_cdkey_cli.cs"
+
+set "BUILD_EXIT=%ERRORLEVEL%"
+
+:cleanup
 del "%ASSEMBLY_INFO%" >nul 2>&1
 
 if not "%BUILD_EXIT%"=="0" exit /b %BUILD_EXIT%
