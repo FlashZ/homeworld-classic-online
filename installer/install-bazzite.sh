@@ -22,6 +22,24 @@ Optional advanced usage:
 EOF
 }
 
+show_welcome() {
+  cat <<'EOF'
+============================================================
+ HOMEWORLD ONLINE SETUP FOR BAZZITE
+============================================================
+
+This setup will ask simple questions and do the Linux work for you.
+
+Before continuing, make sure you have done all three things below:
+  1. Add the retail game EXE to Steam as a non-Steam game.
+  2. Force that Steam shortcut to use Proton.
+  3. Start the game from Steam once, then close it.
+
+The game does NOT need to be on the same drive as Bazzite.
+EOF
+  read -r -p "When those three things are done, press Enter to continue. "
+}
+
 die() {
   echo "ERROR: $*" >&2
   exit 1
@@ -44,7 +62,12 @@ flatpak info "$PROTONTRICKS_APP" >/dev/null 2>&1 \
 [[ -f "$SCRIPT_DIR/RetailCdKeyGen.exe" ]] \
   || die "RetailCdKeyGen.exe is missing. Download and extract the Linux setup bundle from GitHub Releases, then run this copy of the script."
 
+if [[ -z "$GAME" && -z "$GAME_DIR" && -z "$APP_ID" ]]; then
+  show_welcome
+fi
+
 if [[ -z "$GAME" ]]; then
+  echo
   echo "Which game are you setting up?"
   echo "  1) Homeworld 1.05"
   echo "  2) Homeworld: Cataclysm 1.0.0.1 / Emergence"
@@ -60,9 +83,14 @@ fi
 
 if [[ -z "$GAME_DIR" ]]; then
   echo
-  echo "Enter the folder containing the game EXE."
-  echo "Tip: you can drag the folder from the file manager into this window."
-  read -r -p "Game folder: " GAME_DIR
+  echo "Now the setup needs the GAME FOLDER."
+  echo "This is the folder containing Homeworld.exe or Cataclysm.exe."
+  echo
+  echo "Easiest method:"
+  echo "  1. Open the folder in Dolphin (Bazzite's file manager)."
+  echo "  2. Drag the folder itself into this Konsole window."
+  echo "  3. Press Enter."
+  read -r -p "Drag the game folder here, then press Enter: " GAME_DIR
   GAME_DIR="${GAME_DIR#\'}"; GAME_DIR="${GAME_DIR%\'}"
   GAME_DIR="${GAME_DIR#\"}"; GAME_DIR="${GAME_DIR%\"}"
 fi
@@ -79,9 +107,14 @@ if [[ -z "$APP_ID" ]]; then
     | sed -nE '/Non-Steam shortcut:/s/.*\(([0-9]+)\)$/\1/p')
   if [[ "${#shortcut_ids[@]}" -eq 1 ]]; then
     APP_ID="${shortcut_ids[0]}"
-    echo "Using non-Steam shortcut ID: $APP_ID"
+    echo "Found your non-Steam game automatically. Shortcut number: $APP_ID"
   else
-    read -r -p "Enter the number in parentheses for the shortcut you use: " APP_ID
+    echo
+    echo "The shortcut was not found automatically."
+    echo "Look above for a line beginning with: Non-Steam shortcut"
+    echo "Type only the number in parentheses at the end of that line."
+    echo "Example: for 'Non-Steam shortcut: homeworld.exe (123456)', type 123456"
+    read -r -p "Shortcut number: " APP_ID
   fi
 fi
 
@@ -113,4 +146,8 @@ echo "Configuring the game in its Proton prefix..."
 flatpak run "$PROTONTRICKS_APP" -c "$inner_command" "$APP_ID"
 
 echo
-echo "Setup complete. Close this window and launch the game from the same Steam shortcut."
+echo "============================================================"
+echo " SETUP FINISHED SUCCESSFULLY"
+echo "============================================================"
+echo "You may close this window now."
+echo "Open Steam and launch the game from the same non-Steam shortcut."

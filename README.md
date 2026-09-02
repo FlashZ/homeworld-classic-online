@@ -51,13 +51,15 @@ Do this from the game's **Internet** screen after installing.
 
 #### Bazzite / Steam (guided setup)
 
-Download and extract the latest `RetailWONSetup-linux-...zip`, open a terminal in the extracted folder, and run:
+If you are new to Linux, follow the **[click-by-click Bazzite beginner guide](docs/bazzite-player-guide.md)**. It explains how to add the game to Steam, install Protontricks, unzip the download, open Konsole in the correct folder, and answer every setup question.
+
+The short version is: download and extract the latest `RetailWONSetup-linux-...zip`, open the extracted folder in Dolphin, right-click an empty area, select **Open Terminal Here**, and run:
 
 ```bash
 bash installer/install-bazzite.sh
 ```
 
-The script asks whether you are setting up **Homeworld 1.05** or **Cataclysm 1.0.0.1 / Emergence**, asks for the folder containing the game EXE, finds the non-Steam Proton shortcut, and writes the required files and CD key into the correct 32-bit Proton registry view. Launch the game once through Steam before running it. Homeworld can be installed on another drive; the script grants Protontricks access to the selected folders.
+Paste into Konsole with **Ctrl+Shift+V**, then press **Enter**. The script asks whether you are setting up **Homeworld 1.05** or **Cataclysm 1.0.0.1 / Emergence**, asks for the folder containing the game EXE, finds the non-Steam Proton shortcut, and writes the required files and CD key into the correct 32-bit Proton registry view. Launch the game once through Steam before running it. The game can be installed on another drive; it does not need to be on the Bazzite drive.
 
 If Protontricks is missing, install it from Bazzite's **Discover** application first. Do not use this with Homeworld Remastered Classic; that executable is not supported.
 
